@@ -1,4 +1,5 @@
 #include "codegen.h"
+
 #include <cassert>
 
 namespace pancake {
@@ -255,6 +256,22 @@ void CodeGen::emitStmt(const Stmt &stmt) {
     out << ">";
     break;
   }
+  case StmtKind::MemoryStore: {
+    auto &s = static_cast<const MemoryStoreStmt &>(stmt);
+    out << "st ";
+    emitExpr(*s.destExpr);
+    out << ", ";
+    emitExpr(*s.srcExpr);
+    break;
+  }
+  case StmtKind::SharedMemoryStore: {
+    // TODO
+    break;
+  }
+  case StmtKind::SharedMemoryLoad: {
+    // TODO
+    break;
+  }
   }
 }
 
@@ -321,6 +338,13 @@ void CodeGen::emitExpr(const Expr &expr, int parentPrec) {
   case ExprKind::FieldAccess: {
     auto &e = static_cast<const FieldAccessExpr &>(expr);
     out << e.varName << "." << e.fieldIndex;
+    break;
+  }
+  case ExprKind::MemoryLoad: {
+    auto &e = static_cast<const MemoryLoadExpr &>(expr);
+    // TODO only lds 1 <addr> actually compiles
+    out << "lds " << e.shape << " ";
+    emitExpr(*e.addrExpr);
     break;
   }
   }

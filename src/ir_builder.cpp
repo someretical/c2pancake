@@ -1,9 +1,47 @@
 #include "ir_builder.h"
-#include <algorithm>
+#include "pancake_ir.h"
+#include "clang-c/Index.h"
+
+#include <format>
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <memory>
+#include <ranges>
 #include <regex>
+
+// Helper macro/function to combine hash values (boost::hash_combine style)
+inline void hash_combine(std::size_t &seed, std::size_t value) {
+  seed ^= value + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+}
+
+// Helper to hash an individual CXSourceLocation
+inline std::size_t hash_location(const CXSourceLocation &loc) {
+  CXFile file;
+  unsigned line, column, offset;
+  // Extract the raw data from the Clang location
+  clang_getSpellingLocation(loc, &file, &line, &column, &offset);
+
+  std::size_t seed = 0;
+  hash_combine(seed, std::hash<void *>{}(file)); // File pointer
+  hash_combine(seed, std::hash<unsigned>{}(line));
+  hash_combine(seed, std::hash<unsigned>{}(column));
+  hash_combine(seed, std::hash<unsigned>{}(offset));
+  return seed;
+}
+
+// Inject the specialization into the std namespace
+namespace std {
+template <> struct hash<pancake::IRBuilder::CursorHash> {
+  std::size_t
+  operator()(const pancake::IRBuilder::CursorHash &c) const noexcept {
+    std::size_t seed = 0;
+    hash_combine(seed, hash_location(c.startLoc));
+    hash_combine(seed, hash_location(c.endLoc));
+    return seed;
+  }
+};
+} // namespace std
 
 namespace pancake {
 
@@ -37,7 +75,7 @@ std::string IRBuilder::arrayAddr(int slot) {
 BlockPtr IRBuilder::buildBlockOrWrap(CXCursor cursor) {
   if (clang_getCursorKind(cursor) == CXCursor_CompoundStmt)
     return buildBlock(cursor);
-  auto block = std::make_unique<Block>();
+  auto block = std::make_shared<Block>();
   buildStmt(cursor, block->stmts);
   return block;
 }
@@ -168,13 +206,13 @@ std::unique_ptr<Program> IRBuilder::build(const std::string &filename) {
         if (kind == CXCursor_FunctionDecl) {
           auto func = ctx->self->buildFunction(cursor);
           if (func)
-            ctx->prog->functions.push_back(std::move(func));
+            ctx->prog->functions.push_back(func);
         } else if (kind == CXCursor_VarDecl) {
           ctx->self->buildVarDecl(cursor, ctx->prog->globals);
         } else if (kind == CXCursor_StructDecl) {
           ctx->self->buildStructDecl(cursor, ctx->prog->globals);
         } else if (kind == CXCursor_TypedefDecl) {
-          ctx->prog->globals.push_back(std::make_unique<CommentStmt>(
+          ctx->prog->globals.push_back(std::make_shared<CommentStmt>(
               "TODO: Typedef: " + ctx->self->getSourceText(cursor),
               ctx->self->getLoc(cursor)));
         } else if (kind == CXCursor_EnumDecl) {
@@ -201,10 +239,10 @@ std::unique_ptr<Program> IRBuilder::build(const std::string &filename) {
   return program;
 }
 
-std::unique_ptr<Function> IRBuilder::buildFunction(CXCursor cursor) {
+std::shared_ptr<Function> IRBuilder::buildFunction(CXCursor cursor) {
   FunctionScope scope(insideFunction);
 
-  auto func = std::make_unique<Function>();
+  auto func = std::make_shared<Function>();
   func->name = getCursorSpelling(cursor);
   func->loc = getLoc(cursor);
 
@@ -230,25 +268,25 @@ std::unique_ptr<Function> IRBuilder::buildFunction(CXCursor cursor) {
         }
       }
 
-      func->params.push_back(std::move(p));
+      func->params.push_back(p);
     } else if (kind == CXCursor_CompoundStmt) {
       func->body = buildBlock(child);
     }
   }
 
   if (!func->body)
-    func->body = std::make_unique<Block>();
+    func->body = std::make_shared<Block>();
 
   // Pancake requires all functions to end with return
   auto &stmts = func->body->stmts;
   if (stmts.empty() || stmts.back()->kind != StmtKind::Return)
-    stmts.push_back(std::make_unique<ReturnStmt>(nullptr, func->loc));
+    stmts.push_back(std::make_shared<ReturnStmt>(nullptr, func->loc));
 
   return func;
 }
 
 BlockPtr IRBuilder::buildBlock(CXCursor cursor) {
-  auto block = std::make_unique<Block>();
+  auto block = std::make_shared<Block>();
   block->loc = getLoc(cursor);
 
   for (auto &child : getChildren(cursor))
@@ -266,12 +304,14 @@ void IRBuilder::buildStmt(CXCursor cursor, std::vector<StmtPtr> &stmts) {
   // check for FFI replacement
   auto ffiIt = ffiLineReplacements.find(loc.line);
   if (ffiIt != ffiLineReplacements.end()) {
-    stmts.push_back(std::make_unique<ExprStmt>(
-        std::make_unique<RawExpr>("@" + ffiIt->second + "(0,0,0,0)", loc),
+    stmts.push_back(std::make_shared<ExprStmt>(
+        std::make_shared<RawExpr>("@" + ffiIt->second + "(0,0,0,0)", loc),
         loc));
     return;
   }
 
+  // TODO everything other than compound statement needs to handle hoisting
+  // first!
   switch (kind) {
   case CXCursor_DeclStmt: {
     for (auto &child : getChildren(cursor))
@@ -285,7 +325,7 @@ void IRBuilder::buildStmt(CXCursor cursor, std::vector<StmtPtr> &stmts) {
   case CXCursor_CompoundStmt: {
     auto block = buildBlock(cursor);
     for (auto &s : block->stmts)
-      stmts.push_back(std::move(s));
+      stmts.push_back(s);
     break;
   }
   case CXCursor_ReturnStmt: {
@@ -293,7 +333,7 @@ void IRBuilder::buildStmt(CXCursor cursor, std::vector<StmtPtr> &stmts) {
     ExprPtr value;
     if (!children.empty())
       value = buildExpr(children[0]);
-    stmts.push_back(std::make_unique<ReturnStmt>(std::move(value), loc));
+    stmts.push_back(std::make_shared<ReturnStmt>(value, loc));
     break;
   }
   case CXCursor_IfStmt: {
@@ -302,11 +342,7 @@ void IRBuilder::buildStmt(CXCursor cursor, std::vector<StmtPtr> &stmts) {
       break;
 
     // hoist array loads from condition
-    ExprPtr cond;
-    if (hasDescendant(children[0], CXCursor_ArraySubscriptExpr) ||
-        clang_getCursorKind(children[0]) == CXCursor_ArraySubscriptExpr) {
-      cond = hoistArrayLoads(children[0], stmts);
-    }
+    ExprPtr cond = hoistArrayLoads(children[0], stmts);
     if (!cond)
       cond = buildExpr(children[0]);
 
@@ -316,8 +352,8 @@ void IRBuilder::buildStmt(CXCursor cursor, std::vector<StmtPtr> &stmts) {
     if (children.size() >= 3)
       elseBranch = buildBlockOrWrap(children[2]);
 
-    stmts.push_back(std::make_unique<IfStmt>(
-        std::move(cond), std::move(thenBranch), std::move(elseBranch), loc));
+    stmts.push_back(
+        std::make_shared<IfStmt>(cond, thenBranch, elseBranch, loc));
     break;
   }
   case CXCursor_WhileStmt: {
@@ -328,8 +364,7 @@ void IRBuilder::buildStmt(CXCursor cursor, std::vector<StmtPtr> &stmts) {
     auto cond = buildExpr(children[0]);
     auto body = buildBlockOrWrap(children[1]);
 
-    stmts.push_back(
-        std::make_unique<WhileStmt>(std::move(cond), std::move(body), loc));
+    stmts.push_back(std::make_shared<WhileStmt>(cond, body, loc));
     break;
   }
   case CXCursor_ForStmt:
@@ -349,7 +384,7 @@ void IRBuilder::buildStmt(CXCursor cursor, std::vector<StmtPtr> &stmts) {
     if (clang_getCursorKind(bodyCursor) == CXCursor_CompoundStmt) {
       auto block = buildBlock(bodyCursor);
       for (auto &s : block->stmts)
-        stmts.push_back(std::move(s));
+        stmts.push_back(s);
     } else {
       buildStmt(bodyCursor, stmts);
     }
@@ -358,17 +393,16 @@ void IRBuilder::buildStmt(CXCursor cursor, std::vector<StmtPtr> &stmts) {
     auto cond = buildExpr(condCursor);
     auto body = buildBlockOrWrap(bodyCursor);
 
-    stmts.push_back(
-        std::make_unique<WhileStmt>(std::move(cond), std::move(body), loc));
+    stmts.push_back(std::make_shared<WhileStmt>(cond, body, loc));
     break;
   }
 
   case CXCursor_BreakStmt:
-    stmts.push_back(std::make_unique<BreakStmt>(loc));
+    stmts.push_back(std::make_shared<BreakStmt>(loc));
     break;
 
   case CXCursor_ContinueStmt:
-    stmts.push_back(std::make_unique<ContinueStmt>(loc));
+    stmts.push_back(std::make_shared<ContinueStmt>(loc));
     break;
 
   case CXCursor_CompoundAssignOperator:
@@ -378,20 +412,20 @@ void IRBuilder::buildStmt(CXCursor cursor, std::vector<StmtPtr> &stmts) {
   case CXCursor_UnaryOperator: {
     auto result = tryBuildIncrDecr(cursor);
     if (result) {
-      stmts.push_back(std::move(result));
+      stmts.push_back(result);
     } else {
-      stmts.push_back(std::make_unique<ExprStmt>(buildExpr(cursor), loc));
+      pushExprStmt(stmts, cursor);
     }
     break;
   }
   case CXCursor_CallExpr: {
     std::string name = getCalleeName(cursor);
     if (name == "printf") {
-      stmts.push_back(std::make_unique<CommentStmt>(
+      stmts.push_back(std::make_shared<CommentStmt>(
           "TODO: printf not available in Pancake - " + getSourceText(cursor),
           loc));
     } else {
-      stmts.push_back(std::make_unique<ExprStmt>(buildExpr(cursor), loc));
+      stmts.push_back(std::make_shared<ExprStmt>(buildExpr(cursor), loc));
     }
     break;
   }
@@ -409,8 +443,8 @@ void IRBuilder::buildStmt(CXCursor cursor, std::vector<StmtPtr> &stmts) {
           if (fi >= 0) {
             int fc = getStructFieldCount(varName);
             auto value = buildExpr(children[1]);
-            stmts.push_back(std::make_unique<StructFieldAssignStmt>(
-                varName, fi, fc, std::move(value), loc));
+            stmts.push_back(std::make_shared<StructFieldAssignStmt>(
+                varName, fi, fc, value, loc));
             return;
           }
         }
@@ -425,48 +459,43 @@ void IRBuilder::buildStmt(CXCursor cursor, std::vector<StmtPtr> &stmts) {
             std::string addr =
                 arrayAddr(ait->second.baseSlot, getSourceText(arrChildren[1]));
             // hoist RHS if it contains array access
-            ExprPtr valExpr;
-            if (hasDescendant(children[1], CXCursor_ArraySubscriptExpr) ||
-                clang_getCursorKind(children[1]) ==
-                    CXCursor_ArraySubscriptExpr) {
-              valExpr = hoistArrayLoads(children[1], stmts);
+            ExprPtr srcVar = hoistArrayLoads(children[1], stmts);
+            if (!srcVar) {
+              srcVar = buildExpr(children[1]);
+              // emit store via temp var
+              std::string valTmp = std::format("av{}", arrayTmpCounter++);
+              stmts.push_back(std::make_shared<VarDeclStmt>(valTmp, srcVar,
+                                                            std::nullopt, loc));
+              srcVar = std::make_shared<VarRefExpr>(valTmp, loc);
             }
-            if (!valExpr)
-              valExpr = buildExpr(children[1]);
-            // emit store via temp var
-            std::string valTmp = "av" + std::to_string(arrayTmpCounter++);
-            stmts.push_back(std::make_unique<VarDeclStmt>(
-                valTmp, std::move(valExpr), std::nullopt, loc));
-            stmts.push_back(std::make_unique<ExprStmt>(
-                std::make_unique<RawExpr>("st " + addr + ", " + valTmp, loc),
-                loc));
+
+            // TODO we need to parse the LHS for any array access and so on as
+            // well
+            auto destVar = std::make_shared<RawExpr>(addr, loc);
+            stmts.push_back(
+                std::make_shared<MemoryStoreStmt>(srcVar, destVar, loc));
             return;
           }
         }
       }
       std::string target = getCursorSpelling(children[0]);
       // hoist array loads from RHS
-      if (hasDescendant(children[1], CXCursor_ArraySubscriptExpr) ||
-          clang_getCursorKind(children[1]) == CXCursor_ArraySubscriptExpr) {
-        auto hoisted = hoistArrayLoads(children[1], stmts);
-        if (hoisted) {
-          stmts.push_back(
-              std::make_unique<AssignStmt>(target, std::move(hoisted), loc));
-          return;
-        }
+      auto hoisted = hoistArrayLoads(children[1], stmts);
+      if (hoisted) {
+        stmts.push_back(std::make_shared<AssignStmt>(target, hoisted, loc));
+        return;
       }
       // expand ternary in RHS
       auto ternaryResult = tryExpandTernary(children[1], stmts);
       if (ternaryResult) {
-        stmts.push_back(std::make_unique<AssignStmt>(
-            target, std::move(ternaryResult), loc));
+        stmts.push_back(
+            std::make_shared<AssignStmt>(target, ternaryResult, loc));
       } else {
         auto value = buildExpr(children[1]);
-        stmts.push_back(
-            std::make_unique<AssignStmt>(target, std::move(value), loc));
+        stmts.push_back(std::make_shared<AssignStmt>(target, value, loc));
       }
     } else {
-      stmts.push_back(std::make_unique<ExprStmt>(buildExpr(cursor), loc));
+      pushExprStmt(stmts, cursor);
     }
     break;
   }
@@ -475,7 +504,7 @@ void IRBuilder::buildStmt(CXCursor cursor, std::vector<StmtPtr> &stmts) {
     break;
 
   default:
-    stmts.push_back(std::make_unique<ExprStmt>(buildExpr(cursor), loc));
+    pushExprStmt(stmts, cursor);
     break;
   }
 }
@@ -494,7 +523,7 @@ void IRBuilder::buildVarDecl(CXCursor cursor, std::vector<StmtPtr> &stmts) {
       globalArrays[name] = info;
       nextArraySlot += (int)arrSize;
 
-      stmts.push_back(std::make_unique<CommentStmt>(
+      stmts.push_back(std::make_shared<CommentStmt>(
           "array " + name + "[" + std::to_string(arrSize) + "] → @base slots " +
               std::to_string(info.baseSlot) + ".." +
               std::to_string(info.baseSlot + info.size - 1),
@@ -506,8 +535,8 @@ void IRBuilder::buildVarDecl(CXCursor cursor, std::vector<StmtPtr> &stmts) {
           auto initChildren = getChildren(child);
           for (int i = 0; i < (int)initChildren.size() && i < (int)arrSize;
                i++) {
-            target.push_back(std::make_unique<ExprStmt>(
-                std::make_unique<RawExpr>("st " + arrayAddr(info.baseSlot + i) +
+            target.push_back(std::make_shared<ExprStmt>(
+                std::make_shared<RawExpr>("st " + arrayAddr(info.baseSlot + i) +
                                               ", " +
                                               getSourceText(initChildren[i]),
                                           loc),
@@ -543,14 +572,14 @@ void IRBuilder::buildVarDecl(CXCursor cursor, std::vector<StmtPtr> &stmts) {
           std::vector<ExprPtr> fieldExprs;
           for (auto &ic : initChildren)
             fieldExprs.push_back(buildExpr(ic));
-          init = std::make_unique<StructLitExpr>(std::move(fieldExprs), loc);
+          init = std::make_shared<StructLitExpr>(fieldExprs, loc);
         } else {
           init = buildExpr(lastChild);
         }
       }
 
-      stmts.push_back(std::make_unique<VarDeclStmt>(name, std::move(init),
-                                                    fieldCount, loc));
+      stmts.push_back(
+          std::make_shared<VarDeclStmt>(name, init, fieldCount, loc));
       return;
     }
   }
@@ -560,27 +589,25 @@ void IRBuilder::buildVarDecl(CXCursor cursor, std::vector<StmtPtr> &stmts) {
 
   if (!children.empty()) {
     // hoist array loads from initializer
-    if (hasDescendant(cursor, CXCursor_ArraySubscriptExpr)) {
-      auto hoisted = hoistArrayLoads(children.back(), stmts);
-      if (hoisted) {
-        stmts.push_back(std::make_unique<VarDeclStmt>(name, std::move(hoisted),
+    auto hoisted = hoistArrayLoads(children.back(), stmts);
+    if (hoisted) {
+      stmts.push_back(
+          std::make_shared<VarDeclStmt>(name, hoisted, std::nullopt, loc));
+      return;
+    }
+
+    // expand ternary initializer
+    if (getDescendant(cursor, CXCursor_ConditionalOperator)) {
+      auto ternaryResult = tryExpandTernary(children.back(), stmts);
+      if (ternaryResult) {
+        stmts.push_back(std::make_shared<VarDeclStmt>(name, ternaryResult,
                                                       std::nullopt, loc));
         return;
       }
     }
 
-    // expand ternary initializer
-    if (hasDescendant(cursor, CXCursor_ConditionalOperator)) {
-      auto ternaryResult = tryExpandTernary(children.back(), stmts);
-      if (ternaryResult) {
-        stmts.push_back(std::make_unique<VarDeclStmt>(
-            name, std::move(ternaryResult), std::nullopt, loc));
-        return;
-      }
-    }
-
     // function call in initializer needs shape annotation
-    if (hasDescendant(cursor, CXCursor_CallExpr))
+    if (getDescendant(cursor, CXCursor_CallExpr))
       shape = 1;
 
     init = buildExpr(children.back());
@@ -589,15 +616,14 @@ void IRBuilder::buildVarDecl(CXCursor cursor, std::vector<StmtPtr> &stmts) {
     if (init && init->kind == ExprKind::Raw) {
       auto &raw = static_cast<RawExpr &>(*init);
       if (raw.text.find("TODO") != std::string::npos) {
-        stmts.push_back(std::make_unique<CommentStmt>(
+        stmts.push_back(std::make_shared<CommentStmt>(
             "TODO: " + getSourceText(cursor), loc));
         return;
       }
     }
   }
 
-  stmts.push_back(
-      std::make_unique<VarDeclStmt>(name, std::move(init), shape, loc));
+  stmts.push_back(std::make_shared<VarDeclStmt>(name, init, shape, loc));
 }
 
 // for -> while conversion
@@ -679,15 +705,14 @@ void IRBuilder::buildForStmt(CXCursor cursor, std::vector<StmtPtr> &stmts) {
     buildStmt(parts.init, stmts);
 
   ExprPtr cond = parts.hasCond ? buildExpr(parts.condition)
-                               : std::make_unique<IntLitExpr>(1, loc);
+                               : std::make_shared<IntLitExpr>(1, loc);
 
   auto body = buildBlockOrWrap(parts.body);
 
   if (parts.hasUpdate)
     buildForUpdate(parts.update, body->stmts);
 
-  stmts.push_back(
-      std::make_unique<WhileStmt>(std::move(cond), std::move(body), loc));
+  stmts.push_back(std::make_shared<WhileStmt>(cond, body, loc));
 }
 
 void IRBuilder::buildForUpdate(CXCursor cursor, std::vector<StmtPtr> &stmts) {
@@ -696,7 +721,7 @@ void IRBuilder::buildForUpdate(CXCursor cursor, std::vector<StmtPtr> &stmts) {
   if (kind == CXCursor_UnaryOperator) {
     auto result = tryBuildIncrDecr(cursor);
     if (result) {
-      stmts.push_back(std::move(result));
+      stmts.push_back(result);
       return;
     }
   }
@@ -710,13 +735,63 @@ void IRBuilder::buildForUpdate(CXCursor cursor, std::vector<StmtPtr> &stmts) {
     if (opStr == "=" && children.size() == 2) {
       std::string target = getCursorSpelling(children[0]);
       auto value = buildExpr(children[1]);
-      stmts.push_back(std::make_unique<AssignStmt>(target, std::move(value),
-                                                   getLoc(cursor)));
+      stmts.push_back(
+          std::make_shared<AssignStmt>(target, value, getLoc(cursor)));
       return;
     }
   }
-  stmts.push_back(
-      std::make_unique<ExprStmt>(buildExpr(cursor), getLoc(cursor)));
+  pushExprStmt(stmts, cursor);
+}
+
+void IRBuilder::pushExprStmt(std::vector<StmtPtr> &stmts, CXCursor cursor) {
+  if (cursorHasSideEffects(cursor))
+    stmts.push_back(
+        std::make_shared<ExprStmt>(buildExpr(cursor), getLoc(cursor)));
+  else
+    stmts.push_back(std::make_shared<CommentStmt>(
+        "No side effects: " + getSourceText(cursor), getLoc(cursor)));
+}
+
+bool IRBuilder::cursorHasSideEffects(CXCursor cursor) {
+  auto k = clang_getCursorKind(cursor);
+
+  if (k == CXCursor_CallExpr || k == CXCursor_CompoundAssignOperator)
+    return true;
+
+  if (k == CXCursor_BinaryOperator) {
+    auto op = extractBinOp(cursor);
+    if (op == "=")
+      return true;
+  }
+
+  if (k == CXCursor_UnaryOperator) {
+    auto info = extractUnaryOp(cursor);
+    if (info.op == "++" || info.op == "--")
+      return true;
+  }
+
+  // treat reads of volatile variables as side-effects
+  if (k == CXCursor_DeclRefExpr) {
+    auto ref = clang_getCursorReferenced(cursor);
+    if (clang_getCursorKind(ref) == CXCursor_VarDecl ||
+        clang_getCursorKind(ref) == CXCursor_FieldDecl) {
+      auto t = clang_getCursorType(ref);
+      if (clang_isVolatileQualifiedType(t))
+        return true;
+
+      // this check is more expensive so it's gated behind the lighter one
+      auto ct = clang_getCanonicalType(t);
+      if (clang_isVolatileQualifiedType(ct))
+        return true;
+    }
+  }
+
+  for (auto &c : getChildren(cursor)) {
+    if (cursorHasSideEffects(c))
+      return true;
+  }
+
+  return false;
 }
 
 // compound assignment expansion (a += b -> a = a + b)
@@ -726,7 +801,7 @@ void IRBuilder::buildCompoundAssign(CXCursor cursor,
   auto children = getChildren(cursor);
 
   if (children.size() != 2) {
-    stmts.push_back(std::make_unique<CommentStmt>(
+    stmts.push_back(std::make_shared<CommentStmt>(
         "TODO: unsupported compound assignment: " + getSourceText(cursor),
         loc));
     return;
@@ -746,33 +821,32 @@ void IRBuilder::buildCompoundAssign(CXCursor cursor,
 
         // hoist: load, compute, store
         std::string ldTmp = "al" + std::to_string(arrayTmpCounter++);
-        stmts.push_back(std::make_unique<VarDeclStmt>(
-            ldTmp, std::make_unique<RawExpr>("lds 1 " + addr, loc),
+        stmts.push_back(std::make_shared<VarDeclStmt>(
+            ldTmp, std::make_shared<RawExpr>("lds 1 " + addr, loc),
             std::nullopt, loc));
 
         auto rhs = buildExpr(children[1]);
         std::string resTmp = "al" + std::to_string(arrayTmpCounter++);
         auto baseOp = lookupBinOp(baseOpStr);
         if (baseOp) {
-          auto compExpr = std::make_unique<BinaryExpr>(
-              *baseOp, std::make_unique<VarRefExpr>(ldTmp, loc), std::move(rhs),
-              loc);
-          stmts.push_back(std::make_unique<VarDeclStmt>(
-              resTmp, std::move(compExpr), std::nullopt, loc));
+          auto compExpr = std::make_shared<BinaryExpr>(
+              *baseOp, std::make_shared<VarRefExpr>(ldTmp, loc), rhs, loc);
+          stmts.push_back(std::make_shared<VarDeclStmt>(resTmp, compExpr,
+                                                        std::nullopt, loc));
         } else {
-          stmts.push_back(std::make_unique<VarDeclStmt>(
+          stmts.push_back(std::make_shared<VarDeclStmt>(
               resTmp,
-              std::make_unique<RawExpr>(ldTmp + " " + baseOpStr + " " +
+              std::make_shared<RawExpr>(ldTmp + " " + baseOpStr + " " +
                                             getSourceText(children[1]),
                                         loc),
               std::nullopt, loc));
         }
-        stmts.push_back(std::make_unique<ExprStmt>(
-            std::make_unique<RawExpr>("st " + addr + ", " + resTmp, loc), loc));
+        stmts.push_back(std::make_shared<ExprStmt>(
+            std::make_shared<RawExpr>("st " + addr + ", " + resTmp, loc), loc));
         return;
       }
     }
-    stmts.push_back(std::make_unique<CommentStmt>(
+    stmts.push_back(std::make_shared<CommentStmt>(
         "TODO: Array compound assignment - " + getSourceText(cursor), loc));
     return;
   }
@@ -783,7 +857,7 @@ void IRBuilder::buildCompoundAssign(CXCursor cursor,
   std::string baseOpStr = opStr.substr(0, opStr.size() - 1);
   auto baseOp = lookupBinOp(baseOpStr);
   if (!baseOp) {
-    stmts.push_back(std::make_unique<CommentStmt>(
+    stmts.push_back(std::make_shared<CommentStmt>(
         "TODO: unsupported compound assignment: " + getSourceText(cursor),
         loc));
     return;
@@ -791,7 +865,7 @@ void IRBuilder::buildCompoundAssign(CXCursor cursor,
 
   // division and modulo not supported in Pancake
   if (*baseOp == BinOp::Div || *baseOp == BinOp::Mod) {
-    stmts.push_back(std::make_unique<CommentStmt>(
+    stmts.push_back(std::make_shared<CommentStmt>(
         "TODO: " + baseOpStr + " not available in Pancake at the moment - " +
             getSourceText(cursor),
         loc));
@@ -800,12 +874,10 @@ void IRBuilder::buildCompoundAssign(CXCursor cursor,
 
   std::string target = getCursorSpelling(children[0]);
   ExprPtr rhs = buildExpr(children[1]);
-  auto varRef = std::make_unique<VarRefExpr>(target, loc);
-  auto expanded = std::make_unique<BinaryExpr>(*baseOp, std::move(varRef),
-                                               std::move(rhs), loc);
+  auto varRef = std::make_shared<VarRefExpr>(target, loc);
+  auto expanded = std::make_shared<BinaryExpr>(*baseOp, varRef, rhs, loc);
 
-  stmts.push_back(
-      std::make_unique<AssignStmt>(target, std::move(expanded), loc));
+  stmts.push_back(std::make_shared<AssignStmt>(target, expanded, loc));
 }
 
 void IRBuilder::buildStructDecl(CXCursor cursor, std::vector<StmtPtr> &stmts) {
@@ -818,7 +890,7 @@ void IRBuilder::buildStructDecl(CXCursor cursor, std::vector<StmtPtr> &stmts) {
   }
 
   if (!name.empty() && !info.fieldNames.empty())
-    structTypes[name] = std::move(info);
+    structTypes[name] = info;
 }
 
 void IRBuilder::buildEnumDecl(CXCursor cursor, std::vector<StmtPtr> &stmts) {
@@ -827,7 +899,7 @@ void IRBuilder::buildEnumDecl(CXCursor cursor, std::vector<StmtPtr> &stmts) {
     if (clang_getCursorKind(child) == CXCursor_EnumConstantDecl) {
       std::string name = getCursorSpelling(child);
       int64_t value = clang_getEnumConstantDeclValue(child);
-      stmts.push_back(std::make_unique<DefineStmt>(name, value, loc));
+      stmts.push_back(std::make_shared<DefineStmt>(name, value, loc));
     }
   }
 }
@@ -839,7 +911,7 @@ void IRBuilder::buildSwitchStmt(CXCursor cursor, std::vector<StmtPtr> &stmts) {
   auto children = getChildren(cursor);
 
   if (children.size() < 2) {
-    stmts.push_back(std::make_unique<CommentStmt>(
+    stmts.push_back(std::make_shared<CommentStmt>(
         "TODO: unsupported switch: " + getSourceText(cursor), loc));
     return;
   }
@@ -847,8 +919,8 @@ void IRBuilder::buildSwitchStmt(CXCursor cursor, std::vector<StmtPtr> &stmts) {
   auto switchExpr = buildExpr(children[0]);
   std::string switchVar = "sw" + std::to_string(switchVarCounter++);
 
-  stmts.push_back(std::make_unique<VarDeclStmt>(
-      switchVar, std::move(switchExpr), std::nullopt, loc));
+  stmts.push_back(
+      std::make_shared<VarDeclStmt>(switchVar, switchExpr, std::nullopt, loc));
 
   // collect case groups
   struct CaseGroup {
@@ -881,7 +953,7 @@ void IRBuilder::buildSwitchStmt(CXCursor cursor, std::vector<StmtPtr> &stmts) {
         if (subKind == CXCursor_CaseStmt || subKind == CXCursor_DefaultStmt) {
           auto sub = unwrapLabels(ch[1]);
           for (auto &v : sub.values)
-            info.values.push_back(std::move(v));
+            info.values.push_back(v);
           info.bodyCursor = sub.bodyCursor;
           info.hasBody = sub.hasBody;
         } else {
@@ -895,7 +967,7 @@ void IRBuilder::buildSwitchStmt(CXCursor cursor, std::vector<StmtPtr> &stmts) {
         if (subKind == CXCursor_CaseStmt || subKind == CXCursor_DefaultStmt) {
           auto sub = unwrapLabels(ch[0]);
           for (auto &v : sub.values)
-            info.values.push_back(std::move(v));
+            info.values.push_back(v);
           info.bodyCursor = sub.bodyCursor;
           info.hasBody = sub.hasBody;
         } else {
@@ -914,7 +986,7 @@ void IRBuilder::buildSwitchStmt(CXCursor cursor, std::vector<StmtPtr> &stmts) {
       auto info = unwrapLabels(child);
 
       CaseGroup group;
-      group.values = std::move(info.values);
+      group.values = info.values;
       group.loc = getLoc(child);
 
       if (info.hasBody) {
@@ -922,7 +994,7 @@ void IRBuilder::buildSwitchStmt(CXCursor cursor, std::vector<StmtPtr> &stmts) {
         if (innerKind == CXCursor_CompoundStmt) {
           auto block = buildBlock(info.bodyCursor);
           for (auto &s : block->stmts)
-            group.body.push_back(std::move(s));
+            group.body.push_back(s);
         } else if (innerKind == CXCursor_BreakStmt) {
           // skip
         } else {
@@ -930,7 +1002,7 @@ void IRBuilder::buildSwitchStmt(CXCursor cursor, std::vector<StmtPtr> &stmts) {
         }
       }
 
-      groups.push_back(std::move(group));
+      groups.push_back(group);
     } else if (k == CXCursor_BreakStmt) {
       // skip
     } else {
@@ -956,8 +1028,8 @@ void IRBuilder::buildSwitchStmt(CXCursor cursor, std::vector<StmtPtr> &stmts) {
 
   BlockPtr elseBranch;
   if (defaultIdx >= 0) {
-    elseBranch = std::make_unique<Block>();
-    elseBranch->stmts = std::move(groups[defaultIdx].body);
+    elseBranch = std::make_shared<Block>();
+    elseBranch->stmts = groups[defaultIdx].body;
   }
 
   // build if/else chain back to front
@@ -971,98 +1043,163 @@ void IRBuilder::buildSwitchStmt(CXCursor cursor, std::vector<StmtPtr> &stmts) {
     // build condition: switchVar == val1 || switchVar == val2 || ...
     ExprPtr cond;
     for (auto &val : g.values) {
-      auto eq = std::make_unique<BinaryExpr>(
-          BinOp::Eq, std::make_unique<VarRefExpr>(switchVar, g.loc),
-          std::move(val), g.loc);
+      auto eq = std::make_shared<BinaryExpr>(
+          BinOp::Eq, std::make_shared<VarRefExpr>(switchVar, g.loc), val,
+          g.loc);
       if (!cond) {
-        cond = std::move(eq);
+        cond = eq;
       } else {
-        cond = std::make_unique<BinaryExpr>(BinOp::Or, std::move(cond),
-                                            std::move(eq), g.loc);
+        cond = std::make_shared<BinaryExpr>(BinOp::Or, cond, eq, g.loc);
       }
     }
 
     if (!cond)
       continue;
 
-    auto thenBlock = std::make_unique<Block>();
-    thenBlock->stmts = std::move(g.body);
+    auto thenBlock = std::make_shared<Block>();
+    thenBlock->stmts = g.body;
 
-    auto ifStmt = std::make_unique<IfStmt>(
-        std::move(cond), std::move(thenBlock), std::move(elseBranch), g.loc);
+    auto ifStmt = std::make_shared<IfStmt>(cond, thenBlock, elseBranch, g.loc);
 
-    elseBranch = std::make_unique<Block>();
-    elseBranch->stmts.push_back(std::move(ifStmt));
+    elseBranch = std::make_shared<Block>();
+    elseBranch->stmts.push_back(ifStmt);
   }
 
   if (elseBranch && !elseBranch->stmts.empty()) {
     for (auto &s : elseBranch->stmts)
-      stmts.push_back(std::move(s));
+      stmts.push_back(s);
   }
 }
 
-// array load hoisting
-
-ExprPtr IRBuilder::hoistArrayLoads(CXCursor cursor,
+ExprPtr IRBuilder::hoistArrayLoads(CXCursor top_cursor,
                                    std::vector<StmtPtr> &stmts) {
-  auto kind = clang_getCursorKind(cursor);
-  auto loc = getLoc(cursor);
+  // hoist array loads and deref ops as they require temp vars
+  // we use a post-traversal to hoist innermost ops first
 
-  // unwrap implicit casts / parens
-  if (kind == CXCursor_UnexposedExpr || kind == CXCursor_ParenExpr ||
-      kind == CXCursor_CStyleCastExpr) {
-    auto children = getChildren(cursor);
-    if (!children.empty())
-      return hoistArrayLoads(children[0], stmts);
-  }
+  // this function is called before
 
-  // arr[i] -> hoist to temp var
-  if (kind == CXCursor_ArraySubscriptExpr) {
-    auto arrChildren = getChildren(cursor);
-    if (arrChildren.size() == 2) {
-      std::string arrName = resolveVarName(arrChildren[0]);
-      auto ait = globalArrays.find(arrName);
-      if (ait != globalArrays.end()) {
-        std::string addr =
-            arrayAddr(ait->second.baseSlot, getSourceText(arrChildren[1]));
-        std::string tmpVar = "al" + std::to_string(arrayTmpCounter++);
-        stmts.push_back(std::make_unique<VarDeclStmt>(
-            tmpVar, std::make_unique<RawExpr>("lds 1 " + addr, loc),
-            std::nullopt, loc));
-        return std::make_unique<VarRefExpr>(tmpVar, loc);
-      }
-    }
-  }
+  struct StackFrame {
+    CXCursor cursor;
+    bool children_visited = false;
+  };
+  std::vector<StackFrame> stack(1);
+  stack.emplace_back(top_cursor, false);
 
-  // binary expr with array access -> hoist each side
-  if (kind == CXCursor_BinaryOperator) {
-    auto children = getChildren(cursor);
-    if (children.size() == 2) {
-      bool lhsHasArr =
-          hasDescendant(children[0], CXCursor_ArraySubscriptExpr) ||
-          clang_getCursorKind(children[0]) == CXCursor_ArraySubscriptExpr;
-      bool rhsHasArr =
-          hasDescendant(children[1], CXCursor_ArraySubscriptExpr) ||
-          clang_getCursorKind(children[1]) == CXCursor_ArraySubscriptExpr;
-      if (lhsHasArr || rhsHasArr) {
-        ExprPtr lhs = lhsHasArr ? hoistArrayLoads(children[0], stmts) : nullptr;
-        ExprPtr rhs = rhsHasArr ? hoistArrayLoads(children[1], stmts) : nullptr;
-        if (!lhs)
-          lhs = buildExpr(children[0]);
-        if (!rhs)
-          rhs = buildExpr(children[1]);
+  std::unordered_map<CursorHash, ExprPtr> hoistedExprs;
+  ExprPtr retval;
 
-        std::string opStr = extractBinOp(cursor);
-        auto op = lookupBinOp(opStr);
-        if (op) {
-          return std::make_unique<BinaryExpr>(*op, std::move(lhs),
-                                              std::move(rhs), loc);
+  while (!stack.empty()) {
+    StackFrame &frame = stack.back();
+    auto cursor = frame.cursor;
+
+    if (!frame.children_visited) {
+      frame.children_visited = true;
+
+      auto children = getChildren(cursor);
+      auto reverse_view = children | std::views::filter([](CXCursor c) {
+                            auto kind = clang_getCursorKind(c);
+                            return kind == CXCursor_ArraySubscriptExpr ||
+                                   (kind == CXCursor_UnaryOperator &&
+                                    clang_getCursorUnaryOperatorKind(c) ==
+                                        CXUnaryOperator_Deref) ||
+                                   kind == CXCursor_UnexposedExpr ||
+                                   kind == CXCursor_ParenExpr ||
+                                   kind == CXCursor_CStyleCastExpr;
+                          }) |
+                          std::views::reverse |
+                          std::views::transform(
+                              [](CXCursor c) { return StackFrame{c, false}; });
+      stack.reserve(stack.size() + std::ranges::distance(reverse_view));
+      stack.insert(stack.end(), reverse_view.begin(), reverse_view.end());
+    } else {
+      auto kind = clang_getCursorKind(cursor);
+      auto loc = getLoc(cursor);
+      auto children = getChildren(cursor);
+
+      switch (kind) {
+      case CXCursor_ArraySubscriptExpr: {
+        if (children.size() == 2) {
+          auto arrName = resolveVarName(children[0]);
+          auto ait = globalArrays.find(arrName);
+          // TODO need to support the cursed syntax of 42[arr] as well
+          if (ait != globalArrays.end()) {
+            auto tmpVar = std::format("al{}", arrayTmpCounter++);
+            ExprPtr idxExpr = nullptr;
+
+            auto range = clang_getCursorExtent(children[1]);
+            CursorHash hash{clang_getRangeStart(range),
+                            clang_getRangeEnd(range)};
+            auto hoistedIt = hoistedExprs.find(hash);
+            if (hoistedIt != hoistedExprs.end()) {
+              // reuse previously hoisted tmpvar directly
+              auto varRef = hoistedIt->second;
+
+              // (@base + (baseSlot + idx) * @biw)
+              // in this case idx is varRef
+              idxExpr = std::make_shared<BinaryExpr>(
+                  BinOp::Add, std::make_shared<RawExpr>("@base", loc),
+                  std::make_shared<BinaryExpr>(
+                      BinOp::Mul,
+                      std::make_shared<BinaryExpr>(
+                          BinOp::Add,
+                          std::make_shared<RawExpr>(
+                              std::format("{}", ait->second.baseSlot), loc),
+                          varRef, loc),
+                      std::make_shared<RawExpr>("@biw", loc), loc),
+                  loc);
+              hoistedExprs.erase(hoistedIt);
+            } else {
+              // create new temp var for this array access
+              idxExpr = buildExpr(children[1]);
+              auto parentRange = clang_getCursorExtent(cursor);
+              CursorHash parentHash{clang_getRangeStart(parentRange),
+                                    clang_getRangeEnd(parentRange)};
+              hoistedExprs[parentHash] =
+                  std::make_shared<VarRefExpr>(tmpVar, loc);
+            }
+
+            stmts.push_back(std::make_shared<VarDeclStmt>(tmpVar, idxExpr,
+                                                          std::nullopt, loc));
+            retval = std::make_shared<VarRefExpr>(tmpVar, loc);
+          }
         }
+        break;
       }
+      case CXCursor_UnaryOperator: {
+        // has to be deref
+        if (children.size() == 1) {
+          auto tmpVar = std::format("deref{}", derefTmpCounter++);
+          ExprPtr operandExpr = nullptr;
+
+          auto range = clang_getCursorExtent(children[0]);
+          CursorHash hash{clang_getRangeStart(range), clang_getRangeEnd(range)};
+          auto hoistedIt = hoistedExprs.find(hash);
+          if (hoistedIt != hoistedExprs.end()) {
+            // reuse previously hoisted deref tmpvar directly
+            operandExpr = hoistedIt->second;
+            hoistedExprs.erase(hoistedIt);
+          } else {
+            // create new temp var for this deref access
+            operandExpr = buildExpr(children[0]);
+          }
+
+          stmts.push_back(std::make_shared<VarDeclStmt>(tmpVar, operandExpr,
+                                                        std::nullopt, loc));
+          hoistedExprs[hash] = std::make_shared<VarRefExpr>(tmpVar, loc);
+          retval = std::make_shared<VarRefExpr>(tmpVar, loc);
+        }
+        break;
+      }
+
+      default:
+        break;
+      }
+
+      stack.pop_back();
     }
   }
 
-  return nullptr;
+  return retval;
 }
 
 // ternary expansion (cond ? a : b -> tmp var + if/else)
@@ -1086,37 +1223,36 @@ ExprPtr IRBuilder::tryExpandTernary(CXCursor cursor,
 
   std::string tmpVar = "tn" + std::to_string(ternaryVarCounter++);
 
-  stmts.push_back(std::make_unique<VarDeclStmt>(
-      tmpVar, std::make_unique<IntLitExpr>(0, loc), std::nullopt, loc));
+  stmts.push_back(std::make_shared<VarDeclStmt>(
+      tmpVar, std::make_shared<IntLitExpr>(0, loc), std::nullopt, loc));
 
   auto cond = buildExpr(children[0]);
 
   // then branch (may contain nested ternary)
-  auto thenBlock = std::make_unique<Block>();
+  auto thenBlock = std::make_shared<Block>();
   auto nestedTrue = tryExpandTernary(children[1], thenBlock->stmts);
   if (nestedTrue) {
     thenBlock->stmts.push_back(
-        std::make_unique<AssignStmt>(tmpVar, std::move(nestedTrue), loc));
+        std::make_shared<AssignStmt>(tmpVar, nestedTrue, loc));
   } else {
     thenBlock->stmts.push_back(
-        std::make_unique<AssignStmt>(tmpVar, buildExpr(children[1]), loc));
+        std::make_shared<AssignStmt>(tmpVar, buildExpr(children[1]), loc));
   }
 
   // else branch (may contain nested ternary)
-  auto elseBlock = std::make_unique<Block>();
+  auto elseBlock = std::make_shared<Block>();
   auto nestedFalse = tryExpandTernary(children[2], elseBlock->stmts);
   if (nestedFalse) {
     elseBlock->stmts.push_back(
-        std::make_unique<AssignStmt>(tmpVar, std::move(nestedFalse), loc));
+        std::make_shared<AssignStmt>(tmpVar, nestedFalse, loc));
   } else {
     elseBlock->stmts.push_back(
-        std::make_unique<AssignStmt>(tmpVar, buildExpr(children[2]), loc));
+        std::make_shared<AssignStmt>(tmpVar, buildExpr(children[2]), loc));
   }
 
-  stmts.push_back(std::make_unique<IfStmt>(
-      std::move(cond), std::move(thenBlock), std::move(elseBlock), loc));
+  stmts.push_back(std::make_shared<IfStmt>(cond, thenBlock, elseBlock, loc));
 
-  return std::make_unique<VarRefExpr>(tmpVar, loc);
+  return std::make_shared<VarRefExpr>(tmpVar, loc);
 }
 
 ExprPtr IRBuilder::buildExpr(CXCursor cursor) {
@@ -1130,10 +1266,10 @@ ExprPtr IRBuilder::buildExpr(CXCursor cursor) {
   case CXCursor_FloatingLiteral:
   case CXCursor_StringLiteral:
   case CXCursor_CharacterLiteral:
-    return std::make_unique<RawExpr>(getSourceText(cursor), loc);
+    return std::make_shared<RawExpr>(getSourceText(cursor), loc);
 
   case CXCursor_DeclRefExpr:
-    return std::make_unique<VarRefExpr>(getCursorSpelling(cursor), loc);
+    return std::make_shared<VarRefExpr>(getCursorSpelling(cursor), loc);
 
   case CXCursor_BinaryOperator:
     return buildBinaryExpr(cursor);
@@ -1149,14 +1285,16 @@ ExprPtr IRBuilder::buildExpr(CXCursor cursor) {
     auto children = getChildren(cursor);
     if (!children.empty())
       return buildExpr(children[0]);
-    return std::make_unique<RawExpr>(getSourceText(cursor), loc);
+    return std::make_shared<RawExpr>(getSourceText(cursor), loc);
   }
   case CXCursor_CStyleCastExpr: {
     auto children = getChildren(cursor);
     if (!children.empty())
       return buildExpr(children.back());
-    return std::make_unique<RawExpr>(getSourceText(cursor), loc);
+    return std::make_shared<RawExpr>(getSourceText(cursor), loc);
   }
+  // this only handles the TRIVIAL case!
+  // For nested index access and so on, see hoistArrayLoads
   case CXCursor_ArraySubscriptExpr: {
     auto arrChildren = getChildren(cursor);
     if (arrChildren.size() == 2) {
@@ -1165,10 +1303,10 @@ ExprPtr IRBuilder::buildExpr(CXCursor cursor) {
       if (ait != globalArrays.end()) {
         std::string addr =
             arrayAddr(ait->second.baseSlot, getSourceText(arrChildren[1]));
-        return std::make_unique<RawExpr>("lds 1 " + addr, loc);
+        return std::make_shared<RawExpr>("lds 1 " + addr, loc);
       }
     }
-    return std::make_unique<RawExpr>(
+    return std::make_shared<RawExpr>(
         "/* TODO: Array access - " + getSourceText(cursor) + " */", loc);
   }
 
@@ -1179,13 +1317,13 @@ ExprPtr IRBuilder::buildExpr(CXCursor cursor) {
       std::string varName = resolveVarName(memberChildren[0]);
       int fi = findStructFieldIndex(varName, fieldName);
       if (fi >= 0)
-        return std::make_unique<FieldAccessExpr>(varName, fi, loc);
+        return std::make_shared<FieldAccessExpr>(varName, fi, loc);
     }
-    return std::make_unique<RawExpr>(getSourceText(cursor), loc);
+    return std::make_shared<RawExpr>(getSourceText(cursor), loc);
   }
 
   case CXCursor_ConditionalOperator:
-    return std::make_unique<RawExpr>(getSourceText(cursor), loc);
+    return std::make_shared<RawExpr>(getSourceText(cursor), loc);
 
   case CXCursor_InitListExpr: {
     auto children = getChildren(cursor);
@@ -1196,13 +1334,13 @@ ExprPtr IRBuilder::buildExpr(CXCursor cursor) {
       result += getSourceText(children[i]);
     }
     result += ">";
-    return std::make_unique<RawExpr>(result, loc);
+    return std::make_shared<RawExpr>(result, loc);
   }
   case CXCursor_CompoundAssignOperator:
-    return std::make_unique<RawExpr>(getSourceText(cursor), loc);
+    return std::make_shared<RawExpr>(getSourceText(cursor), loc);
 
   default:
-    return std::make_unique<RawExpr>(getSourceText(cursor), loc);
+    return std::make_shared<RawExpr>(getSourceText(cursor), loc);
   }
 }
 
@@ -1211,20 +1349,20 @@ ExprPtr IRBuilder::buildBinaryExpr(CXCursor cursor) {
   auto children = getChildren(cursor);
 
   if (children.size() != 2)
-    return std::make_unique<RawExpr>(getSourceText(cursor), loc);
+    return std::make_shared<RawExpr>(getSourceText(cursor), loc);
 
   std::string opStr = extractBinOp(cursor);
 
   if (opStr == "=")
-    return std::make_unique<RawExpr>(getSourceText(cursor), loc);
+    return std::make_shared<RawExpr>(getSourceText(cursor), loc);
 
   auto op = lookupBinOp(opStr);
   if (!op)
-    return std::make_unique<RawExpr>(getSourceText(cursor), loc);
+    return std::make_shared<RawExpr>(getSourceText(cursor), loc);
 
   if (*op == BinOp::Div || *op == BinOp::Mod) {
     std::string opName = (*op == BinOp::Div) ? "Division" : "Modulo";
-    return std::make_unique<RawExpr>(
+    return std::make_shared<RawExpr>(
         "/* TODO: " + opName + " not available in Pancake at the moment - " +
             getSourceText(cursor) + " */",
         loc);
@@ -1232,38 +1370,38 @@ ExprPtr IRBuilder::buildBinaryExpr(CXCursor cursor) {
 
   auto lhs = buildExpr(children[0]);
   auto rhs = buildExpr(children[1]);
-  return std::make_unique<BinaryExpr>(*op, std::move(lhs), std::move(rhs), loc);
+  return std::make_shared<BinaryExpr>(*op, lhs, rhs, loc);
 }
 
 ExprPtr IRBuilder::buildUnaryExpr(CXCursor cursor) {
   auto loc = getLoc(cursor);
   auto children = getChildren(cursor);
   if (children.empty())
-    return std::make_unique<RawExpr>(getSourceText(cursor), loc);
+    return std::make_shared<RawExpr>(getSourceText(cursor), loc);
 
   auto info = extractUnaryOp(cursor);
 
   if (info.op == "++" || info.op == "--")
-    return std::make_unique<RawExpr>(getSourceText(cursor), loc);
+    return std::make_shared<RawExpr>(getSourceText(cursor), loc);
 
   auto op = lookupUnaryOp(info.op);
   if (!op)
-    return std::make_unique<RawExpr>(getSourceText(cursor), loc);
+    return std::make_shared<RawExpr>(getSourceText(cursor), loc);
 
   auto operand = buildExpr(children[0]);
-  return std::make_unique<UnaryExpr>(*op, std::move(operand), loc);
+  return std::make_shared<UnaryExpr>(*op, operand, loc);
 }
 
 ExprPtr IRBuilder::buildCallExpr(CXCursor cursor) {
   auto loc = getLoc(cursor);
   auto children = getChildren(cursor);
   if (children.empty())
-    return std::make_unique<RawExpr>(getSourceText(cursor), loc);
+    return std::make_shared<RawExpr>(getSourceText(cursor), loc);
 
   std::string callee = getCalleeName(cursor);
 
   if (callee == "printf") {
-    return std::make_unique<RawExpr>(
+    return std::make_shared<RawExpr>(
         "/* TODO: printf not available in Pancake - " + getSourceText(cursor) +
             " */",
         loc);
@@ -1273,16 +1411,16 @@ ExprPtr IRBuilder::buildCallExpr(CXCursor cursor) {
   for (size_t i = 1; i < children.size(); i++)
     args.push_back(buildExpr(children[i]));
 
-  return std::make_unique<CallExpr>(callee, std::move(args), loc);
+  return std::make_shared<CallExpr>(callee, args, loc);
 }
 
 ExprPtr IRBuilder::buildIntLit(CXCursor cursor) {
   std::string text = getSourceText(cursor);
   try {
     int64_t value = std::stoll(text, nullptr, 0);
-    return std::make_unique<IntLitExpr>(value, getLoc(cursor));
+    return std::make_shared<IntLitExpr>(value, getLoc(cursor));
   } catch (...) {
-    return std::make_unique<RawExpr>(text, getLoc(cursor));
+    return std::make_shared<RawExpr>(text, getLoc(cursor));
   }
 }
 
@@ -1302,12 +1440,11 @@ StmtPtr IRBuilder::tryBuildIncrDecr(CXCursor cursor) {
 
   auto loc = getLoc(cursor);
   BinOp op = (info.op == "++") ? BinOp::Add : BinOp::Sub;
-  auto varRef = std::make_unique<VarRefExpr>(varName, loc);
-  auto one = std::make_unique<IntLitExpr>(1, loc);
-  auto expr =
-      std::make_unique<BinaryExpr>(op, std::move(varRef), std::move(one), loc);
+  auto varRef = std::make_shared<VarRefExpr>(varName, loc);
+  auto one = std::make_shared<IntLitExpr>(1, loc);
+  auto expr = std::make_shared<BinaryExpr>(op, varRef, one, loc);
 
-  return std::make_unique<AssignStmt>(varName, std::move(expr), loc);
+  return std::make_shared<AssignStmt>(varName, expr, loc);
 }
 
 // operator extraction via tokenization
@@ -1481,7 +1618,7 @@ const std::string &IRBuilder::getFileContent(CXFile file) {
     return empty;
   std::string content((std::istreambuf_iterator<char>(f)),
                       std::istreambuf_iterator<char>());
-  return sourceCache.emplace(name, std::move(content)).first->second;
+  return sourceCache.emplace(name, content).first->second;
 }
 
 std::string IRBuilder::getSourceSlice(CXFile file, unsigned start,
@@ -1492,7 +1629,7 @@ std::string IRBuilder::getSourceSlice(CXFile file, unsigned start,
   return content.substr(start, end - start);
 }
 
-bool IRBuilder::hasDescendant(CXCursor cursor, CXCursorKind targetKind) {
+bool IRBuilder::getDescendant(CXCursor cursor, CXCursorKind targetKind) {
   struct Ctx {
     CXCursorKind target;
     bool found;

@@ -14,6 +14,16 @@ public:
 
   std::unique_ptr<Program> build(const std::string &filename);
 
+  struct CursorHash {
+    CXSourceLocation startLoc;
+    CXSourceLocation endLoc;
+
+    bool operator==(const CursorHash &other) const {
+      return clang_equalLocations(startLoc, other.startLoc) &&
+             clang_equalLocations(endLoc, other.endLoc);
+    }
+  };
+
 private:
   CXTranslationUnit tu = nullptr;
   CXIndex index = nullptr;
@@ -55,6 +65,7 @@ private:
   int switchVarCounter = 0;
   int ternaryVarCounter = 0;
   int arrayTmpCounter = 0;
+  int derefTmpCounter = 0;
 
   void scanFFIAnnotations(const std::string &filename);
 
@@ -71,7 +82,7 @@ private:
   static std::string stripStructPrefix(const std::string &name);
 
   // top-level builders
-  std::unique_ptr<Function> buildFunction(CXCursor cursor);
+  std::shared_ptr<Function> buildFunction(CXCursor cursor);
   BlockPtr buildBlock(CXCursor cursor);
 
   // statement builders
@@ -91,6 +102,11 @@ private:
   ExprPtr buildIntLit(CXCursor cursor);
   ExprPtr tryExpandTernary(CXCursor cursor, std::vector<StmtPtr> &stmts);
   ExprPtr hoistArrayLoads(CXCursor cursor, std::vector<StmtPtr> &stmts);
+
+  void pushExprStmt(std::vector<StmtPtr> &stmts, CXCursor cursor);
+
+  // detect whether a cursor or any of its descendants may have side effects
+  bool cursorHasSideEffects(CXCursor cursor);
 
   // for-loop helpers
   struct ForParts {
@@ -112,14 +128,14 @@ private:
   std::string getCalleeName(CXCursor callExpr);
 
   // libclang helpers
-  std::vector<CXCursor> getChildren(CXCursor cursor);
+  static std::vector<CXCursor> getChildren(CXCursor cursor);
   std::string getSourceText(CXCursor cursor);
   std::string getCursorSpelling(CXCursor cursor);
-  std::string getTypeSpelling(CXCursor cursor);
-  SourceLoc getLoc(CXCursor cursor);
+  static std::string getTypeSpelling(CXCursor cursor);
+  static SourceLoc getLoc(CXCursor cursor);
   const std::string &getFileContent(CXFile file);
   std::string getSourceSlice(CXFile file, unsigned start, unsigned end);
-  bool hasDescendant(CXCursor cursor, CXCursorKind kind);
+  static bool getDescendant(CXCursor cursor, CXCursorKind kind);
 };
 } // namespace pancake
 #endif
