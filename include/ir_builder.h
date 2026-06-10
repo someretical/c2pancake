@@ -2,6 +2,7 @@
 #define IR_BUILDER_H
 
 #include "pancake_ir.h"
+
 #include <clang-c/Index.h>
 #include <optional>
 #include <unordered_map>

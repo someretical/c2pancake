@@ -3,6 +3,8 @@ project(c2pancake)
 
 set(CMAKE_CXX_STANDARD 26)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -stdlib=libstdc++")
 
 find_package(LLVM REQUIRED CONFIG)
 message(STATUS "Found LLVM ${LLVM_PACKAGE_VERSION}")
@@ -31,6 +33,7 @@ set(SOURCES
     src/ir_builder.cpp
     src/codegen.cpp
     src/main.cpp
+    src/util.cpp
 )
 
 add_executable(c2pancake ${SOURCES})
