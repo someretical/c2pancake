@@ -5,14 +5,15 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "type": "lldb",
+            "type": "lldb-dap",
             "request": "launch",
-            "name": "Launch",
-            "program": "${workspaceFolder}/build/Debug/c2pancake",
+            "name": "Debug c2pancake",
+            "program": "${command:cmake.launchTargetPath}",
             "args": [
                 "tests/arith.c"
             ],
-            "cwd": "${workspaceFolder}"
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal"
         }
     ]
 }

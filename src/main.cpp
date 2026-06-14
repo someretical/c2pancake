@@ -10,9 +10,9 @@ namespace fs = std::filesystem;
 
 int main(int argc, char *argv[]) {
   if (argc < 2) {
-    std::print("Usage: {} <input.c> [output.pancake]\n", argv[0]);
-    std::print("  Transpiles C code to Pancake\n");
-    std::print("  If output file is not specified, outputs to stdout\n");
+    std::println("Usage: {} <input.c> [output.pancake]", argv[0]);
+    std::println("  Transpiles C code to Pancake");
+    std::println("  If output file is not specified, outputs to stdout");
     return 1;
   }
 
@@ -22,13 +22,12 @@ int main(int argc, char *argv[]) {
   pancake::IRBuilder builder;
   auto program = builder.build(input_file.string());
   if (!program) {
-    // std::println outputs cleanly to stderr when passed std::cerr
     std::println(std::cerr, "Transpilation failed");
     return 1;
   }
 
   pancake::CodeGen codegen;
-  std::string result = codegen.generate(*program);
+  auto result = codegen.generate(*program);
 
   // If an output file is provided
   if (argc >= 3) {
@@ -45,7 +44,6 @@ int main(int argc, char *argv[]) {
     std::println("Successfully transpiled {} to {}", input_file.string(),
                  output_file.string());
   } else {
-    // Direct format string output without dealing with std::cout streams
     std::print("{}", result);
   }
 

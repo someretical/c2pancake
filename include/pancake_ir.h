@@ -1,5 +1,5 @@
-#ifndef PANCAKE_IR_H
-#define PANCAKE_IR_H
+#ifndef C2PANCAKE_IR_H
+#define C2PANCAKE_IR_H
 
 #include <memory>
 #include <optional>
@@ -35,9 +35,9 @@ enum class BinOp {
 };
 
 enum class UnaryOp {
-  Negate,
+  Negate, // pretty sure this is not supported in pancake
   Not,
-  BitwiseNot,
+  BitwiseNot, // this is also not supported
 };
 
 struct Expr;
@@ -55,10 +55,15 @@ enum class ExprKind {
   Binary,
   Unary,
   Call,
-  Raw,
   StructLit,
   FieldAccess,
   MemoryLoad,
+  Raw,
+  ArrayIndex, // helper
+  ArrayLoad,  // helper, complementary to ArrayStoreStmt
+  BasePtr,
+  TopPtr,
+  BytesInWord,
 };
 
 struct Expr {
@@ -109,6 +114,18 @@ struct RawExpr : Expr {
   RawExpr(std::string t, SourceLoc l = {}) : Expr(ExprKind::Raw, l), text(t) {}
 };
 
+struct BasePtrExpr : RawExpr {
+  BasePtrExpr(SourceLoc l = {}) : RawExpr("@base", l) {}
+};
+
+struct TopPtrExpr : RawExpr {
+  TopPtrExpr(SourceLoc l = {}) : RawExpr("@top", l) {}
+};
+
+struct BytesInWordExpr : RawExpr {
+  BytesInWordExpr(SourceLoc l = {}) : RawExpr("@biw", l) {}
+};
+
 struct StructLitExpr : Expr {
   std::vector<ExprPtr> fields;
   StructLitExpr(std::vector<ExprPtr> f, SourceLoc l = {})
@@ -129,8 +146,23 @@ struct MemoryLoadExpr : Expr {
       : Expr(ExprKind::MemoryLoad, l), shape(shape), addrExpr(addr) {}
 };
 
+struct ArrayIndexExpr : Expr {
+  ExprPtr idx;
+  ExprPtr step;
+  ArrayIndexExpr(ExprPtr i, ExprPtr s, SourceLoc l = {})
+      : Expr(ExprKind::ArrayIndex, l), idx(i), step(s) {}
+};
+
+struct ArrayLoadExpr : Expr {
+  int baseSlot;
+  ExprPtr indexExpr; // this should be a ArrayIndexExpr!!!
+  ArrayLoadExpr(int bs, ExprPtr idx, SourceLoc l = {})
+      : Expr(ExprKind::ArrayLoad, l), baseSlot(bs), indexExpr(idx) {}
+};
+
 // statements
 enum class StmtKind {
+  Block,
   VarDecl,
   Assign,
   Return,
@@ -143,6 +175,7 @@ enum class StmtKind {
   Break,
   Continue,
   MemoryStore,
+  ArrayStore,        // helper for array element assignment
   SharedMemoryStore, // TODO
   SharedMemoryLoad,  // TODO
 };
@@ -161,6 +194,13 @@ struct Block {
   SourceLoc loc;
 };
 
+struct BlockStmt : Stmt {
+  BlockPtr block;
+  SourceLoc loc;
+  BlockStmt(BlockPtr b, SourceLoc l = {})
+      : Stmt(StmtKind::Block, l), block(b) {}
+};
+
 struct VarDeclStmt : Stmt {
   std::string name;
   std::optional<int> shape; // shape hint for call-initialized vars
@@ -171,10 +211,13 @@ struct VarDeclStmt : Stmt {
 };
 
 struct AssignStmt : Stmt {
-  std::string target;
+  ExprPtr target;
   ExprPtr value;
-  AssignStmt(std::string t, ExprPtr v, SourceLoc l = {})
+  AssignStmt(ExprPtr t, ExprPtr v, SourceLoc l = {})
       : Stmt(StmtKind::Assign, l), target(t), value(v) {}
+  AssignStmt(std::string t, ExprPtr v, SourceLoc l = {})
+      : Stmt(StmtKind::Assign, l), target(std::make_shared<VarRefExpr>(t, l)),
+        value(v) {}
 };
 
 struct ReturnStmt : Stmt {
@@ -225,6 +268,15 @@ struct MemoryStoreStmt : Stmt {
       : Stmt(StmtKind::MemoryStore, l), srcExpr(src), destExpr(dest) {}
 };
 
+struct ArrayStoreStmt : Stmt {
+  int baseSlot;
+  ExprPtr indexExpr; // this should be a ArrayIndexExpr!!!
+  ExprPtr valueExpr;
+  ArrayStoreStmt(int bs, ExprPtr idx, ExprPtr val, SourceLoc l = {})
+      : Stmt(StmtKind::ArrayStore, l), baseSlot(bs), indexExpr(idx),
+        valueExpr(val) {}
+};
+
 struct DefineStmt : Stmt {
   std::string name;
   int64_t value;
@@ -247,7 +299,7 @@ struct StructFieldAssignStmt : Stmt {
 // top-level
 struct Param {
   std::string name;
-  int shape = 1;
+  size_t shape = 1;
 };
 
 struct Function {
@@ -263,4 +315,4 @@ struct Program {
   std::vector<std::shared_ptr<Function>> functions;
 };
 } // namespace pancake
-#endif
+#endif // C2PANCAKE_IR_H

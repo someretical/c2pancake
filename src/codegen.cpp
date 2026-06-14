@@ -77,7 +77,7 @@ const char *CodeGen::opString(BinOp op) {
   case BinOp::Shr:
     return ">>";
   }
-  return "?";
+  return "<?>";
 }
 
 const char *CodeGen::opString(UnaryOp op) {
@@ -144,13 +144,13 @@ void CodeGen::emit(const Function &func) {
   out << ") ";
 
   if (func.body) {
-    emitBlock(*func.body);
+    emitBlock(*func.body, false);
   } else {
     out << "{\n}\n";
   }
 }
 
-void CodeGen::emitBlock(const Block &block) {
+void CodeGen::emitBlock(const Block &block, bool appendSemicolon) {
   out << "{\n";
   increaseIndent();
 
@@ -168,6 +168,11 @@ void CodeGen::emitBlock(const Block &block) {
 
 void CodeGen::emitStmt(const Stmt &stmt) {
   switch (stmt.kind) {
+  case StmtKind::Block: {
+    auto &s = static_cast<const BlockStmt &>(stmt);
+    emitBlock(*s.block, true);
+    break;
+  }
   case StmtKind::VarDecl: {
     auto &s = static_cast<const VarDeclStmt &>(stmt);
     out << "var ";
@@ -182,7 +187,8 @@ void CodeGen::emitStmt(const Stmt &stmt) {
   }
   case StmtKind::Assign: {
     auto &s = static_cast<const AssignStmt &>(stmt);
-    out << s.target << " = ";
+    emitExpr(*s.target);
+    out << " = ";
     emitExpr(*s.value);
     break;
   }
@@ -202,10 +208,10 @@ void CodeGen::emitStmt(const Stmt &stmt) {
     out << "if (";
     emitExpr(*s.condition);
     out << ") ";
-    emitBlock(*s.thenBranch);
+    emitBlock(*s.thenBranch, false);
     if (s.elseBranch) {
       out << " else ";
-      emitBlock(*s.elseBranch);
+      emitBlock(*s.elseBranch, false);
     }
     break;
   }
@@ -214,7 +220,7 @@ void CodeGen::emitStmt(const Stmt &stmt) {
     out << "while (";
     emitExpr(*s.condition);
     out << ") ";
-    emitBlock(*s.body);
+    emitBlock(*s.body, false);
     break;
   }
   case StmtKind::ExprStmt: {
@@ -262,6 +268,16 @@ void CodeGen::emitStmt(const Stmt &stmt) {
     emitExpr(*s.destExpr);
     out << ", ";
     emitExpr(*s.srcExpr);
+    break;
+  }
+  case StmtKind::ArrayStore: {
+    // st @base + (baseSlot + indexExpr), valueExpr
+    // note that ArrayIndexExpr calculates the step size for us
+    auto &s = static_cast<const ArrayStoreStmt &>(stmt);
+    out << std::format("st @base + ({} + (", s.baseSlot);
+    emitExpr(*s.indexExpr);
+    out << "), ";
+    emitExpr(*s.valueExpr);
     break;
   }
   case StmtKind::SharedMemoryStore: {
@@ -319,6 +335,9 @@ void CodeGen::emitExpr(const Expr &expr, int parentPrec) {
     out << ")";
     break;
   }
+  case ExprKind::BasePtr:
+  case ExprKind::TopPtr:
+  case ExprKind::BytesInWord:
   case ExprKind::Raw: {
     auto &e = static_cast<const RawExpr &>(expr);
     out << e.text;
@@ -343,8 +362,33 @@ void CodeGen::emitExpr(const Expr &expr, int parentPrec) {
   case ExprKind::MemoryLoad: {
     auto &e = static_cast<const MemoryLoadExpr &>(expr);
     // TODO only lds 1 <addr> actually compiles
-    out << "lds " << e.shape << " ";
+    out << std::format("(lds {} (", e.shape);
     emitExpr(*e.addrExpr);
+    out << "))";
+    break;
+  }
+  case ExprKind::ArrayIndex: {
+    auto &e = static_cast<const ArrayIndexExpr &>(expr);
+    // this is just a helper for calculating the step size for array accesses
+    // it should never appear in the final output
+    bool needParens = parentPrec > precedence(BinOp::Mul);
+    if (needParens)
+      out << "(";
+    emitExpr(*e.idx);
+    out << " * ";
+    emitExpr(*e.step);
+    if (needParens)
+      out << ")";
+    break;
+  }
+  case ExprKind::ArrayLoad: {
+    auto &e = static_cast<const ArrayLoadExpr &>(expr);
+    // this is a helper for array element access, it should be emitted as
+    // lds 1 @base + (baseSlot + indexExpr)
+    // TODO figure out how to support different load sizes
+    out << std::format("(lds 1 (@base + {} + (", e.baseSlot);
+    emitExpr(*e.indexExpr);
+    out << ")))";
     break;
   }
   }

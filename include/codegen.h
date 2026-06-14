@@ -1,7 +1,8 @@
-#ifndef CODEGEN_H
-#define CODEGEN_H
+#ifndef C2PANCAKE_CODEGEN_H
+#define C2PANCAKE_CODEGEN_H
 
 #include "pancake_ir.h"
+
 #include <sstream>
 #include <string>
 
@@ -15,7 +16,7 @@ private:
   int indentLevel = 0;
 
   void emit(const Function &func);
-  void emitBlock(const Block &block);
+  void emitBlock(const Block &block, bool appendSemicolon);
   void emitStmt(const Stmt &stmt);
   void emitExpr(const Expr &expr, int parentPrec = -1);
 
@@ -29,4 +30,4 @@ private:
   static bool needsSemicolon(const Stmt &stmt);
 };
 } // namespace pancake
-#endif
+#endif // C2PANCAKE_CODEGEN_H

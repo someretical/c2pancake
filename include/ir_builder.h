@@ -1,5 +1,5 @@
-#ifndef IR_BUILDER_H
-#define IR_BUILDER_H
+#ifndef C2PANCAKE_IR_BUILDER_H
+#define C2PANCAKE_IR_BUILDER_H
 
 #include "pancake_ir.h"
 
@@ -15,14 +15,18 @@ public:
 
   std::unique_ptr<Program> build(const std::string &filename);
 
-  struct CursorHash {
-    CXSourceLocation startLoc;
-    CXSourceLocation endLoc;
+  struct BuiltExpression {
+    // the final expression to use
+    ExprPtr finalExpr;
+    // array indexing/deref ops may require tmp vars
+    std::vector<StmtPtr> preStmts;
+    std::vector<StmtPtr> postStmts;
+  };
 
-    bool operator==(const CursorHash &other) const {
-      return clang_equalLocations(startLoc, other.startLoc) &&
-             clang_equalLocations(endLoc, other.endLoc);
-    }
+  enum class CursorContext {
+    ValueContext,     // normal rvalue context
+    AssignmentTarget, // cursor is the target of an assignment
+    AddressContext,   // cursor is operand of address-of operator
   };
 
 private:
@@ -67,6 +71,7 @@ private:
   int ternaryVarCounter = 0;
   int arrayTmpCounter = 0;
   int derefTmpCounter = 0;
+  int compoundAssignTmpCounter = 0;
 
   void scanFFIAnnotations(const std::string &filename);
 
@@ -87,24 +92,27 @@ private:
   BlockPtr buildBlock(CXCursor cursor);
 
   // statement builders
-  void buildStmt(CXCursor cursor, std::vector<StmtPtr> &stmts);
-  void buildVarDecl(CXCursor cursor, std::vector<StmtPtr> &stmts);
-  void buildForStmt(CXCursor cursor, std::vector<StmtPtr> &stmts);
-  void buildCompoundAssign(CXCursor cursor, std::vector<StmtPtr> &stmts);
-  void buildStructDecl(CXCursor cursor, std::vector<StmtPtr> &stmts);
-  void buildEnumDecl(CXCursor cursor, std::vector<StmtPtr> &stmts);
-  void buildSwitchStmt(CXCursor cursor, std::vector<StmtPtr> &stmts);
+  std::vector<StmtPtr> buildStmt(CXCursor cursor);
+  std::vector<StmtPtr> buildVarDecl(CXCursor cursor);
+  std::vector<StmtPtr> buildForStmt(CXCursor cursor);
+  std::vector<StmtPtr> buildStructDecl(CXCursor cursor);
+  std::vector<StmtPtr> buildEnumDecl(CXCursor cursor);
+  std::vector<StmtPtr> buildSwitchStmt(CXCursor cursor);
 
   // expression builders
-  ExprPtr buildExpr(CXCursor cursor);
-  ExprPtr buildBinaryExpr(CXCursor cursor);
-  ExprPtr buildUnaryExpr(CXCursor cursor);
-  ExprPtr buildCallExpr(CXCursor cursor);
-  ExprPtr buildIntLit(CXCursor cursor);
-  ExprPtr tryExpandTernary(CXCursor cursor, std::vector<StmtPtr> &stmts);
-  ExprPtr hoistArrayLoads(CXCursor cursor, std::vector<StmtPtr> &stmts);
-
-  void pushExprStmt(std::vector<StmtPtr> &stmts, CXCursor cursor);
+  BuiltExpression buildExpr(CXCursor cursor, enum CursorContext ctx);
+  BuiltExpression buildBinaryExpr(CXCursor cursor, enum CursorContext lhsCtx,
+                                  enum CursorContext rhsCtx);
+  BuiltExpression buildCompoundAssignExpr(CXCursor cursor,
+                                          enum CursorContext lhsCtx,
+                                          enum CursorContext rhsCtx);
+  BuiltExpression buildUnaryExpr(CXCursor cursor, enum CursorContext ctx);
+  BuiltExpression buildArraySubscriptExpr(CXCursor cursor,
+                                          enum CursorContext ctx);
+  BuiltExpression buildCallExpr(CXCursor cursor, enum CursorContext ctx);
+  BuiltExpression buildIntLit(CXCursor cursor, enum CursorContext ctx);
+  BuiltExpression tryExpandTernary(CXCursor cursor,
+                                   std::vector<StmtPtr> &stmts);
 
   // detect whether a cursor or any of its descendants may have side effects
   bool cursorHasSideEffects(CXCursor cursor);
@@ -117,15 +125,10 @@ private:
   ForParts classifyForChildren(CXCursor forStmt);
   void buildForUpdate(CXCursor cursor, std::vector<StmtPtr> &stmts);
 
-  StmtPtr tryBuildIncrDecr(CXCursor cursor);
+  BuiltExpression tryBuildIncrDecr(CXCursor cursor,
+                                   std::vector<StmtPtr> &stmts);
 
   // operator extraction
-  std::string extractBinOp(CXCursor cursor);
-  struct UnaryOpInfo {
-    std::string op;
-    bool isPrefix;
-  };
-  UnaryOpInfo extractUnaryOp(CXCursor cursor);
   std::string getCalleeName(CXCursor callExpr);
 
   // libclang helpers
@@ -134,9 +137,10 @@ private:
   std::string getCursorSpelling(CXCursor cursor);
   static std::string getTypeSpelling(CXCursor cursor);
   static SourceLoc getLoc(CXCursor cursor);
+  static SourceLoc getEndLoc(CXCursor cursor);
   const std::string &getFileContent(CXFile file);
   std::string getSourceSlice(CXFile file, unsigned start, unsigned end);
   static bool getDescendant(CXCursor cursor, CXCursorKind kind);
 };
 } // namespace pancake
-#endif
+#endif // C2PANCAKE_IR_BUILDER_H

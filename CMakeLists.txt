@@ -4,6 +4,8 @@ project(c2pancake)
 set(CMAKE_CXX_STANDARD 26)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+
+# also requires gcc 14+
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -stdlib=libstdc++")
 
 find_package(LLVM REQUIRED CONFIG)
@@ -26,15 +28,16 @@ if(NOT LIBCLANG_LIBRARY OR NOT LIBCLANG_INCLUDE_DIR)
     message(FATAL_ERROR "libclang not found!")
 endif()
 
-include_directories(${LIBCLANG_INCLUDE_DIR})
-include_directories(include)
-
-set(SOURCES
+add_library(c2pancake_lib 
     src/ir_builder.cpp
     src/codegen.cpp
-    src/main.cpp
-    src/util.cpp
+)
+target_include_directories(c2pancake_lib PUBLIC ${LIBCLANG_INCLUDE_DIR} include)
+target_link_libraries(c2pancake_lib ${LIBCLANG_LIBRARY})
+set_target_properties(c2pancake_lib PROPERTIES
+    OUTPUT_NAME c2pancake
 )
 
-add_executable(c2pancake ${SOURCES})
-target_link_libraries(c2pancake ${LIBCLANG_LIBRARY})
+add_executable(c2pancake src/main.cpp)
+target_include_directories(c2pancake PUBLIC include)
+target_link_libraries(c2pancake c2pancake_lib)

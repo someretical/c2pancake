@@ -1,3 +1,6 @@
 {
-    "cmake.cmakePath": "/usr/bin/cmake"
+    "cmake.cmakePath": "/usr/bin/cmake",
+    "cmake.debugConfig": {
+        "type": "lldb-dap"
+    }
 }
