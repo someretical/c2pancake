@@ -9,7 +9,6 @@ option(SECURE_BUILD_FOR_PRODUCTION "Enable production-specific hardening" OFF)
 option(SECURE_BUILD_FOR_DEVELOPMENT "Enable development-specific strictness" ON)
 include(CheckPIESupported)
 check_pie_supported()
-set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 find_package(LLVM 22.1.7 REQUIRED CONFIG)
 find_package(Clang 22.1.7 REQUIRED CONFIG)
@@ -30,9 +29,17 @@ foreach(PATH_VAR GCC_TOOLCHAIN_PATH GCC_BASE_INCLUDE_PATH GCC_ARCH_INCLUDE_PATH)
     endif()
 endforeach()
 
-add_executable(c2pancake src/main.cpp)
+add_executable(c2pancake 
+    src/main.cpp
+    src/increment_rewriter.cpp
+    src/utils.cpp
+)
 
-# recommended security hardening flags 
+target_include_directories(c2pancake PRIVATE include)
+
+# recommended security hardening flags
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
 target_compile_options(c2pancake PRIVATE
     -O2
     -Wall
@@ -110,10 +117,18 @@ target_include_directories(c2pancake SYSTEM PRIVATE
     ${CLANG_INCLUDE_DIRS}
 )
 target_link_libraries(c2pancake PRIVATE
-    clangAST
+    clangTooling
     clangASTMatchers
-    clangBasic
+    clangAST
+    clangRewrite
     clangFrontend
     clangSerialization
-    clangTooling
+    clangDriver
+    clangParse
+    clangSema
+    clangAnalysis
+    clangEdit
+    clangLex
+    clangBasic
+    LLVMSupport
 )
