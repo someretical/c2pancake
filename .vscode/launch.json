@@ -10,7 +10,8 @@
             "name": "Debug c2pancake",
             "program": "${command:cmake.launchTargetPath}",
             "args": [
-                "tests/arith.c"
+                "tests/arith.c",
+                "--"
             ],
             "cwd": "${workspaceFolder}",
             "console": "integratedTerminal"
