@@ -26,7 +26,7 @@ Install GCC/libstdc++ 16
 sudo apt install software-properties-common -y
 sudo add-apt-repository ppa:ubuntu-toolchain-r/test -y
 sudo apt update
-sudo apt install gcc-16 g++-16 -y
+sudo apt install gcc-16 g++-16 libstdc++-16-dev -y
 ```
 
 Install other build tools
