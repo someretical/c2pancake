@@ -54,7 +54,7 @@ The instructions below are for Ubuntu 24.x
 Install dependencies first
 ```
 sudo apt update
-sudo apt install libedit-dev zlib1g-dev libzstd-dev libcurl4-openssl-dev
+sudo apt install libedit-dev zlib1g-dev libzstd-dev libcurl4-openssl-dev -y
 ```
 
 Install LLVM, current supported version is 22.1.7
@@ -74,7 +74,7 @@ sudo apt install gcc-16 g++-16 libstdc++-16-dev -y
 
 Install other build tools
 ```
-sudo apt install build-essential ninja-build cmake
+sudo apt install build-essential ninja-build cmake cmake-format -y
 ```
 
 ### Installing pancake compiler
@@ -89,6 +89,29 @@ mkdir build && cd build && wget -c <LINK> -O - | tar -xz
 E.g.
 ```
 mkdir build && cd build && wget -c https://cakeml.org/regression/artefacts/3364/cake-x64-64.tar.gz -O - | tar -xz
+```
+
+### VSCode extensions
+
+Install from command line
+```
+code --install-extension \
+  cheshirekow.cmake-format \
+  cs128.cs128-clang-tidy \
+  llvm-vs-code-extensions.lldb-dap \
+  llvm-vs-code-extensions.vscode-clangd \
+  ms-python.black-formatter \
+  ms-python.debugpy \
+  ms-python.isort \
+  ms-python.python \
+  ms-python.vscode-pylance \
+  ms-python.vscode-python-envs \
+  ms-vscode.cmake-tools \
+  ms-vscode.cpp-devtools \
+  ms-vscode.cpptools \
+  twxs.cmake \
+  vadimcn.vscode-lldb \
+  xaver.clang-format
 ```
 
 ### CMake

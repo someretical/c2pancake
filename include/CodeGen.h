@@ -1,33 +1,35 @@
 #ifndef C2PANCAKE_CODEGEN_H
 #define C2PANCAKE_CODEGEN_H
 
-#include "pancake_ir.h"
+#include "PancakeIR.h"
 
+#include <cstddef>
 #include <sstream>
 #include <string>
 
 namespace pancake {
 class CodeGen {
 public:
-  std::string generate(const Program &program);
+  auto generate(const Program &program) -> std::string;
 
 private:
   std::ostringstream out;
-  int indentLevel = 0;
+  size_t indentLevel = 0;
 
   void emit(const Function &func);
   void emitBlock(const Block &block, bool appendSemicolon);
   void emitStmt(const Stmt &stmt);
   void emitExpr(const Expr &expr, int parentPrec = -1);
 
-  std::string indentStr() const;
+  auto indentStr() const -> std::string;
   void increaseIndent() { indentLevel++; }
   void decreaseIndent() { indentLevel--; }
 
-  static int precedence(BinOp op);
-  static const char *opString(BinOp op);
-  static const char *opString(UnaryOp op);
-  static bool needsSemicolon(const Stmt &stmt);
+  static auto precedence(BinOp op) -> int;
+  static auto opString(BinOp op) -> const char *;
+  static auto opString(UnaryOp op) -> const char *;
+  static auto needsSemicolon(const Stmt &stmt) -> bool;
 };
 } // namespace pancake
+
 #endif // C2PANCAKE_CODEGEN_H
