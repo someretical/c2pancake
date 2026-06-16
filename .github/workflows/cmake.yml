@@ -56,12 +56,14 @@ jobs:
       - name: Configure CMake
         run: >
           cmake 
+          -DLLVM_DIR=/usr/lib/llvm-22/lib/cmake/llvm 
+          -DClang_DIR=/usr/lib/llvm-22/lib/cmake/clang 
           -DCMAKE_EXPORT_COMPILE_COMMANDS:BOOL=TRUE 
           -DCMAKE_C_COMPILER:FILEPATH=/usr/bin/clang-22 
           -DCMAKE_CXX_COMPILER:FILEPATH=/usr/bin/clang++-22 
           --no-warn-unused-cli 
           -S ${{ github.workspace }} 
-          -B ${{ steps.strings.outputs.build-output-dir }}
+          -B ${{ steps.strings.outputs.build-output-dir }} 
           -G "Ninja Multi-Config"
 
       - name: Build Release
