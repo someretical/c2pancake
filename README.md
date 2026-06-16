@@ -61,7 +61,7 @@ Install LLVM, current supported version is 22.1.7
 ```
 wget https://apt.llvm.org/llvm.sh
 chmod +x llvm.sh
-sudo ./llvm.sh 22.1.7 all
+sudo ./llvm.sh 22 all
 ```
 
 Install GCC/libstdc++ 16
