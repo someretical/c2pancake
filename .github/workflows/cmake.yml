@@ -34,7 +34,7 @@ jobs:
           sudo apt install libedit-dev zlib1g-dev libzstd-dev libcurl4-openssl-dev -y
           wget https://apt.llvm.org/llvm.sh
           chmod +x llvm.sh
-          sudo ./llvm.sh 22.1.7 all
+          sudo ./llvm.sh 22 all
           sudo apt install software-properties-common -y
           sudo add-apt-repository ppa:ubuntu-toolchain-r/test -y
           sudo apt update
