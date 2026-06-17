@@ -1,6 +1,8 @@
 #ifndef C2PANCAKE_IR_H
 #define C2PANCAKE_IR_H
 
+#include <clang/Basic/SourceLocation.h>
+
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -10,11 +12,6 @@
 #include <vector>
 
 namespace pancake {
-struct SourceLoc {
-  std::string file;
-  unsigned line = 0;
-  unsigned col = 0;
-};
 
 enum class BinOp : uint8_t {
   Add,
@@ -38,9 +35,9 @@ enum class BinOp : uint8_t {
 };
 
 enum class UnaryOp : uint8_t {
-  Negate, // pretty sure this is not supported in pancake
+  Negate,
   Not,
-  BitwiseNot, // this is also not supported
+  BitwiseNot,
 };
 
 struct Expr;
@@ -62,8 +59,8 @@ enum class ExprKind : uint8_t {
   FieldAccess,
   MemoryLoad,
   Raw,
-  ArrayIndex, // helper
-  ArrayLoad,  // helper, complementary to ArrayStoreStmt
+  ArrayIndex,
+  ArrayLoad,
   BasePtr,
   TopPtr,
   BytesInWord,
@@ -71,113 +68,118 @@ enum class ExprKind : uint8_t {
 
 struct Expr {
   ExprKind kind;
-  SourceLoc loc;
+  clang::SourceLocation loc;
+
   virtual ~Expr() = default;
-  // default copy constructor
   Expr(const Expr &) = default;
-  // default copy assignment operator
   auto operator=(const Expr &) -> Expr & = default;
-  // default move constructor
   Expr(Expr &&) = default;
-  // default move assignment operator
   auto operator=(Expr &&) -> Expr & = default;
 
 protected:
-  Expr(ExprKind k, SourceLoc l = {}) : kind(k), loc(std::move(std::move(l))) {}
+  Expr(ExprKind k, const clang::SourceLocation &loc) : kind(k), loc(loc) {}
 };
 
 struct IntLitExpr : Expr {
   int64_t value;
-  IntLitExpr(int64_t v, SourceLoc l = {})
-      : Expr(ExprKind::IntLit, std::move(l)), value(v) {}
+
+  IntLitExpr(const clang::SourceLocation &loc, int64_t v)
+      : Expr(ExprKind::IntLit, loc), value(v) {}
 };
 
-struct VarRefExpr : Expr {
+struct DeclRefExpr : Expr {
   std::string name;
-  VarRefExpr(std::string n, SourceLoc l = {})
-      : Expr(ExprKind::VarRef, std::move(l)), name(std::move(std::move(n))) {}
+
+  DeclRefExpr(const clang::SourceLocation &loc, std::string n)
+      : Expr(ExprKind::VarRef, loc), name(std::move(n)) {}
 };
 
 struct BinaryExpr : Expr {
   BinOp op;
   ExprPtr lhs, rhs;
-  BinaryExpr(BinOp o, ExprPtr l, ExprPtr r, SourceLoc loc = {})
-      : Expr(ExprKind::Binary, std::move(loc)), op(o),
-        lhs(std::move(std::move(l))), rhs(std::move(std::move(r))) {}
+
+  BinaryExpr(const clang::SourceLocation &loc, BinOp o, ExprPtr l, ExprPtr r)
+      : Expr(ExprKind::Binary, loc), op(o), lhs(std::move(l)),
+        rhs(std::move(r)) {}
 };
 
 struct UnaryExpr : Expr {
   UnaryOp op;
   ExprPtr operand;
-  UnaryExpr(UnaryOp o, ExprPtr e, SourceLoc l = {})
-      : Expr(ExprKind::Unary, std::move(l)), op(o),
-        operand(std::move(std::move(e))) {}
+
+  UnaryExpr(const clang::SourceLocation &loc, UnaryOp o, ExprPtr e)
+      : Expr(ExprKind::Unary, loc), op(o), operand(std::move(e)) {}
 };
 
 struct CallExpr : Expr {
   std::string callee;
   std::vector<ExprPtr> args;
-  CallExpr(std::string c, std::vector<ExprPtr> a, SourceLoc l = {})
-      : Expr(ExprKind::Call, std::move(l)), callee(std::move(std::move(c))),
-        args(std::move(std::move(a))) {}
+
+  CallExpr(const clang::SourceLocation &loc, std::string c,
+           std::vector<ExprPtr> a)
+      : Expr(ExprKind::Call, loc), callee(std::move(c)), args(std::move(a)) {}
 };
 
-// raw source text fallback
 struct RawExpr : Expr {
   std::string text;
-  RawExpr(std::string t, SourceLoc l = {})
-      : Expr(ExprKind::Raw, std::move(l)), text(std::move(std::move(t))) {}
+
+  RawExpr(const clang::SourceLocation &loc, std::string t)
+      : Expr(ExprKind::Raw, loc), text(std::move(t)) {}
 };
 
 struct BasePtrExpr : RawExpr {
-  BasePtrExpr(SourceLoc l = {}) : RawExpr("@base", std::move(l)) {}
+  BasePtrExpr(const clang::SourceLocation &loc) : RawExpr(loc, "@base") {}
 };
 
 struct TopPtrExpr : RawExpr {
-  TopPtrExpr(SourceLoc l = {}) : RawExpr("@top", std::move(l)) {}
+  TopPtrExpr(const clang::SourceLocation &loc) : RawExpr(loc, "@top") {}
 };
 
 struct BytesInWordExpr : RawExpr {
-  BytesInWordExpr(SourceLoc l = {}) : RawExpr("@biw", std::move(l)) {}
+  BytesInWordExpr(const clang::SourceLocation &loc) : RawExpr(loc, "@biw") {}
 };
 
 struct StructLitExpr : Expr {
   std::vector<ExprPtr> fields;
-  StructLitExpr(std::vector<ExprPtr> f, SourceLoc l = {})
-      : Expr(ExprKind::StructLit, std::move(l)),
-        fields(std::move(std::move(f))) {}
+
+  StructLitExpr(const clang::SourceLocation &loc, std::vector<ExprPtr> f)
+      : Expr(ExprKind::StructLit, loc), fields(std::move(f)) {}
 };
 
 struct FieldAccessExpr : Expr {
   std::string varName;
   int fieldIndex;
-  FieldAccessExpr(std::string v, int idx, SourceLoc l = {})
-      : Expr(ExprKind::FieldAccess, std::move(l)),
-        varName(std::move(std::move(v))), fieldIndex(idx) {}
+
+  FieldAccessExpr(const clang::SourceLocation &loc, std::string v, int idx)
+      : Expr(ExprKind::FieldAccess, loc), varName(std::move(v)),
+        fieldIndex(idx) {}
 };
 
 struct MemoryLoadExpr : Expr {
   int shape;
   ExprPtr addrExpr;
-  MemoryLoadExpr(int shape, ExprPtr addr, SourceLoc l = {})
-      : Expr(ExprKind::MemoryLoad, std::move(l)), shape(shape),
-        addrExpr(std::move(std::move(addr))) {}
+
+  MemoryLoadExpr(const clang::SourceLocation &loc, int shape, ExprPtr addr)
+      : Expr(ExprKind::MemoryLoad, loc), shape(shape),
+        addrExpr(std::move(addr)) {}
 };
 
 struct ArrayIndexExpr : Expr {
   ExprPtr idx;
   ExprPtr step;
-  ArrayIndexExpr(ExprPtr i, ExprPtr s, SourceLoc l = {})
-      : Expr(ExprKind::ArrayIndex, std::move(l)), idx(std::move(std::move(i))),
-        step(std::move(std::move(s))) {}
+
+  ArrayIndexExpr(const clang::SourceLocation &loc, ExprPtr i, ExprPtr s)
+      : Expr(ExprKind::ArrayIndex, loc), idx(std::move(i)), step(std::move(s)) {
+  }
 };
 
 struct ArrayLoadExpr : Expr {
   int baseSlot;
-  ExprPtr indexExpr; // this should be a ArrayIndexExpr!!!
-  ArrayLoadExpr(int bs, ExprPtr idx, SourceLoc l = {})
-      : Expr(ExprKind::ArrayLoad, std::move(l)), baseSlot(bs),
-        indexExpr(std::move(std::move(idx))) {}
+  ExprPtr indexExpr;
+
+  ArrayLoadExpr(const clang::SourceLocation &loc, int bs, ExprPtr idx)
+      : Expr(ExprKind::ArrayLoad, loc), baseSlot(bs),
+        indexExpr(std::move(idx)) {}
 };
 
 // statements
@@ -195,143 +197,147 @@ enum class StmtKind : uint8_t {
   Break,
   Continue,
   MemoryStore,
-  ArrayStore,        // helper for array element assignment
-  SharedMemoryStore, // TODO
-  SharedMemoryLoad,  // TODO
+  ArrayStore,
+  SharedMemoryStore,
+  SharedMemoryLoad,
 };
 
 struct Stmt {
   StmtKind kind;
-  SourceLoc loc;
+  clang::SourceLocation loc;
+
   virtual ~Stmt() = default;
-  // default copy constructor
   Stmt(const Stmt &) = default;
-  // default copy assignment operator
   auto operator=(const Stmt &) -> Stmt & = default;
-  // default move constructor
   Stmt(Stmt &&) = default;
-  // default move assignment operator
   auto operator=(Stmt &&) -> Stmt & = default;
 
 protected:
-  Stmt(StmtKind k, SourceLoc l = {}) : kind(k), loc(std::move(std::move(l))) {}
+  Stmt(StmtKind k, const clang::SourceLocation &loc) : kind(k), loc(loc) {}
 };
 
 struct Block {
   std::vector<StmtPtr> stmts;
-  SourceLoc loc;
+  clang::SourceLocation loc;
+
+  Block(const clang::SourceLocation &loc, std::vector<StmtPtr> s)
+      : stmts(std::move(s)), loc(loc) {}
 };
 
 struct BlockStmt : Stmt {
   BlockPtr block;
-  SourceLoc loc;
-  BlockStmt(BlockPtr b, SourceLoc l = {})
-      : Stmt(StmtKind::Block, std::move(l)), block(std::move(std::move(b))) {}
+
+  BlockStmt(const clang::SourceLocation &loc, BlockPtr b)
+      : Stmt(StmtKind::Block, loc), block(std::move(b)) {}
 };
 
 struct VarDeclStmt : Stmt {
   std::string name;
-  std::optional<int> shape; // shape hint for call-initialized vars
+  std::optional<int> shape;
   ExprPtr init;
-  VarDeclStmt(std::string n, ExprPtr i = nullptr,
-              std::optional<int> sh = std::nullopt, SourceLoc l = {})
-      : Stmt(StmtKind::VarDecl, std::move(l)), name(std::move(std::move(n))),
-        shape(sh), init(std::move(std::move(i))) {}
+
+  VarDeclStmt(const clang::SourceLocation &loc, std::string n, ExprPtr i,
+              std::optional<int> sh)
+      : Stmt(StmtKind::VarDecl, loc), name(std::move(n)), shape(sh),
+        init(std::move(i)) {}
 };
 
 struct AssignStmt : Stmt {
   ExprPtr target;
   ExprPtr value;
-  AssignStmt(ExprPtr t, ExprPtr v, SourceLoc l = {})
-      : Stmt(StmtKind::Assign, std::move(l)), target(std::move(std::move(t))),
-        value(std::move(std::move(v))) {}
-  AssignStmt(const std::string &t, ExprPtr v, const SourceLoc &l = {})
-      : Stmt(StmtKind::Assign, l), target(std::make_shared<VarRefExpr>(t, l)),
-        value(std::move(std::move(v))) {}
+
+  AssignStmt(const clang::SourceLocation &loc, ExprPtr t, ExprPtr v)
+      : Stmt(StmtKind::Assign, loc), target(std::move(t)), value(std::move(v)) {
+  }
 };
 
 struct ReturnStmt : Stmt {
   ExprPtr value;
-  ReturnStmt(ExprPtr v = nullptr, SourceLoc l = {})
-      : Stmt(StmtKind::Return, std::move(l)), value(std::move(std::move(v))) {}
+
+  ReturnStmt(const clang::SourceLocation &loc, ExprPtr v)
+      : Stmt(StmtKind::Return, loc), value(std::move(v)) {}
 };
 
 struct IfStmt : Stmt {
   ExprPtr condition;
   BlockPtr thenBranch;
   BlockPtr elseBranch;
-  IfStmt(ExprPtr c, BlockPtr t, BlockPtr e = nullptr, SourceLoc l = {})
-      : Stmt(StmtKind::If, std::move(l)), condition(std::move(std::move(c))),
-        thenBranch(std::move(std::move(t))),
-        elseBranch(std::move(std::move(e))) {}
+
+  IfStmt(const clang::SourceLocation &loc, ExprPtr c, BlockPtr t, BlockPtr e)
+      : Stmt(StmtKind::If, loc), condition(std::move(c)),
+        thenBranch(std::move(t)), elseBranch(std::move(e)) {}
 };
 
 struct WhileStmt : Stmt {
   ExprPtr condition;
   BlockPtr body;
-  WhileStmt(ExprPtr c, BlockPtr b, SourceLoc l = {})
-      : Stmt(StmtKind::While, std::move(l)), condition(std::move(std::move(c))),
-        body(std::move(std::move(b))) {}
+
+  WhileStmt(const clang::SourceLocation &loc, ExprPtr c, BlockPtr b)
+      : Stmt(StmtKind::While, loc), condition(std::move(c)),
+        body(std::move(b)) {}
 };
 
 struct ExprStmt : Stmt {
   ExprPtr expr;
-  ExprStmt(ExprPtr e, SourceLoc l = {})
-      : Stmt(StmtKind::ExprStmt, std::move(l)), expr(std::move(std::move(e))) {}
+
+  ExprStmt(const clang::SourceLocation &loc, ExprPtr e)
+      : Stmt(StmtKind::ExprStmt, loc), expr(std::move(e)) {}
 };
 
 struct CommentStmt : Stmt {
   std::string text;
-  CommentStmt(std::string t, SourceLoc l = {})
-      : Stmt(StmtKind::Comment, std::move(l)), text(std::move(std::move(t))) {}
+
+  CommentStmt(const clang::SourceLocation &loc, std::string t)
+      : Stmt(StmtKind::Comment, loc), text(std::move(t)) {}
 };
 
 struct BreakStmt : Stmt {
-  BreakStmt(SourceLoc l = {}) : Stmt(StmtKind::Break, std::move(l)) {}
+  BreakStmt(const clang::SourceLocation &loc) : Stmt(StmtKind::Break, loc) {}
 };
 
 struct ContinueStmt : Stmt {
-  ContinueStmt(SourceLoc l = {}) : Stmt(StmtKind::Continue, std::move(l)) {}
+  ContinueStmt(const clang::SourceLocation &loc)
+      : Stmt(StmtKind::Continue, loc) {}
 };
 
 struct MemoryStoreStmt : Stmt {
   ExprPtr srcExpr;
   ExprPtr destExpr;
-  MemoryStoreStmt(ExprPtr src, ExprPtr dest, SourceLoc l = {})
-      : Stmt(StmtKind::MemoryStore, std::move(l)),
-        srcExpr(std::move(std::move(src))),
-        destExpr(std::move(std::move(dest))) {}
+
+  MemoryStoreStmt(const clang::SourceLocation &loc, ExprPtr src, ExprPtr dest)
+      : Stmt(StmtKind::MemoryStore, loc), srcExpr(std::move(src)),
+        destExpr(std::move(dest)) {}
 };
 
 struct ArrayStoreStmt : Stmt {
   int baseSlot;
-  ExprPtr indexExpr; // this should be a ArrayIndexExpr!!!
+  ExprPtr indexExpr;
   ExprPtr valueExpr;
-  ArrayStoreStmt(int bs, ExprPtr idx, ExprPtr val, SourceLoc l = {})
-      : Stmt(StmtKind::ArrayStore, std::move(l)), baseSlot(bs),
-        indexExpr(std::move(std::move(idx))),
-        valueExpr(std::move(std::move(val))) {}
+
+  ArrayStoreStmt(const clang::SourceLocation &loc, int bs, ExprPtr idx,
+                 ExprPtr val)
+      : Stmt(StmtKind::ArrayStore, loc), baseSlot(bs),
+        indexExpr(std::move(idx)), valueExpr(std::move(val)) {}
 };
 
 struct DefineStmt : Stmt {
   std::string name;
   int64_t value;
-  DefineStmt(std::string n, int64_t v, SourceLoc l = {})
-      : Stmt(StmtKind::Define, std::move(l)), name(std::move(std::move(n))),
-        value(v) {}
+
+  DefineStmt(const clang::SourceLocation &loc, std::string n, int64_t v)
+      : Stmt(StmtKind::Define, loc), name(std::move(n)), value(v) {}
 };
 
-// struct field assign via whole-struct reassignment
 struct StructFieldAssignStmt : Stmt {
   std::string structName;
   int fieldIndex;
   int fieldCount;
   ExprPtr value;
-  StructFieldAssignStmt(std::string sn, int idx, int count, ExprPtr v,
-                        SourceLoc l = {})
-      : Stmt(StmtKind::StructFieldAssign, std::move(l)),
-        structName(std::move(std::move(sn))), fieldIndex(idx),
-        fieldCount(count), value(std::move(std::move(v))) {}
+
+  StructFieldAssignStmt(const clang::SourceLocation &loc, std::string sn,
+                        int idx, int count, ExprPtr v)
+      : Stmt(StmtKind::StructFieldAssign, loc), structName(std::move(sn)),
+        fieldIndex(idx), fieldCount(count), value(std::move(v)) {}
 };
 
 // top-level
@@ -343,14 +349,16 @@ struct Param {
 struct Function {
   std::string name;
   std::vector<Param> params;
+  std::string returnType;
   BlockPtr body;
-  SourceLoc loc;
+  clang::SourceLocation loc;
+
+  Function(const clang::SourceLocation &loc, std::string n,
+           std::vector<Param> p, std::string rt, BlockPtr b)
+      : name(std::move(n)), params(std::move(p)), returnType(std::move(rt)),
+        body(std::move(b)), loc(loc) {}
 };
 
-struct Program {
-  std::vector<StmtPtr> globals;
-  std::vector<StmtPtr> arrayInits; // prepended to main()
-  std::vector<std::shared_ptr<Function>> functions;
-};
 } // namespace pancake
+
 #endif // C2PANCAKE_IR_H

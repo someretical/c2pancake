@@ -1,4 +1,5 @@
 #include "CodeGen.h"
+#include "IRBuilder.h"
 #include "PancakeIR.h"
 
 #include <cassert>
@@ -112,23 +113,23 @@ auto CodeGen::indentStr() const -> std::string {
   return str;
 }
 
-auto CodeGen::generate(const Program &program) -> std::string {
+auto CodeGen::generate(const IRBuilder &builder) -> std::string {
   out.str("");
   out.clear();
   indentLevel = 0;
 
   out << "// Generated Pancake code from C\n";
 
-  for (const auto &stmt : program.globals) {
-    emitStmt(*stmt);
-    if (needsSemicolon(*stmt))
+  for (const auto &stmt : builder.getGlobals()) {
+    emitStmt(*stmt.get());
+    if (needsSemicolon(*stmt.get()))
       out << ";";
     out << "\n";
   }
 
-  for (const auto &func : program.functions) {
+  for (const auto &func : builder.getFunctions()) {
     out << "\n";
-    emit(*func);
+    emit(func.get());
     out << "\n";
   }
 
@@ -305,7 +306,7 @@ void CodeGen::emitExpr(const Expr &expr, int parentPrec) {
     break;
   }
   case ExprKind::VarRef: {
-    const auto &e = dynamic_cast<const VarRefExpr &>(expr);
+    const auto &e = dynamic_cast<const DeclRefExpr &>(expr);
     out << e.name;
     break;
   }

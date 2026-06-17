@@ -20,7 +20,8 @@ Checks: >
   -readability-identifier-length,
   -misc-override-with-different-visibility,
   -misc-non-private-member-variables-in-classes,
-  -bugprone-easily-swappable-parameters
+  -bugprone-easily-swappable-parameters,
+  -misc-no-recursion
 
 WarningsAsErrors: '*'
 

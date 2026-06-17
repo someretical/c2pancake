@@ -1,10 +1,9 @@
 #include "Utils.h"
 
-#include "clang/AST/ParentMapContext.h"
-#include <algorithm>
 #include <clang/AST/ASTContext.h>
 #include <clang/AST/ASTTypeTraits.h>
 #include <clang/AST/Expr.h>
+#include <clang/AST/ParentMapContext.h>
 #include <clang/AST/Stmt.h>
 #include <clang/Basic/LLVM.h>
 #include <clang/Basic/LangOptions.h>
@@ -12,35 +11,37 @@
 #include <clang/Basic/SourceManager.h>
 #include <clang/Lex/Lexer.h>
 
+#include <algorithm>
 #include <string>
 
-auto exprToString(const Expr *E, const SourceManager &SM, const LangOptions &LO)
-    -> std::string {
-  CharSourceRange const r = CharSourceRange::getTokenRange(E->getSourceRange());
+auto exprToString(const clang::Expr *E, const clang::SourceManager &SM,
+                  const clang::LangOptions &LO) -> std::string {
+  auto r = clang::CharSourceRange::getTokenRange(E->getSourceRange());
   bool invalid = false;
-  StringRef text = Lexer::getSourceText(r, SM, LO, &invalid);
+  auto text = clang::Lexer::getSourceText(r, SM, LO, &invalid);
   if (invalid)
     return "<invalid>";
   return text.str();
 }
 
-auto stmtToString(const Stmt *S, const SourceManager &SM, const LangOptions &LO)
-    -> std::string {
-  CharSourceRange const r = CharSourceRange::getTokenRange(S->getSourceRange());
+auto stmtToString(const clang::Stmt *S, const clang::SourceManager &SM,
+                  const clang::LangOptions &LO) -> std::string {
+  auto r = clang::CharSourceRange::getTokenRange(S->getSourceRange());
   bool invalid = false;
-  StringRef text = Lexer::getSourceText(r, SM, LO, &invalid);
+  auto text = clang::Lexer::getSourceText(r, SM, LO, &invalid);
   if (invalid)
     return "<invalid>";
   return text.str();
 }
 
-auto hasSideEffect(const Expr *E, ASTContext &Ctx) -> bool {
+static auto hasSideEffect(const clang::Expr *E, clang::ASTContext &Ctx) -> bool {
   return E->HasSideEffects(Ctx, true);
 }
 
-auto isTopLevelStmt(const UnaryOperator *UO, ASTContext &Ctx) -> bool {
-  DynTypedNodeList const parents = Ctx.getParents(*UO);
-  return std::ranges::any_of(parents, [](const DynTypedNode &p) -> bool {
-    return p.get<Stmt>() != nullptr;
+static auto isTopLevelStmt(const clang::UnaryOperator *UO, clang::ASTContext &Ctx)
+    -> bool {
+  clang::DynTypedNodeList const parents = Ctx.getParents(*UO);
+  return std::ranges::any_of(parents, [](const clang::DynTypedNode &p) -> bool {
+    return p.get<clang::Stmt>() != nullptr;
   });
 }

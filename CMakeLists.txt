@@ -37,7 +37,9 @@ foreach(PATH_VAR GCC_TOOLCHAIN_PATH GCC_BASE_INCLUDE_PATH GCC_ARCH_INCLUDE_PATH)
   endif()
 endforeach()
 
-add_executable(c2pancake src/main.cpp src/MultiPass.cpp src/CodeGen.cpp)
+add_executable(
+  c2pancake src/Utils.cpp src/Pass_HoistArraysAndAddresses.cpp
+            src/MultiPass.cpp src/CodeGen.cpp src/IRBuilder.cpp src/main.cpp)
 
 target_include_directories(c2pancake PRIVATE include)
 
@@ -91,9 +93,8 @@ if(SECURE_BUILD_FOR_PRODUCTION)
                       -fno-strict-aliasing -ftrivial-auto-var-init=zero)
 endif()
 
-if(SECURE_BUILD_FOR_DEVELOPMENT)
-  target_compile_options(c2pancake PRIVATE -Werror)
-endif()
+# if(SECURE_BUILD_FOR_DEVELOPMENT) target_compile_options(c2pancake PRIVATE
+# -Werror) endif()
 
 target_compile_options(
   c2pancake

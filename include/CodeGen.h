@@ -1,6 +1,7 @@
 #ifndef C2PANCAKE_CODEGEN_H
 #define C2PANCAKE_CODEGEN_H
 
+#include "IRBuilder.h"
 #include "PancakeIR.h"
 
 #include <cstddef>
@@ -10,7 +11,7 @@
 namespace pancake {
 class CodeGen {
 public:
-  auto generate(const Program &program) -> std::string;
+  auto generate(const IRBuilder &builder) -> std::string;
 
 private:
   std::ostringstream out;

@@ -45,6 +45,20 @@ c2pancake options:
 c2pancake tests/arith.c --
 ```
 
+## Restrictions
+
+All existing structs and unions will be rewritten to use ONLY uint32_t/uint64_t (same as word size). Warnings will be generated if any field is downsized.
+
+Only pointer structs are allowed to have any layout. Pointer structs are those which are only accessed through a pointer (e.g. memory mapped regions).
+
+Any externally defined data type will also be rewritten to the word size and a warning generated if necessary.
+
+All arrays in functions are considered static so no recursion is allowed. They will be hoisted into the global scope with a special prefix.
+
+Any stack variable which has its address taken will also be hoisted into the global scope with a special prefix.
+
+
+
 ## Development
 
 The instructions below are for Ubuntu 24.x
@@ -88,7 +102,7 @@ mkdir build && cd build && wget -c <LINK> -O - | tar -xz
 ```
 E.g.
 ```
-mkdir build && cd build && wget -c https://cakeml.org/regression/artefacts/3364/cake-x64-64.tar.gz -O - | tar -xz
+mkdir build && cd build && wget -c https://cakeml.org/regression/artefacts/3389/cake-x64-64.tar.gz -O - | tar -xz
 ```
 
 ### VSCode extensions
@@ -120,7 +134,16 @@ Easiest method is to use the VSCode CMake extension.
 
 Manual instructions (make sure you are in the project folder):
 ```
-cmake -DCMAKE_EXPORT_COMPILE_COMMANDS:BOOL=TRUE -DCMAKE_C_COMPILER:FILEPATH=/usr/bin/clang-22 -DCMAKE_CXX_COMPILER:FILEPATH=/usr/bin/clang++-22 --no-warn-unused-cli -S . -B build -G "Ninja Multi-Config"
+cmake \
+  -DLLVM_DIR=/usr/lib/llvm-22/lib/cmake/llvm \
+  -DClang_DIR=/usr/lib/llvm-22/lib/cmake/clang \ 
+  -DCMAKE_EXPORT_COMPILE_COMMANDS:BOOL=TRUE \
+  -DCMAKE_C_COMPILER:FILEPATH=/usr/bin/clang-22 \
+  -DCMAKE_CXX_COMPILER:FILEPATH=/usr/bin/clang++-22 \
+  --no-warn-unused-cli \
+  -S . \
+  -B build \
+  -G "Ninja Multi-Config"
 ```
 
 Debug build:
