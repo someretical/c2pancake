@@ -19,11 +19,11 @@
 #include <llvm/Support/Casting.h>
 #include <llvm/Support/Error.h>
 #include <llvm/Support/FileSystem.h>
+#include <llvm/Support/FormatVariadic.h>
 #include <llvm/Support/MemoryBufferRef.h>
 #include <llvm/Support/raw_ostream.h>
 
 #include <cstddef>
-#include <format>
 #include <memory>
 #include <set>
 #include <string>
@@ -31,86 +31,129 @@
 #include <utility>
 #include <vector>
 
-using namespace pancake::hoist_arrays_and_addresses;
+using namespace pancake::pass_hoist_arrays_and_addresses;
 
-static size_t hoist_arr_counter = 0;
-static size_t hoist_ptr_counter = 0;
-
-// generate a unique global name for a hoisted array
-static auto arrayPrefix(const std::string &func, const std::string &var)
-    -> std::string {
-  return std::format("__c2pnk_arr_{}_{}_{}", func, var, hoist_arr_counter++);
+namespace {
+// generate a unique global name for a hoisted array variable
+auto arrayPrefix(bool make_shared, size_t counter, llvm::StringRef func,
+                 llvm::StringRef var) -> std::string {
+  return llvm::formatv("__c2pnk_{0}_array_{1}_{2}_{3}",
+                       make_shared ? "shared" : "local", func, var, counter)
+      .str();
 }
 
 // generate a unique global name for a hoisted address-taken variable
-static auto ptrPrefix(const std::string &func, const std::string &var)
-    -> std::string {
-  return std::format("__c2pnk_ptr_{}_{}_{}", func, var, hoist_ptr_counter++);
+auto ptrPrefix(bool make_shared, size_t counter, llvm::StringRef func,
+               llvm::StringRef var) -> std::string {
+  return llvm::formatv("__c2pnk_{0}_ptr_{1}_{2}_{3}",
+                       make_shared ? "shared" : "local", func, var, counter)
+      .str();
 }
 
-// Build a global declaration string for a VarDecl
-static auto buildGlobalDecl(const clang::VarDecl *VD,
-                            const std::string &newName, clang::ASTContext &Ctx,
-                            bool preserveInit) -> std::string {
-  const auto& pp(Ctx.getLangOpts());
-  const auto qt = VD->getType();
-  const auto sc = VD->getStorageClass();
-  std::string decl;
-  llvm::raw_string_ostream os(decl);
-  os << ((sc == clang::SC_Extern) ? "extern " : "static ");
-
-  qt.print(os, pp, newName);
-
-  if (preserveInit && VD->hasInit()) {
-    std::string init_str;
-    llvm::raw_string_ostream init_os(init_str);
-    VD->getInit()->printPretty(init_os, nullptr, pp);
-    os << " = " << init_str;
-  }
-  os << ";";
-  return os.str();
+auto recordPrefix(bool make_shared, size_t counter, llvm::StringRef func,
+                  llvm::StringRef var) -> std::string {
+  return llvm::formatv("__c2pnk_{0}_record_{1}_{2}_{3}",
+                       make_shared ? "shared" : "local", func, var, counter)
+      .str();
 }
 
 // Nested array init helper
 //
 // Walks an InitListExpr recursively, tracking the subscript path (e.g.
-// "[0][2]") and emitting one flat assignment statement per scalar leaf:
+// "[0][2]") and emitting one flat assignment statement per scalar leaf.
+// This also works for structs
 //
 //   float mat[3][3] = {{1,0,0},{0,1,0},{0,0,1}};
 //   ->
 //   __hoist_arr_matrix_mat_0[0][0] = 1;
 //   __hoist_arr_matrix_mat_0[0][1] = 0;
-//   ...
-static void emitNestedArrayInits(const clang::Expr *expr,
-                                 const std::string &baseName,
-                                 const std::string &indexPath,
-                                 const clang::PrintingPolicy &pp,
-                                 std::string &out) {
+// NOLINTNEXTLINE(misc-no-recursion)
+void emitNestedInits(const clang::Expr *expr, const clang::Type *type,
+                     llvm::StringRef baseName, llvm::StringRef accessPath,
+                     const clang::PrintingPolicy &pp, clang::ASTContext &Ctx,
+                     llvm::raw_ostream &out) {
   const auto *stripped = expr->IgnoreParenCasts();
+  const auto *ile = dyn_cast<clang::InitListExpr>(stripped);
 
-  if (const auto *ile = dyn_cast<clang::InitListExpr>(stripped)) {
-    // Use the syntactic form if available
-    // the semantic form inserts implicit zero-fills that we do not want to emit
-    // explicitly
-    const auto *to_walk =
-        ile->isSyntacticForm() ? ile : ile->getSyntacticForm();
-    if (to_walk == nullptr)
-      to_walk = ile;
-
-    for (unsigned i = 0; i < to_walk->getNumInits(); ++i) {
-      emitNestedArrayInits(to_walk->getInit(i), baseName,
-                           std::format("{}[{}]", indexPath, i), pp, out);
-    }
-  } else {
-    // we are at the leaf scalar expression so emit the assignment statement
+  if (ile == nullptr) {
+    // Scalar leaf — emit the assignment
     std::string val;
     llvm::raw_string_ostream os(val);
     expr->printPretty(os, nullptr, pp);
-    out += std::format("{}{} = {};\n", baseName, indexPath, val);
+    out << llvm::formatv("{0}{1} = {2};\n", baseName, accessPath, val);
+    return;
+  }
+
+  const auto *to_walk = ile->isSyntacticForm() ? ile : ile->getSyntacticForm();
+  if (to_walk == nullptr)
+    to_walk = ile;
+
+  if (to_walk->getNumInits() == 0)
+    return;
+
+  if (type->isArrayType()) {
+    const auto *at = Ctx.getAsArrayType(clang::QualType(type, 0));
+    const clang::Type *elem_type = at->getElementType().getTypePtr();
+
+    for (unsigned i = 0; i < to_walk->getNumInits(); ++i) {
+      llvm::SmallString<64> path;
+      llvm::raw_svector_ostream(path) << accessPath << "[" << i << "]";
+      emitNestedInits(to_walk->getInit(i), elem_type, baseName, path, pp, Ctx,
+                      out);
+    }
+  } else if (type->isRecordType()) {
+    const auto *rd = type->getAs<clang::RecordType>()->getDecl();
+    // Collect fields in order to match against init list positions
+    llvm::SmallVector<const clang::FieldDecl *, 8> fields;
+    for (const clang::FieldDecl *fd : rd->fields())
+      fields.push_back(fd);
+
+    for (unsigned i = 0; i < to_walk->getNumInits() && i < fields.size(); ++i) {
+      const clang::FieldDecl *fd = fields[i];
+      llvm::SmallString<64> path;
+      llvm::raw_svector_ostream(path) << accessPath << "." << fd->getName();
+      emitNestedInits(to_walk->getInit(i), fd->getType().getTypePtr(), baseName,
+                      path, pp, Ctx, out);
+    }
+  } else {
+    // Shouldn't happen except for bitfields...
+    std::string val;
+    llvm::raw_string_ostream os(val);
+    expr->printPretty(os, nullptr, pp);
+    out << llvm::formatv("{0}{1} = {2};\n", baseName, accessPath, val);
   }
 }
 
-auto AddressTakenFinder::VisitUnaryOperator(clang::UnaryOperator *UO) -> bool {
+// Build a global declaration string for a VarDecl
+auto buildGlobalDecl(const clang::VarDecl *VD, llvm::StringRef newName,
+                     clang::ASTContext &Ctx, bool preserveInit) -> std::string {
+  const auto &pp(Ctx.getLangOpts());
+  const auto qt = VD->getType();
+  const auto sc = VD->getStorageClass();
+  llvm::SmallString<128> decl;
+  llvm::raw_svector_ostream os(decl);
+  os << ((sc == clang::SC_Extern) ? "extern " : "static ");
+  qt.print(os, pp, newName);
+  os << ";";
+
+  if (preserveInit && VD->hasInit()) {
+    os << llvm::formatv(
+        "\n/* c2pancake: initialiser for static variable {0} was not a "
+        "compile-time constant, so it was emitted as runtime code */\n",
+        newName);
+    os << "/* c2pancake: move the following code into the entry point of the "
+          "program */\n";
+    emitNestedInits(VD->getInit(), VD->getType().getTypePtr(), newName, "", pp,
+                    Ctx, os);
+    os << llvm::formatv(
+        "/* c2pancake: end of initialiser for static variable {0} */\n",
+        newName);
+  }
+  return std::string(decl);
+}
+} // namespace
+
+auto PassFind::VisitUnaryOperator(clang::UnaryOperator *UO) -> bool {
   if (UO->getOpcode() == clang::UO_AddrOf) {
     auto *sub = UO->getSubExpr()->IgnoreParenCasts();
     if (auto *dr = dyn_cast<clang::DeclRefExpr>(sub))
@@ -120,17 +163,46 @@ auto AddressTakenFinder::VisitUnaryOperator(clang::UnaryOperator *UO) -> bool {
   return true;
 }
 
-auto CollectVisitor::VisitFunctionDecl(clang::FunctionDecl *FD) -> bool {
+auto PassFind::VisitMemberExpr(clang::MemberExpr *ME) -> bool {
+  auto *fd = dyn_cast<clang::FieldDecl>(ME->getMemberDecl());
+  if ((fd == nullptr) || !fd->getType()->isArrayType())
+    return true;
+
+  // Strip & and -> to get to the base VarDecl
+  const clang::Expr *base = ME->getBase()->IgnoreParenImpCasts();
+  // handle p->arr where p is a pointer-to-struct local and nested structs
+  while (true) {
+    if (const auto *inner = dyn_cast<clang::MemberExpr>(base)) {
+      base = inner->getBase()->IgnoreParenImpCasts();
+
+    } else if (const auto *uo = dyn_cast<clang::UnaryOperator>(base);
+               (uo != nullptr) && uo->getOpcode() == clang::UO_Deref) {
+      base = uo->getSubExpr()->IgnoreParenImpCasts();
+    } else {
+      break;
+    }
+  }
+
+  if (const auto *dr = dyn_cast<clang::DeclRefExpr>(base))
+    if (const auto *vd = dyn_cast<clang::VarDecl>(dr->getDecl()))
+      arrayFieldAccessed.insert(vd);
+
+  return true;
+}
+
+auto PassAnalyse::VisitFunctionDecl(clang::FunctionDecl *FD) -> bool {
   if (!FD->hasBody() || !FD->isThisDeclarationADefinition())
     return true;
 
-  AddressTakenFinder atf;
+  PassFind atf;
   atf.TraverseStmt(FD->getBody());
-  walkStmt(FD->getBody(), FD, atf.addressTaken);
+  walkStmt(FD->getBody(), FD, atf);
   return true;
 }
-void CollectVisitor::walkStmt(clang::Stmt *S, clang::FunctionDecl *FD,
-                              std::set<const clang::VarDecl *> &addrTaken) {
+
+// NOLINTNEXTLINE(misc-no-recursion)
+void PassAnalyse::walkStmt(clang::Stmt *S, clang::FunctionDecl *FD,
+                           PassFind &atf) {
   if (S == nullptr)
     return;
 
@@ -143,41 +215,67 @@ void CollectVisitor::walkStmt(clang::Stmt *S, clang::FunctionDecl *FD,
       const auto sc = vd->getStorageClass();
       const auto qt = vd->getType();
       const auto is_array = qt->isArrayType();
-      const auto addr_taken_var = addrTaken.contains(vd);
+      const auto addr_taken_var = atf.addressTaken.contains(vd);
+      const auto array_field_accessed_var = atf.arrayFieldAccessed.contains(vd);
+      const auto *rt = qt->getAs<clang::RecordType>();
+      const auto is_record = (rt != nullptr);
 
       if (sc == clang::SC_Extern) {
-        info.hoistMap[vd] = {.newName = vd->getName().str(),
-                             .treatment = DeclTreatment::ExternRedecl,
-                             .func = FD};
+        info.hoistMap.insert(
+            {vd, VarHoistEntry{vd->getName().str(), DeclTreatment::ExternRedecl,
+                               FD}});
         continue;
       }
 
       if (sc == clang::SC_Static && (is_array || addr_taken_var)) {
-        const auto new_name =
-            is_array ? arrayPrefix(FD->getName().str(), vd->getName().str())
-                     : ptrPrefix(FD->getName().str(), vd->getName().str());
-        info.hoistMap[vd] = {.newName = new_name,
-                             .treatment = DeclTreatment::StaticGlobal,
-                             .func = FD};
+        // static func vars are always shared across all threads
+        const auto new_name = is_array
+                                  ? arrayPrefix(true, info.hoist_arr_counter++,
+                                                FD->getName(), vd->getName())
+                                  : ptrPrefix(true, info.hoist_ptr_counter++,
+                                              FD->getName(), vd->getName());
+        info.hoistMap.insert(
+            {vd, VarHoistEntry{new_name, DeclTreatment::StaticGlobal, FD}});
         continue;
       }
 
       if (vd->hasLocalStorage() && (is_array || addr_taken_var)) {
-        const auto new_name =
-            is_array ? arrayPrefix(FD->getName().str(), vd->getName().str())
-                     : ptrPrefix(FD->getName().str(), vd->getName().str());
-        info.hoistMap[vd] = {.newName = new_name,
-                             .treatment = DeclTreatment::NewGlobal,
-                             .func = FD};
+        const auto new_name = is_array
+                                  ? arrayPrefix(false, info.hoist_arr_counter++,
+                                                FD->getName(), vd->getName())
+                                  : ptrPrefix(false, info.hoist_ptr_counter++,
+                                              FD->getName(), vd->getName());
+        info.hoistMap.insert(
+            {vd, VarHoistEntry{new_name, DeclTreatment::NewGlobal, FD}});
+      }
+
+      if (vd->hasLocalStorage() && is_record) {
+        if (addr_taken_var || array_field_accessed_var) {
+          const auto new_name = recordPrefix(false, info.hoist_record_counter++,
+                                             FD->getName(), vd->getName());
+          info.hoistMap.insert(
+              {vd, VarHoistEntry{new_name, DeclTreatment::NewGlobal, FD}});
+          continue;
+        }
+      }
+
+      if (sc == clang::SC_Static && is_record) {
+        if (addr_taken_var || array_field_accessed_var) {
+          const auto new_name = recordPrefix(true, info.hoist_record_counter++,
+                                             FD->getName(), vd->getName());
+          info.hoistMap.insert(
+              {vd, VarHoistEntry{new_name, DeclTreatment::StaticGlobal, FD}});
+          continue;
+        }
       }
     }
   }
 
   for (auto *child : S->children())
-    walkStmt(child, FD, addrTaken);
+    walkStmt(child, FD, atf);
 }
 
-auto CollectReplacementsVisitor::VisitDeclStmt(clang::DeclStmt *DS) -> bool {
+auto PassRename::VisitDeclStmt(clang::DeclStmt *DS) -> bool {
   struct Partition {
     clang::VarDecl *VD{};
     VarHoistEntry *entry{};
@@ -202,7 +300,8 @@ auto CollectReplacementsVisitor::VisitDeclStmt(clang::DeclStmt *DS) -> bool {
     return true;
 
   const clang::PrintingPolicy pp(Ctx.getLangOpts());
-  std::string replacement;
+  llvm::SmallString<256> replacement;
+  llvm::raw_svector_ostream out(replacement);
 
   for (auto &p : parts) {
     auto *vd = p.VD;
@@ -212,7 +311,7 @@ auto CollectReplacementsVisitor::VisitDeclStmt(clang::DeclStmt *DS) -> bool {
       std::string decl_str;
       llvm::raw_string_ostream os(decl_str);
       vd->print(os, pp);
-      replacement += std::format("{};\n", decl_str);
+      out << llvm::formatv("{0};\n", decl_str);
       continue;
     }
 
@@ -222,9 +321,9 @@ auto CollectReplacementsVisitor::VisitDeclStmt(clang::DeclStmt *DS) -> bool {
 
     case DeclTreatment::ExternRedecl:
       // Remove the local re-declaration; the external symbol already exists.
-      replacement += std::format(
-          "/* c2pancake: extern decl {} was moved to global scope */\n",
-          vd->getName().str());
+      out << llvm::formatv(
+          "\n\n/* c2pancake: extern decl {0} was moved to global scope */\n",
+          vd->getName());
       break;
 
     case DeclTreatment::StaticGlobal: {
@@ -239,31 +338,22 @@ auto CollectReplacementsVisitor::VisitDeclStmt(clang::DeclStmt *DS) -> bool {
           std::string init_str;
           llvm::raw_string_ostream os(init_str);
           vd->getInit()->printPretty(os, nullptr, pp);
-          replacement += std::format("{} = {};\n", entry.newName, init_str);
+          out << llvm::formatv("{0} = {1};\n", entry.newName, init_str);
           emitted = true;
         }
       }
       if (!emitted)
-        replacement += std::format(
-            "/* c2pancake: static decl {} was moved to global scope */\n",
-            vd->getName().str());
+        out << llvm::formatv(
+            "/* c2pancake: static decl {0} was moved to global scope */\n\n",
+            vd->getName());
       break;
     }
 
     case DeclTreatment::NewGlobal: {
-      // Replace the local declaration with flat assignments
-      // For arrays we recurse into the init-list to produce one statement
-      // per scalar element, handling arbitrary nesting depth
       if (vd->hasInit()) {
         auto *init = vd->getInit();
-        if (vd->getType()->isArrayType()) {
-          emitNestedArrayInits(init, entry.newName, "", pp, replacement);
-        } else {
-          std::string init_str;
-          llvm::raw_string_ostream os(init_str);
-          init->printPretty(os, nullptr, pp);
-          replacement += std::format("{} = {};\n", entry.newName, init_str);
-        }
+        emitNestedInits(init, vd->getType().getTypePtr(), entry.newName, "", pp,
+                        Ctx, out);
       }
       // If no init, then the global is already zero-initialised so we don't
       // need to do anything
@@ -272,14 +362,14 @@ auto CollectReplacementsVisitor::VisitDeclStmt(clang::DeclStmt *DS) -> bool {
     } // switch
   }
 
-  if (replacement.empty())
-    replacement = std::format("/* hoisted */\n");
+  llvm::StringRef const replacement_ref =
+      replacement.empty() ? llvm::StringRef("/* hoisted */\n")
+                          : llvm::StringRef(replacement);
 
-  addReplacement(DS->getSourceRange(), replacement);
+  addReplacement(DS->getSourceRange(), replacement_ref);
   return true;
 }
-auto CollectReplacementsVisitor::VisitDeclRefExpr(clang::DeclRefExpr *DR)
-    -> bool {
+auto PassRename::VisitDeclRefExpr(clang::DeclRefExpr *DR) -> bool {
   if (auto *vd = dyn_cast<clang::VarDecl>(DR->getDecl())) {
     auto it = info.hoistMap.find(vd);
     if (it != info.hoistMap.end())
@@ -287,24 +377,25 @@ auto CollectReplacementsVisitor::VisitDeclRefExpr(clang::DeclRefExpr *DR)
   }
   return true;
 }
-void CollectReplacementsVisitor::addReplacement(clang::SourceRange range,
-                                                const std::string &text) {
+void PassRename::addReplacement(clang::SourceRange range,
+                                llvm::StringRef text) {
   // Expand to account for macro expansions so we replace the spelling loc.
   auto char_range = clang::CharSourceRange::getTokenRange(range);
   clang::tooling::Replacement const repl(SM, char_range, text);
   if (auto err = Repls.add(repl)) {
     llvm::errs() << "Replacement conflict: " << llvm::toString(std::move(err))
                  << "\n";
+    has_replacement_error = true;
   }
 }
 
-void HoistConsumer::HandleTranslationUnit(clang::ASTContext &Ctx) {
-  clang::SourceManager  const&sm = Ctx.getSourceManager();
-  clang::TranslationUnitDecl *tu = Ctx.getTranslationUnitDecl();
+void Consumer::HandleTranslationUnit(clang::ASTContext &Ctx) {
+  const auto &sm = Ctx.getSourceManager();
+  auto *tu = Ctx.getTranslationUnitDecl();
 
   // collect all variables that are arrays/address-taken
   HoistInfo info;
-  CollectVisitor cv(info, Ctx);
+  PassAnalyse cv(info, Ctx);
   cv.TraverseDecl(tu);
 
   // copy source text to new file
@@ -333,18 +424,21 @@ void HoistConsumer::HandleTranslationUnit(clang::ASTContext &Ctx) {
   }
 
   clang::tooling::Replacements repls;
+  bool insertion_failed = false;
 
   // insert global declarations before the first function definition
   if (first_func_loc.isValid()) {
-    std::string global_block = "\n/* c2pancake: hoisted variables (arrays "
-                               "and address-taken locals) begin */\n";
+    llvm::SmallString<512> global_block;
+    llvm::raw_svector_ostream gb(global_block);
+    gb << "\n/* c2pancake: hoisted variables (arrays "
+          "and address-taken locals) begin */\n";
 
     for (auto &[VD, entry] : info.hoistMap) {
       switch (entry.treatment) {
       case DeclTreatment::NewGlobal:
         // omit init as it will be re-applied at each time the function is
         // called
-        global_block += buildGlobalDecl(VD, entry.newName, Ctx, false) + "\n";
+        gb << buildGlobalDecl(VD, entry.newName, Ctx, false) << "\n";
         break;
 
       case DeclTreatment::StaticGlobal: {
@@ -354,34 +448,45 @@ void HoistConsumer::HandleTranslationUnit(clang::ASTContext &Ctx) {
           clang::Expr::EvalResult result;
           keep_init = VD->getInit()->EvaluateAsRValue(result, Ctx);
         }
-        global_block +=
-            buildGlobalDecl(VD, entry.newName, Ctx, keep_init) + "\n";
+        gb << buildGlobalDecl(VD, entry.newName, Ctx, keep_init) << "\n";
         break;
       }
 
       case DeclTreatment::ExternRedecl: {
         // extern can be emitted multipile times without issue
-        global_block += buildGlobalDecl(VD, entry.newName, Ctx, false) + "\n";
+        gb << buildGlobalDecl(VD, entry.newName, Ctx, false) << "\n";
         break;
       }
       }
     }
 
-    global_block += "/* c2pancake: hoisted variables (arrays and "
-                    "address-taken locals) end */\n";
+    gb << "/* c2pancake: hoisted variables (arrays and "
+          "address-taken locals) end */\n";
 
     // An insertion is modelled as a zero-length replacement at the offset.
     unsigned const insert_offset = sm.getFileOffset(first_func_loc);
     const clang::tooling::Replacement ins(sm.getFilename(first_func_loc),
-                                          insert_offset, 0, global_block);
-    if (auto err = repls.add(ins))
-      llvm::errs() << "hoist_rewriter: insertion conflict: "
-                   << llvm::toString(std::move(err)) << "\n";
+                                          insert_offset, 0, global_block.str());
+    if (auto err = repls.add(ins)) {
+      llvm::errs() << llvm::formatv(
+          "hoist_rewriter: failed to add global decls for '{0}': {1}\n",
+          sm.getFilename(first_func_loc), err);
+
+      insertion_failed = true;
+    }
   }
 
   // collect DeclStmt and DeclRefExpr replacements
-  CollectReplacementsVisitor crv(repls, Ctx, info);
+  PassRename crv(repls, Ctx, info);
   crv.TraverseDecl(tu);
+
+  if (insertion_failed || crv.has_replacement_error) {
+    llvm::errs() << llvm::formatv("hoist_rewriter: aborting due to replacement "
+                                  "conflicts, no output written "
+                                  "for '{0}'\n",
+                                  output_path);
+    return;
+  }
 
   // apply all replacements to the original source in one shot
   llvm::Expected<std::string> result =
@@ -394,26 +499,35 @@ void HoistConsumer::HandleTranslationUnit(clang::ASTContext &Ctx) {
 
   emitToFile(*result);
 }
-void HoistConsumer::emitToFile(const std::string &text) const {
+void Consumer::emitToFile(const std::string &text) const {
 
   std::error_code ec;
-  llvm::raw_fd_ostream out(outputPath, ec, llvm::sys::fs::OF_None);
+  llvm::raw_fd_ostream out(output_path, ec, llvm::sys::fs::OF_None);
   if (ec) {
-    llvm::errs() << "hoist_rewriter: cannot open '" << outputPath
-                 << "': " << ec.message() << "\n";
+    llvm::errs() << llvm::formatv(
+        "pass_hoist_rewriter: cannot open '{0}': {1}\n", output_path,
+        ec.message());
     return;
   }
   out << text;
-  llvm::errs() << "hoist_rewriter: wrote '" << outputPath << "'\n";
+  llvm::outs() << llvm::formatv("pass_hoist_rewriter: wrote '{0}'\n",
+                                output_path);
 }
 
-auto HoistAction::CreateASTConsumer(clang::CompilerInstance &CI,
-                                    clang::StringRef file)
+auto Action::CreateASTConsumer(clang::CompilerInstance &CI,
+                               clang::StringRef file)
     -> std::unique_ptr<clang::ASTConsumer> {
-  auto consumer = std::make_unique<HoistConsumer>(CI);
+  if (!file.ends_with(cur_suffix_)) {
+    llvm::errs() << llvm::formatv(
+        "pass_hoist_rewriter: warning: input file '{0}' does not end with the "
+        "expected suffix '{1}'; output path may be incorrect\n",
+        file, cur_suffix_);
+  }
+
+  auto consumer = std::make_unique<Consumer>(CI);
   consumer->current_suffix = cur_suffix_;
   auto original = file.drop_back(
       cur_suffix_.size()); // remove current suffix to get original filename
-  consumer->outputPath = std::format("{}{}", original.str(), next_suffix_);
+  consumer->output_path = llvm::formatv("{0}{1}", original, next_suffix_).str();
   return consumer;
 }

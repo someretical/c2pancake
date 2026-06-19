@@ -21,11 +21,15 @@ Checks: >
   -misc-override-with-different-visibility,
   -misc-non-private-member-variables-in-classes,
   -bugprone-easily-swappable-parameters,
-  -misc-no-recursion
+  -misc-no-recursion,
+  -cppcoreguidelines-avoid-const-or-ref-data-members,
+  -readability-function-cognitive-complexity,
+  -bugprone-throwing-static-initialization,-cert-err58-cpp,
+  -bugprone-derived-method-shadowing-base-method
 
 WarningsAsErrors: '*'
-
-HeaderFilterRegex: '^(include|clang|llvm)/.*'
+SystemHeaders: false
+HeaderFilterRegex: '^(clang|llvm)/.*'
 
 CheckOptions:
   - key:             readability-identifier-naming.VariableCase
@@ -34,3 +38,5 @@ CheckOptions:
     value:           camelBack
   - key:             readability-identifier-naming.ClassCase
     value:           CamelCase
+  - key:             cppcoreguidelines-avoid-non-const-global-variables.AllowInternalLinkage
+    value:           true

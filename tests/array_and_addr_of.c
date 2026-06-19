@@ -99,6 +99,55 @@ void multiple_init(void) {
   printf("a = %p, b = %p, c = %d\n", (void *)a, (void *)b, c);
 }
 
+void struct_test(void) {
+  struct S {
+    int arr[4]; /* hoisted: auto array in struct */
+  };
+  struct S s = {{1, 2, 3, 4}};
+  printf("%d\n", s.arr[2]);
+}
+
+void struct_pointer_test(void) {
+  struct S {
+    int field; /* hoisted: address taken via pointer in struct */
+  };
+  struct S s = {42};
+  struct S *sp = &s;
+  printf("%d\n", sp->field);
+}
+
+void struct_unused_arr_test(void) {
+  struct S {
+    int arr[4]; /* not hoisted: since it is never used */
+    int field2; /* not hoisted: address not taken, not an array */
+  };
+  struct S s;
+  s.field2 = 42; /* only field2 is used, so arr is not hoisted */
+  printf("%d\n", s.field2);
+}
+
+void struct_unused_arr_ptr_test(void) {
+  struct S {
+    int arr[4]; /* not hoisted: since it is never used */
+    int field2; /* not hoisted: address not taken, not an array */
+  };
+  struct S s;
+  struct S *sp = &s;
+  sp->field2 = 42; /* S has to be hoisted now... */
+  printf("%d\n", sp->field2);
+}
+
+void array_of_structs(void) {
+  struct S {
+    int x;
+    int y;
+  };
+  struct S points[3] = {
+      {1, 2}, {3, 4}, {5, 6}}; /* hoisted: auto array of structs */
+  for (int i = 0; i < 3; i++)
+    printf("point %d: (%d, %d)\n", i, points[i].x, points[i].y);
+}
+
 int main(void) {
   printf("sum  = %d\n", sum_array());
   inc_via_ptr();

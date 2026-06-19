@@ -36,13 +36,13 @@ private:
   clang::Rewriter R;
 };
 
-std::vector<std::string> runMultiPass(
+auto runMultiPass(
     const clang::tooling::CompilationDatabase &BaseCompilations,
     const std::vector<std::string> &InputFiles,
     const std::string &CurrentSuffix, // Suffix on the files we are READING
     const std::string &NextSuffix,    // Suffix we append for the next pass
     std::unique_ptr<clang::tooling::FrontendActionFactory> ActionFactory,
-    const std::string &PassName);
+    const std::string &PassName) -> std::vector<std::string>;
 } // namespace pancake
 
 #endif // C2PANCAKE_MULTIPASS_H

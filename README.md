@@ -47,17 +47,26 @@ c2pancake tests/arith.c --
 
 ## Restrictions
 
-All existing structs and unions will be rewritten to use ONLY uint32_t/uint64_t (same as word size). Warnings will be generated if any field is downsized.
+### Before running the tool
 
-Only pointer structs are allowed to have any layout. Pointer structs are those which are only accessed through a pointer (e.g. memory mapped regions).
+1. Find any static symbols within functions that have non-zero initialisers. 
+1. Make those static symbols global, and move the non-zero initialising statements to the start of the entry point of the program. Since this transpiler doesn't act as a linker, you'll have to do this manually. 
 
-Any externally defined data type will also be rewritten to the word size and a warning generated if necessary.
+### Other restrictions
 
-All arrays in functions are considered static so no recursion is allowed. They will be hoisted into the global scope with a special prefix.
+All existing structs and unions will be rewritten to use ONLY (u)int32_t/(u)int64_t (same as word size). Bitfields will be promoted to full width types. Warnings will be generated if any field is downsized. Struct definitions outside the global scope will be hoisted to global scope with name mangling.
 
-Any stack variable which has its address taken will also be hoisted into the global scope with a special prefix.
+The only exception are structs which are only accessed through a pointer (e.g. memory mapped regions). They will not be rewritten.
 
+Any externally defined symbol will also be rewritten to the word size and a warning generated if necessary.
 
+All arrays in functions are considered "static" (but not shareable across threads) so no recursion is allowed. They will be hoisted into the global scope with name mangling.
+
+Any stack variable which has its address taken will also be hoisted into the global scope with name mangling.
+
+Floating point types are not supported and will be promoted into ints.
+
+The insertion of `#include <stdint.h>` at the top of a file may fail if there are complex processor directives present.
 
 ## Development
 

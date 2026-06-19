@@ -58,9 +58,9 @@ auto MultiPassAction::CreateASTConsumer(clang::CompilerInstance &CI,
   std::string const copy = file.str();
   return std::make_unique<MultiPassConsumer>(R, copy);
 }
-
 auto MultiPassAction::EndSourceFileAction() -> void {}
 
+namespace {
 class MultiPassCompilationDatabase
     : public clang::tooling::CompilationDatabase {
 private:
@@ -109,6 +109,7 @@ public:
     return InnerDB.getAllCompileCommands();
   }
 };
+} // namespace
 
 auto pancake::runMultiPass(
     const clang::tooling::CompilationDatabase &BaseCompilations,

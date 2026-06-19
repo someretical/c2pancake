@@ -38,8 +38,14 @@ foreach(PATH_VAR GCC_TOOLCHAIN_PATH GCC_BASE_INCLUDE_PATH GCC_ARCH_INCLUDE_PATH)
 endforeach()
 
 add_executable(
-  c2pancake src/Utils.cpp src/Pass_HoistArraysAndAddresses.cpp
-            src/MultiPass.cpp src/CodeGen.cpp src/IRBuilder.cpp src/main.cpp)
+  c2pancake
+  src/Utils.cpp
+  src/Pass_PromoteRecords.cpp
+  src/Pass_HoistArraysAndAddresses.cpp
+  src/MultiPass.cpp
+  src/CodeGen.cpp
+  src/IRBuilder.cpp
+  src/main.cpp)
 
 target_include_directories(c2pancake PRIVATE include)
 

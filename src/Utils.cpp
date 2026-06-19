@@ -34,11 +34,11 @@ auto stmtToString(const clang::Stmt *S, const clang::SourceManager &SM,
   return text.str();
 }
 
-static auto hasSideEffect(const clang::Expr *E, clang::ASTContext &Ctx) -> bool {
+auto hasSideEffect(const clang::Expr *E, clang::ASTContext &Ctx) -> bool {
   return E->HasSideEffects(Ctx, true);
 }
 
-static auto isTopLevelStmt(const clang::UnaryOperator *UO, clang::ASTContext &Ctx)
+auto isTopLevelStmt(const clang::UnaryOperator *UO, clang::ASTContext &Ctx)
     -> bool {
   clang::DynTypedNodeList const parents = Ctx.getParents(*UO);
   return std::ranges::any_of(parents, [](const clang::DynTypedNode &p) -> bool {

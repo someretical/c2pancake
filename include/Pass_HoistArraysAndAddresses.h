@@ -5,22 +5,17 @@
 #include <clang/AST/ASTContext.h>
 #include <clang/AST/Decl.h>
 #include <clang/AST/Expr.h>
-#include <clang/AST/OperationKinds.h>
 #include <clang/AST/RecursiveASTVisitor.h>
 #include <clang/AST/Stmt.h>
 #include <clang/AST/TypeBase.h>
 #include <clang/Basic/LLVM.h>
 #include <clang/Basic/SourceLocation.h>
-#include <clang/Basic/Specifiers.h>
 #include <clang/Frontend/CompilerInstance.h>
 #include <clang/Frontend/FrontendAction.h>
 #include <clang/Rewrite/Core/Rewriter.h>
-#include <clang/Tooling/CommonOptionsParser.h>
 #include <clang/Tooling/Core/Replacement.h>
 #include <clang/Tooling/Tooling.h>
-#include <llvm/ADT/StringRef.h>
-#include <llvm/Support/Casting.h>
-#include <llvm/Support/CommandLine.h>
+#include <llvm/ADT/DenseMap.h>
 #include <llvm/Support/FileSystem.h>
 #include <llvm/Support/raw_ostream.h>
 
@@ -29,7 +24,8 @@
 #include <set>
 #include <string>
 
-namespace pancake::hoist_arrays_and_addresses {
+namespace pancake::pass_hoist_arrays_and_addresses {
+
 enum class DeclTreatment : uint8_t {
   // Auto/register local: emit a fresh global decl before the first function,
   // replace the local DeclStmt with initialisation assignments
@@ -48,46 +44,54 @@ struct VarHoistEntry {
   std::string newName;
   DeclTreatment treatment;
   const clang::FunctionDecl *func{};
+
+  VarHoistEntry(std::string newName, DeclTreatment treatment,
+                const clang::FunctionDecl *func)
+      : newName(std::move(newName)), treatment(treatment), func(func) {}
 };
 
 struct HoistInfo {
   llvm::DenseMap<const clang::VarDecl *, VarHoistEntry> hoistMap;
+  size_t hoist_arr_counter = 0;
+  size_t hoist_ptr_counter = 0;
+  size_t hoist_record_counter = 0;
 };
 
-// Pass 1: Collect all variables that need hoisting
-class AddressTakenFinder
-    : public clang::RecursiveASTVisitor<AddressTakenFinder> {
+// Collect all variables that need hoisting
+class PassFind : public clang::RecursiveASTVisitor<PassFind> {
 public:
   std::set<const clang::VarDecl *> addressTaken;
+  std::set<const clang::VarDecl *> arrayFieldAccessed;
 
   auto VisitUnaryOperator(clang::UnaryOperator *UO) -> bool;
+  auto VisitMemberExpr(clang::MemberExpr *ME) -> bool;
 };
 
-class CollectVisitor : public clang::RecursiveASTVisitor<CollectVisitor> {
+// Analyse how each variable should be hoisted and prepare the replacement map
+class PassAnalyse : public clang::RecursiveASTVisitor<PassAnalyse> {
 public:
   HoistInfo &info;
   clang::ASTContext &Ctx;
 
-  CollectVisitor(HoistInfo &hi, clang::ASTContext &ctx) : info(hi), Ctx(ctx) {}
+  PassAnalyse(HoistInfo &hi, clang::ASTContext &ctx) : info(hi), Ctx(ctx) {}
 
   auto VisitFunctionDecl(clang::FunctionDecl *FD) -> bool;
 
 private:
-  void walkStmt(clang::Stmt *S, clang::FunctionDecl *FD,
-                std::set<const clang::VarDecl *> &addrTaken);
+  void walkStmt(clang::Stmt *S, clang::FunctionDecl *FD, PassFind &atf);
 };
 
-// Pass 2: Accumulate edits and apply at the end
-class CollectReplacementsVisitor
-    : public clang::RecursiveASTVisitor<CollectReplacementsVisitor> {
+// Accumulate replacements for DeclStmts and DeclRefExprs
+class PassRename : public clang::RecursiveASTVisitor<PassRename> {
 public:
   clang::tooling::Replacements &Repls;
   clang::ASTContext &Ctx;
   HoistInfo &info;
   clang::SourceManager &SM;
+  bool has_replacement_error = false;
 
-  CollectReplacementsVisitor(clang::tooling::Replacements &repls,
-                             clang::ASTContext &ctx, HoistInfo &hi)
+  PassRename(clang::tooling::Replacements &repls, clang::ASTContext &ctx,
+             HoistInfo &hi)
       : Repls(repls), Ctx(ctx), info(hi), SM(ctx.getSourceManager()) {}
 
   // Replace DeclStmts that contain hoisted vars
@@ -97,48 +101,47 @@ public:
   auto VisitDeclRefExpr(clang::DeclRefExpr *DR) -> bool;
 
 private:
-  // Convert a SourceRange to a tooling::Replacement and add it to the set.
-  // tooling::Replacements::add() returns an llvm::Error if there is an
-  // irreconcilable conflict; we log and continue rather than crashing.
-  void addReplacement(clang::SourceRange range, const std::string &text);
+  // Convert a SourceRange to a tooling::Replacement and add it to the set
+  void addReplacement(clang::SourceRange range, llvm::StringRef text);
 };
 
-class HoistConsumer : public clang::ASTConsumer {
-  clang::CompilerInstance &CI;
-
+class Consumer : public clang::ASTConsumer {
 public:
   std::string current_suffix;
-  std::string outputPath;
+  std::string output_path;
 
-  explicit HoistConsumer(clang::CompilerInstance &ci) : CI(ci) {}
+  explicit Consumer(clang::CompilerInstance &ci) : CI(ci) {}
 
   void HandleTranslationUnit(clang::ASTContext &Ctx) override;
 
 private:
+  clang::CompilerInstance &CI;
   void emitToFile(const std::string &text) const;
 };
 
-class HoistAction : public clang::ASTFrontendAction {
-  std::string cur_suffix_;
-  std::string next_suffix_;
+class Action : public clang::ASTFrontendAction {
 
 public:
-  HoistAction(std::string cur_suffix, std::string next_suffix)
+  Action(std::string cur_suffix, std::string next_suffix)
       : cur_suffix_(std::move(cur_suffix)),
         next_suffix_(std::move(next_suffix)) {}
 
   auto CreateASTConsumer(clang::CompilerInstance &CI, clang::StringRef file)
       -> std::unique_ptr<clang::ASTConsumer> override;
+
+private:
+  std::string cur_suffix_;
+  std::string next_suffix_;
 };
 
-struct HoistActionFactory : public clang::tooling::FrontendActionFactory {
+struct ActionFactory : public clang::tooling::FrontendActionFactory {
   std::string cur_suffix;
   std::string next_suffix;
   auto create() -> std::unique_ptr<clang::FrontendAction> override {
-    return std::make_unique<HoistAction>(cur_suffix, next_suffix);
+    return std::make_unique<Action>(cur_suffix, next_suffix);
   }
 };
 
-} // namespace pancake::hoist_arrays_and_addresses
+} // namespace pancake::pass_hoist_arrays_and_addresses
 
 #endif // C2PANCAKE_PASS_HOISTARRAYSANDADDRESSES_H
