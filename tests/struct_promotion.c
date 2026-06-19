@@ -1,0 +1,96 @@
+#include <stddef.h>
+#include <stdint.h>
+
+/* ── 1. Global struct (promoted in-place) ───────────────────────────────────
+ */
+struct GlobalPoint {
+  int x;
+  int y;
+  float z;
+};
+
+/* ── 2. Pointer-only struct (must be IGNORED) ───────────────────────────────
+ */
+struct PtrOnly {
+  int value;
+};
+
+/* ── 3. Bit-field struct ────────────────────────────────────────────────────
+ */
+struct BitfieldFlags {
+  unsigned int active : 1;
+  unsigned int mode : 3;
+  int level : 12;
+};
+
+/* ── 4. Mixed struct (array and pointer fields left alone) ──────────────────
+ */
+struct MixedStruct {
+  short count;     /* scalar  – promoted                   */
+  char name[64];   /* array   – left alone                 */
+  int *ptr;        /* pointer – left alone                 */
+  unsigned int id; /* scalar  – promoted                   */
+  char grid[4][8]; /* 2-D array – left alone               */
+};
+
+/* ── 5. Deeply nested struct with anonymous inner union ─────────────────────
+ */
+struct Nested {
+  int tag; /* scalar – promoted                   */
+  union {  /* anonymous union – rendered inline   */
+    int as_int;
+    float as_float;
+  };
+  struct { /* anonymous struct – rendered inline  */
+    short lo;
+    short hi;
+  } pair;
+};
+
+/* ======================================================================== */
+
+void use_global(void) {
+  struct GlobalPoint p = {1, 2, 3.0f};
+  (void)p;
+}
+
+void use_pointer_only(void) {
+  /* PtrOnly is only ever used via pointer – must NOT be promoted */
+  struct PtrOnly *p = 0;
+  (void)p;
+}
+
+void use_bitfield(void) {
+  struct BitfieldFlags f = {1, 2, -4};
+  (void)f;
+}
+
+void use_mixed(void) {
+  struct MixedStruct m = {3, "hello", 0, 42u};
+  (void)m;
+}
+
+void use_nested(void) {
+  struct Nested n = {7, {.as_int = 99}, {1, 2}};
+  (void)n;
+}
+
+/* LocalRect is defined inside a function → must be lifted to global scope    */
+void use_local_rect(void) {
+  struct LocalRect {
+    short width;
+    short height;
+  };
+  struct LocalRect r = {100, 200};
+  (void)r;
+}
+
+int main(void) {
+  use_global();
+  use_pointer_only();
+  use_bitfield();
+  use_mixed();
+  use_nested();
+  use_local_rect();
+  return 0;
+}
