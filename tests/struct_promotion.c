@@ -1,47 +1,42 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* ── 1. Global struct (promoted in-place) ───────────────────────────────────
- */
+/* Global struct (promoted in-place) */
 struct GlobalPoint {
   int x;
   int y;
   float z;
 };
 
-/* ── 2. Pointer-only struct (must be IGNORED) ───────────────────────────────
- */
+/* Pointer-only struct (must be IGNORED) */
 struct PtrOnly {
   int value;
 };
 
-/* ── 3. Bit-field struct ────────────────────────────────────────────────────
- */
+/* Bit-field struct */
 struct BitfieldFlags {
   unsigned int active : 1;
   unsigned int mode : 3;
   int level : 12;
 };
 
-/* ── 4. Mixed struct (array and pointer fields left alone) ──────────────────
- */
+/* Mixed struct (array and pointer fields left alone) */
 struct MixedStruct {
-  short count;     /* scalar  – promoted                   */
-  char name[64];   /* array   – left alone                 */
-  int *ptr;        /* pointer – left alone                 */
-  unsigned int id; /* scalar  – promoted                   */
-  char grid[4][8]; /* 2-D array – left alone               */
+  short count;     /* scalar  - promoted                   */
+  char name[64];   /* array   - left alone                 */
+  int *ptr;        /* pointer - left alone                 */
+  unsigned int id; /* scalar  - promoted                   */
+  char grid[4][8]; /* 2-D array - left alone               */
 };
 
-/* ── 5. Deeply nested struct with anonymous inner union ─────────────────────
- */
+/* Deeply nested struct with anonymous inner union */
 struct Nested {
-  int tag; /* scalar – promoted                   */
-  union {  /* anonymous union – rendered inline   */
+  int tag; /* scalar - promoted                   */
+  union {  /* anonymous union - rendered inline   */
     int as_int;
     float as_float;
   };
-  struct { /* anonymous struct – rendered inline  */
+  struct { /* anonymous struct - rendered inline  */
     short lo;
     short hi;
   } pair;
@@ -55,7 +50,7 @@ void use_global(void) {
 }
 
 void use_pointer_only(void) {
-  /* PtrOnly is only ever used via pointer – must NOT be promoted */
+  /* PtrOnly is only ever used via pointer - must NOT be promoted */
   struct PtrOnly *p = 0;
   (void)p;
 }
@@ -75,8 +70,8 @@ void use_nested(void) {
   (void)n;
 }
 
-/* LocalRect is defined inside a function → must be lifted to global scope    */
 void use_local_rect(void) {
+  /* LocalRect is defined inside a function, must be lifted to global scope */
   struct LocalRect {
     short width;
     short height;
