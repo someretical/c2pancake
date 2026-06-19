@@ -78,6 +78,33 @@ void use_local_rect(void) {
   };
   struct LocalRect r = {100, 200};
   (void)r;
+
+  struct MixedStruct2 {
+    short count;
+    char name[64];
+    int *ptr;
+    unsigned int id;
+    char grid[4][8];
+  };
+
+  struct MixedStruct2 m2[5];
+  m2[0].count = 10;
+  (void)m2;
+
+  struct Nested2 {
+    int tag;
+    union {
+      int as_int;
+      float as_float;
+    };
+    struct {
+      short lo;
+      short hi;
+    } pair;
+  };
+  struct Nested2 n2[2];
+  n2[0].tag = 42;
+  (void)n2;
 }
 
 int main(void) {
