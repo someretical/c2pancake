@@ -190,15 +190,20 @@ auto printRecordDecl(const clang::RecordDecl *RD, clang::ASTContext &Ctx,
 
 auto PassFind::VisitRecordDecl(clang::RecordDecl *RD) -> bool {
   if (RD->isCompleteDefinition()) {
+    bool inside_func = true;
     // only consider records inside functions
     for (const clang::DeclContext *dc = RD->getDeclContext(); dc != nullptr;
          dc = dc->getParent()) {
 
       if (const auto *fd = llvm::dyn_cast<clang::FunctionDecl>(dc)) {
         InitialisedStructs.insert({RD, fd});
+        inside_func = true;
         break;
       }
     }
+
+    if (!inside_func)
+      InitialisedStructs.insert({RD, nullptr});
   }
 
   return true;

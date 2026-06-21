@@ -35,7 +35,6 @@ public:
     return FunctionOrdering | std::views::reverse;
   }
 
-  // NOLINTBEGIN(misc-no-recursion,bugprone-derived-method-shadowing-base-method)
   // top level
   auto TraverseFunctionDecl(clang::FunctionDecl *FD) -> bool;
   // auto TraverseVarDecl(clang::VarDecl *VD) -> bool;
@@ -59,15 +58,12 @@ public:
   auto TraverseIntegerLiteral(clang::IntegerLiteral *IL) -> bool;
   // auto TraverseArraySubscriptExpr(clang::ArraySubscriptExpr *ASE) -> bool;
   // auto TraverseMemberExpr(clang::MemberExpr *ME) -> bool;
-  // NOLINTEND(misc-no-recursion,bugprone-derived-method-shadowing-base-method)
 
 private:
-  // NOLINTBEGIN(cppcoreguidelines-avoid-const-or-ref-data-members)
   const clang::Rewriter &Rewriter;
   const clang::ASTContext &Ctx;
   const clang::LangOptions &LO;
   const clang::SourceManager &SM;
-  // NOLINTEND(cppcoreguidelines-avoid-const-or-ref-data-members)
 
   clang::FunctionDecl *CurrentFunction = nullptr;
 
