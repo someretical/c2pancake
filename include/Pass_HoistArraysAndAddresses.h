@@ -1,6 +1,8 @@
 #ifndef C2PANCAKE_PASS_HOISTARRAYSANDADDRESSES_H
 #define C2PANCAKE_PASS_HOISTARRAYSANDADDRESSES_H
 
+#include "MultiPass.h"
+
 #include <clang/AST/ASTConsumer.h>
 #include <clang/AST/ASTContext.h>
 #include <clang/AST/Decl.h>
@@ -45,8 +47,7 @@ struct VarHoistEntry {
   DeclTreatment treatment;
   const clang::FunctionDecl *func{};
 
-  VarHoistEntry(std::string newName, DeclTreatment treatment,
-                const clang::FunctionDecl *func)
+  VarHoistEntry(std::string newName, DeclTreatment treatment, const clang::FunctionDecl *func)
       : newName(std::move(newName)), treatment(treatment), func(func) {}
 };
 
@@ -90,8 +91,7 @@ public:
   clang::SourceManager &SM;
   bool has_replacement_error = false;
 
-  PassRename(clang::tooling::Replacements &repls, clang::ASTContext &ctx,
-             HoistInfo &hi)
+  PassRename(clang::tooling::Replacements &repls, clang::ASTContext &ctx, HoistInfo &hi)
       : Repls(repls), Ctx(ctx), info(hi), SM(ctx.getSourceManager()) {}
 
   // Replace DeclStmts that contain hoisted vars
@@ -102,44 +102,19 @@ public:
 
 private:
   // Convert a SourceRange to a tooling::Replacement and add it to the set
-  void addReplacement(clang::SourceRange range, llvm::StringRef text);
+  void AddReplacement(clang::SourceRange range, llvm::StringRef text);
 };
 
-class Consumer : public clang::ASTConsumer {
+class Consumer : public C2PancakePass {
 public:
-  std::string current_suffix;
-  std::string output_path;
-
-  explicit Consumer(clang::CompilerInstance &ci) : CI(ci) {}
-
+  using C2PancakePass::C2PancakePass; // inherit constructor
   void HandleTranslationUnit(clang::ASTContext &Ctx) override;
-
-private:
-  clang::CompilerInstance &CI;
-  void emitToFile(const std::string &text) const;
 };
 
-class Action : public clang::ASTFrontendAction {
-
+class Action : public PipelineAction<Action, Consumer> {
 public:
-  Action(std::string cur_suffix, std::string next_suffix)
-      : cur_suffix_(std::move(cur_suffix)),
-        next_suffix_(std::move(next_suffix)) {}
-
-  auto CreateASTConsumer(clang::CompilerInstance &CI, clang::StringRef file)
-      -> std::unique_ptr<clang::ASTConsumer> override;
-
-private:
-  std::string cur_suffix_;
-  std::string next_suffix_;
-};
-
-struct ActionFactory : public clang::tooling::FrontendActionFactory {
-  std::string cur_suffix;
-  std::string next_suffix;
-  auto create() -> std::unique_ptr<clang::FrontendAction> override {
-    return std::make_unique<Action>(cur_suffix, next_suffix);
-  }
+  using PipelineAction<Action, Consumer>::PipelineAction; // inherit constructor
+  static auto GetActionName() -> std::string { return "HoistArraysAndAddresses"; }
 };
 
 } // namespace pancake::pass_hoist_arrays_and_addresses

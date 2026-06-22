@@ -32,16 +32,14 @@
 using namespace pancake::pass_promote_records;
 
 namespace {
-auto recordDeclPrefix(bool make_shared, size_t counter, const std::string &func,
-                      const std::string &var) -> std::string {
-  return llvm::formatv("__c2pnk_{0}_record_decl_{1}_{2}_{3}",
-                       make_shared ? "shared" : "local", func, var, counter);
+auto RecordDeclPrefix(bool make_shared, size_t counter, const std::string &func, const std::string &var)
+    -> std::string {
+  return llvm::formatv("__c2pnk_{0}_record_decl_{1}_{2}_{3}", make_shared ? "shared" : "local", func, var, counter);
 }
 
 const bool is32_bit = sizeof(void *) == 4;
 
-auto computePromotion(const clang::FieldDecl *F, const clang::ASTContext &Ctx,
-                      FieldPromotion &out) -> bool {
+auto ComputePromotion(const clang::FieldDecl *F, const clang::ASTContext &Ctx, FieldPromotion &out) -> bool {
   clang::QualType const qt = F->getType();
   const clang::Type *t = qt.getTypePtr();
 
@@ -60,8 +58,7 @@ auto computePromotion(const clang::FieldDecl *F, const clang::ASTContext &Ctx,
   bool const is_signed = !t->isUnsignedIntegerType();
 
   auto width = is32_bit ? 32 : 64;
-  out.newTypeName = is_signed ? llvm::formatv("int{0}_t", width)
-                              : llvm::formatv("uint{0}_t", width);
+  out.newTypeName = is_signed ? llvm::formatv("int{0}_t", width) : llvm::formatv("uint{0}_t", width);
 
   if (F->isBitField()) {
     out.isBitField = true;
@@ -77,12 +74,10 @@ auto computePromotion(const clang::FieldDecl *F, const clang::ASTContext &Ctx,
   return true;
 }
 
-auto printRecordDecl(const clang::RecordDecl *RD, clang::ASTContext &Ctx,
-                     const std::string &overrideName, unsigned indent)
-    -> std::string;
+auto PrintRecordDecl(const clang::RecordDecl *RD, clang::ASTContext &Ctx, const std::string &overrideName,
+                     unsigned indent) -> std::string;
 
-auto printFieldDecl(const clang::FieldDecl *F, clang::ASTContext &Ctx,
-                    unsigned indent) -> std::string {
+auto PrintFieldDecl(const clang::FieldDecl *F, clang::ASTContext &Ctx, unsigned indent) -> std::string {
   std::string pad(indent, ' ');
   clang::QualType const qt = F->getType();
 
@@ -113,8 +108,7 @@ auto printFieldDecl(const clang::FieldDecl *F, clang::ASTContext &Ctx,
     const clang::RecordDecl *nested = rt->getDecl();
     // handle anonymous nested record
     if (nested->isAnonymousStructOrUnion() || nested->getDeclName().isEmpty()) {
-      std::string body =
-          printRecordDecl(nested, Ctx, /*overrideName=*/"", indent);
+      std::string body = PrintRecordDecl(nested, Ctx, /*overrideName=*/"", indent);
       // body ends with "};" so strip the ";" since we need to append the field
       // name
       if (!body.empty() && body.back() == ';')
@@ -132,19 +126,14 @@ auto printFieldDecl(const clang::FieldDecl *F, clang::ASTContext &Ctx,
   }
 
   FieldPromotion promo;
-  if (computePromotion(F, Ctx, promo)) {
+  if (ComputePromotion(F, Ctx, promo)) {
     std::string line;
     llvm::raw_string_ostream os(line);
-    os << llvm::formatv("{0}{1} {2};", pad, promo.newTypeName,
-                        F->getNameAsString());
+    os << llvm::formatv("{0}{1} {2};", pad, promo.newTypeName, F->getNameAsString());
     if (promo.isBitField)
-      os << llvm::formatv(
-          "  /* WARNING: promoted from bit-field (was {0} bits) */",
-          promo.bitFieldWidth);
+      os << llvm::formatv("  /* WARNING: promoted from bit-field (was {0} bits) */", promo.bitFieldWidth);
     if (promo.sizeDecreased)
-      os << llvm::formatv(
-          "  /* WARNING: size decreased (original field was {0} bytes) */",
-          promo.origBytes);
+      os << llvm::formatv("  /* WARNING: size decreased (original field was {0} bytes) */", promo.origBytes);
     return line;
   }
 
@@ -163,13 +152,11 @@ auto printFieldDecl(const clang::FieldDecl *F, clang::ASTContext &Ctx,
   return os.str();
 }
 
-auto printRecordDecl(const clang::RecordDecl *RD, clang::ASTContext &Ctx,
-                     const std::string &overrideName, unsigned indent)
-    -> std::string {
+auto PrintRecordDecl(const clang::RecordDecl *RD, clang::ASTContext &Ctx, const std::string &overrideName,
+                     unsigned indent) -> std::string {
   std::string const pad(indent, ' ');
   std::string const keyword = RD->isUnion() ? "union" : "struct";
-  std::string const name =
-      overrideName.empty() ? RD->getNameAsString() : overrideName;
+  std::string const name = overrideName.empty() ? RD->getNameAsString() : overrideName;
 
   std::string out;
   llvm::raw_string_ostream os(out);
@@ -180,7 +167,7 @@ auto printRecordDecl(const clang::RecordDecl *RD, clang::ASTContext &Ctx,
 
   unsigned const field_indent = indent + 4;
   for (const clang::FieldDecl *f : RD->fields()) {
-    os << printFieldDecl(f, Ctx, field_indent) << "\n";
+    os << PrintFieldDecl(f, Ctx, field_indent) << "\n";
   }
 
   os << pad << "}";
@@ -192,8 +179,7 @@ auto PassFind::VisitRecordDecl(clang::RecordDecl *RD) -> bool {
   if (RD->isCompleteDefinition()) {
     bool inside_func = true;
     // only consider records inside functions
-    for (const clang::DeclContext *dc = RD->getDeclContext(); dc != nullptr;
-         dc = dc->getParent()) {
+    for (const clang::DeclContext *dc = RD->getDeclContext(); dc != nullptr; dc = dc->getParent()) {
 
       if (const auto *fd = llvm::dyn_cast<clang::FunctionDecl>(dc)) {
         InitialisedStructs.insert({RD, fd});
@@ -215,19 +201,16 @@ void Consumer::HandleTranslationUnit(clang::ASTContext &Ctx) {
   sc.TraverseDecl(Ctx.getTranslationUnitDecl());
 
   // copy source text to new file
-  const llvm::MemoryBufferRef buf =
-      sm.getBufferOrFake(sm.getMainFileID(), clang::SourceLocation{});
+  const llvm::MemoryBufferRef buf = sm.getBufferOrFake(sm.getMainFileID(), clang::SourceLocation{});
   std::string const source_text(buf.getBuffer());
 
   if (sc.InitialisedStructs.empty()) {
-    emitToFile(source_text);
     return;
   }
 
   // Find offset just after the last top of file #include, and whether
   // <stdint.h> is already included anywhere in the file
-  llvm::StringRef const main_file =
-      sm.getFileEntryRefForID(sm.getMainFileID())->getName();
+  llvm::StringRef const main_file = sm.getFileEntryRefForID(sm.getMainFileID())->getName();
   unsigned insert_offset = 0;
   bool has_stdint = false;
   {
@@ -235,9 +218,8 @@ void Consumer::HandleTranslationUnit(clang::ASTContext &Ctx) {
     size_t pos = 0;
     while (pos < text.size()) {
       size_t const line_end = text.find('\n', pos);
-      llvm::StringRef const line = (line_end == llvm::StringRef::npos)
-                                       ? text.substr(pos)
-                                       : text.substr(pos, line_end - pos);
+      llvm::StringRef const line =
+          (line_end == llvm::StringRef::npos) ? text.substr(pos) : text.substr(pos, line_end - pos);
       llvm::StringRef const trimmed = line.trim();
 
       if (trimmed.contains("stdint.h"))
@@ -245,11 +227,9 @@ void Consumer::HandleTranslationUnit(clang::ASTContext &Ctx) {
 
       if (trimmed.starts_with("#include")) {
         // Extend insertOffset to just past this line (including newline).
-        insert_offset = (line_end == llvm::StringRef::npos)
-                            ? static_cast<unsigned>(source_text.size())
-                            : static_cast<unsigned>(line_end + 1);
-      } else if (trimmed.empty() || trimmed.starts_with("//") ||
-                 trimmed.starts_with("/*")) {
+        insert_offset = (line_end == llvm::StringRef::npos) ? static_cast<unsigned>(source_text.size())
+                                                            : static_cast<unsigned>(line_end + 1);
+      } else if (trimmed.empty() || trimmed.starts_with("//") || trimmed.starts_with("/*")) {
         // Skip blank lines / comments at the top without stopping the scan
       } else {
         // First non-include, non-blank, non-comment line: stop scanning
@@ -282,36 +262,32 @@ void Consumer::HandleTranslationUnit(clang::ASTContext &Ctx) {
     if (orig_name.empty())
       continue; // anonymous top-level struct
 
-    bool const is_global =
-        clang::isa<clang::TranslationUnitDecl>(RD->getDeclContext());
+    bool const is_global = clang::isa<clang::TranslationUnitDecl>(RD->getDeclContext());
     bool const needs_lift = !is_global;
 
     std::string new_name =
-        needs_lift ? recordDeclPrefix(true, sc.hoist_record_decl_counter++,
-                                      FD->getNameAsString(), orig_name)
+        needs_lift ? RecordDeclPrefix(true, sc.hoist_record_decl_counter++, FD->getNameAsString(), orig_name)
                    : orig_name;
 
     std::string new_body;
     {
       llvm::raw_string_ostream os(new_body);
-      os << printRecordDecl(RD, Ctx, new_name, 0) << ";";
+      os << PrintRecordDecl(RD, Ctx, new_name, 0) << ";";
     }
 
     if (needs_lift) {
-      std::string const comment =
-          llvm::formatv("/* struct {0} hoisted to global scope as {1} */",
-                        orig_name, new_name);
-      addReplacement(Ctx, RD->getSourceRange(), comment, true);
+      std::string const comment = llvm::formatv("/* struct {0} hoisted to global scope as {1} */", orig_name, new_name);
+      AddReplacement(Ctx, RD->getSourceRange(), comment, true);
 
       {
         llvm::raw_string_ostream os(preamble);
         os << new_body << "\n\n";
       }
 
-      rewriteTypeUses(RD, new_name, Ctx);
+      RewriteTypeUses(RD, new_name, Ctx);
     } else {
       // rewrite in place
-      addReplacement(Ctx, RD->getSourceRange(), new_body, true);
+      AddReplacement(Ctx, RD->getSourceRange(), new_body, true);
     }
   }
 
@@ -320,22 +296,10 @@ void Consumer::HandleTranslationUnit(clang::ASTContext &Ctx) {
     os << "/* c2pancake: end of promoted struct definitions */\n\n";
   }
 
-  insertAtOffset(main_file, insert_offset, preamble);
-
-  // apply all replacements to the original source in one shot
-  llvm::Expected<std::string> result =
-      clang::tooling::applyAllReplacements(source_text, Repls);
-  if (!result) {
-    llvm::errs() << "promote_records: failed to apply replacements: "
-                 << llvm::toString(result.takeError()) << "\n";
-    return;
-  }
-
-  emitToFile(*result);
+  InsertAtOffset(main_file, insert_offset, preamble);
 }
 
-void Consumer::addReplacement(clang::ASTContext &Ctx, clang::SourceRange SR,
-                              const std::string &newText,
+void Consumer::AddReplacement(clang::ASTContext &Ctx, clang::SourceRange SR, const std::string &newText,
                               bool includeTerminatingSemicolon) {
   const auto &sm = Ctx.getSourceManager();
   const auto &lang_opts = Ctx.getLangOpts();
@@ -349,33 +313,16 @@ void Consumer::addReplacement(clang::ASTContext &Ctx, clang::SourceRange SR,
   }
 
   auto char_range = clang::CharSourceRange::getTokenRange(SR);
-  clang::tooling::Replacement const repl(Ctx.getSourceManager(), char_range,
-                                         newText);
-  if (auto err = Repls.add(repl)) {
-    llvm::errs() << "Replacement conflict: " << llvm::toString(std::move(err))
-                 << "\n";
+  clang::tooling::Replacement const repl(Ctx.getSourceManager(), char_range, newText);
+  if (auto err = repls.add(repl)) {
+    llvm::errs() << "Replacement conflict: " << llvm::toString(std::move(err)) << "\n";
   }
 }
 
-void Consumer::insertAtOffset(llvm::StringRef file, unsigned offset,
-                              const std::string &text) {
+void Consumer::InsertAtOffset(llvm::StringRef file, unsigned offset, const std::string &text) {
   clang::tooling::Replacement const r(file, offset, 0, text);
-  if (auto err = Repls.add(r))
-    llvm::errs() << "Insert conflict: " << llvm::toString(std::move(err))
-                 << "\n";
-}
-
-void Consumer::emitToFile(const std::string &text) const {
-
-  std::error_code ec;
-  llvm::raw_fd_ostream out(output_path, ec, llvm::sys::fs::OF_None);
-  if (ec) {
-    llvm::errs() << "pass_promote_records: cannot open '" << output_path
-                 << "': " << ec.message() << "\n";
-    return;
-  }
-  out << text;
-  llvm::errs() << "pass_promote_records: wrote '" << output_path << "'\n";
+  if (auto err = repls.add(r))
+    llvm::errs() << "Insert conflict: " << llvm::toString(std::move(err)) << "\n";
 }
 
 namespace {
@@ -385,8 +332,7 @@ struct Renamer : clang::RecursiveASTVisitor<Renamer> {
   Consumer &Parent;
   clang::ASTContext &Ctx;
 
-  Renamer(const clang::RecordDecl *T, const std::string &N, Consumer &P,
-          clang::ASTContext &C)
+  Renamer(const clang::RecordDecl *T, const std::string &N, Consumer &P, clang::ASTContext &C)
       : Target(T), NewName(N), Parent(P), Ctx(C) {}
 
   auto VisitTypeLoc(clang::TypeLoc TL) -> bool {
@@ -410,7 +356,7 @@ struct Renamer : clang::RecursiveASTVisitor<Renamer> {
       std::string replacement;
       llvm::raw_string_ostream os(replacement);
       os << "struct " << NewName;
-      Parent.addReplacement(Ctx, sr, replacement, false);
+      Parent.AddReplacement(Ctx, sr, replacement, false);
     }
 
     return true;
@@ -418,20 +364,7 @@ struct Renamer : clang::RecursiveASTVisitor<Renamer> {
 };
 } // namespace
 
-void Consumer::rewriteTypeUses(const clang::RecordDecl *RD,
-                               const std::string &newName,
-                               clang::ASTContext &Ctx) {
+void Consumer::RewriteTypeUses(const clang::RecordDecl *RD, const std::string &newName, clang::ASTContext &Ctx) {
   Renamer r(RD, newName, *this, Ctx);
   r.TraverseDecl(Ctx.getTranslationUnitDecl());
-}
-
-auto Action::CreateASTConsumer(clang::CompilerInstance &CI,
-                               clang::StringRef file)
-    -> std::unique_ptr<clang::ASTConsumer> {
-  auto consumer = std::make_unique<Consumer>(CI);
-  consumer->current_suffix = cur_suffix_;
-  auto original = file.drop_back(
-      cur_suffix_.size()); // remove current suffix to get original filename
-  consumer->output_path = llvm::formatv("{0}{1}", original.str(), next_suffix_);
-  return consumer;
 }

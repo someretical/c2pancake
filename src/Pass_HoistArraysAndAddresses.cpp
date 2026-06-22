@@ -35,26 +35,17 @@ using namespace pancake::pass_hoist_arrays_and_addresses;
 
 namespace {
 // generate a unique global name for a hoisted array variable
-auto arrayPrefix(bool make_shared, size_t counter, llvm::StringRef func,
-                 llvm::StringRef var) -> std::string {
-  return llvm::formatv("__c2pnk_{0}_array_{1}_{2}_{3}",
-                       make_shared ? "shared" : "local", func, var, counter)
-      .str();
+auto ArrayPrefix(bool make_shared, size_t counter, llvm::StringRef func, llvm::StringRef var) -> std::string {
+  return llvm::formatv("__c2pnk_{0}_array_{1}_{2}_{3}", make_shared ? "shared" : "local", func, var, counter).str();
 }
 
 // generate a unique global name for a hoisted address-taken variable
-auto ptrPrefix(bool make_shared, size_t counter, llvm::StringRef func,
-               llvm::StringRef var) -> std::string {
-  return llvm::formatv("__c2pnk_{0}_ptr_{1}_{2}_{3}",
-                       make_shared ? "shared" : "local", func, var, counter)
-      .str();
+auto PtrPrefix(bool make_shared, size_t counter, llvm::StringRef func, llvm::StringRef var) -> std::string {
+  return llvm::formatv("__c2pnk_{0}_ptr_{1}_{2}_{3}", make_shared ? "shared" : "local", func, var, counter).str();
 }
 
-auto recordPrefix(bool make_shared, size_t counter, llvm::StringRef func,
-                  llvm::StringRef var) -> std::string {
-  return llvm::formatv("__c2pnk_{0}_record_{1}_{2}_{3}",
-                       make_shared ? "shared" : "local", func, var, counter)
-      .str();
+auto RecordPrefix(bool make_shared, size_t counter, llvm::StringRef func, llvm::StringRef var) -> std::string {
+  return llvm::formatv("__c2pnk_{0}_record_{1}_{2}_{3}", make_shared ? "shared" : "local", func, var, counter).str();
 }
 
 // Nested array init helper
@@ -68,9 +59,8 @@ auto recordPrefix(bool make_shared, size_t counter, llvm::StringRef func,
 //   __hoist_arr_matrix_mat_0[0][0] = 1;
 //   __hoist_arr_matrix_mat_0[0][1] = 0;
 // NOLINTNEXTLINE(misc-no-recursion)
-void emitNestedInits(const clang::Expr *expr, const clang::Type *type,
-                     llvm::StringRef baseName, llvm::StringRef accessPath,
-                     const clang::PrintingPolicy &pp, clang::ASTContext &Ctx,
+void EmitNestedInits(const clang::Expr *expr, const clang::Type *type, llvm::StringRef baseName,
+                     llvm::StringRef accessPath, const clang::PrintingPolicy &pp, clang::ASTContext &Ctx,
                      llvm::raw_ostream &out) {
   const auto *stripped = expr->IgnoreParenCasts();
   const auto *ile = dyn_cast<clang::InitListExpr>(stripped);
@@ -98,8 +88,7 @@ void emitNestedInits(const clang::Expr *expr, const clang::Type *type,
     for (unsigned i = 0; i < to_walk->getNumInits(); ++i) {
       llvm::SmallString<64> path;
       llvm::raw_svector_ostream(path) << accessPath << "[" << i << "]";
-      emitNestedInits(to_walk->getInit(i), elem_type, baseName, path, pp, Ctx,
-                      out);
+      EmitNestedInits(to_walk->getInit(i), elem_type, baseName, path, pp, Ctx, out);
     }
   } else if (type->isRecordType()) {
     const auto *rd = type->getAs<clang::RecordType>()->getDecl();
@@ -112,8 +101,7 @@ void emitNestedInits(const clang::Expr *expr, const clang::Type *type,
       const clang::FieldDecl *fd = fields[i];
       llvm::SmallString<64> path;
       llvm::raw_svector_ostream(path) << accessPath << "." << fd->getName();
-      emitNestedInits(to_walk->getInit(i), fd->getType().getTypePtr(), baseName,
-                      path, pp, Ctx, out);
+      EmitNestedInits(to_walk->getInit(i), fd->getType().getTypePtr(), baseName, path, pp, Ctx, out);
     }
   } else {
     // Shouldn't happen except for bitfields...
@@ -125,8 +113,8 @@ void emitNestedInits(const clang::Expr *expr, const clang::Type *type,
 }
 
 // Build a global declaration string for a VarDecl
-auto buildGlobalDecl(const clang::VarDecl *VD, llvm::StringRef newName,
-                     clang::ASTContext &Ctx, bool preserveInit) -> std::string {
+auto BuildGlobalDecl(const clang::VarDecl *VD, llvm::StringRef newName, clang::ASTContext &Ctx, bool preserveInit)
+    -> std::string {
   const auto &pp(Ctx.getLangOpts());
   const auto qt = VD->getType();
   const auto sc = VD->getStorageClass();
@@ -137,17 +125,13 @@ auto buildGlobalDecl(const clang::VarDecl *VD, llvm::StringRef newName,
   os << ";";
 
   if (preserveInit && VD->hasInit()) {
-    os << llvm::formatv(
-        "\n/* c2pancake: initialiser for static variable {0} was not a "
-        "compile-time constant, so it was emitted as runtime code */\n",
-        newName);
+    os << llvm::formatv("\n/* c2pancake: initialiser for static variable {0} was not a "
+                        "compile-time constant, so it was emitted as runtime code */\n",
+                        newName);
     os << "/* c2pancake: move the following code into the entry point of the "
           "program */\n";
-    emitNestedInits(VD->getInit(), VD->getType().getTypePtr(), newName, "", pp,
-                    Ctx, os);
-    os << llvm::formatv(
-        "/* c2pancake: end of initialiser for static variable {0} */\n",
-        newName);
+    EmitNestedInits(VD->getInit(), VD->getType().getTypePtr(), newName, "", pp, Ctx, os);
+    os << llvm::formatv("/* c2pancake: end of initialiser for static variable {0} */\n", newName);
   }
   return std::string(decl);
 }
@@ -201,8 +185,7 @@ auto PassAnalyse::VisitFunctionDecl(clang::FunctionDecl *FD) -> bool {
 }
 
 // NOLINTNEXTLINE(misc-no-recursion)
-void PassAnalyse::walkStmt(clang::Stmt *S, clang::FunctionDecl *FD,
-                           PassFind &atf) {
+void PassAnalyse::walkStmt(clang::Stmt *S, clang::FunctionDecl *FD, PassFind &atf) {
   if (S == nullptr)
     return;
 
@@ -221,50 +204,36 @@ void PassAnalyse::walkStmt(clang::Stmt *S, clang::FunctionDecl *FD,
       const auto is_record = (rt != nullptr);
 
       if (sc == clang::SC_Extern) {
-        info.hoistMap.insert(
-            {vd, VarHoistEntry{vd->getName().str(), DeclTreatment::ExternRedecl,
-                               FD}});
+        info.hoistMap.insert({vd, VarHoistEntry{vd->getName().str(), DeclTreatment::ExternRedecl, FD}});
         continue;
       }
 
       if (sc == clang::SC_Static && (is_array || addr_taken_var)) {
         // static func vars are always shared across all threads
-        const auto new_name = is_array
-                                  ? arrayPrefix(true, info.hoist_arr_counter++,
-                                                FD->getName(), vd->getName())
-                                  : ptrPrefix(true, info.hoist_ptr_counter++,
-                                              FD->getName(), vd->getName());
-        info.hoistMap.insert(
-            {vd, VarHoistEntry{new_name, DeclTreatment::StaticGlobal, FD}});
+        const auto new_name = is_array ? ArrayPrefix(true, info.hoist_arr_counter++, FD->getName(), vd->getName())
+                                       : PtrPrefix(true, info.hoist_ptr_counter++, FD->getName(), vd->getName());
+        info.hoistMap.insert({vd, VarHoistEntry{new_name, DeclTreatment::StaticGlobal, FD}});
         continue;
       }
 
       if (vd->hasLocalStorage() && (is_array || addr_taken_var)) {
-        const auto new_name = is_array
-                                  ? arrayPrefix(false, info.hoist_arr_counter++,
-                                                FD->getName(), vd->getName())
-                                  : ptrPrefix(false, info.hoist_ptr_counter++,
-                                              FD->getName(), vd->getName());
-        info.hoistMap.insert(
-            {vd, VarHoistEntry{new_name, DeclTreatment::NewGlobal, FD}});
+        const auto new_name = is_array ? ArrayPrefix(false, info.hoist_arr_counter++, FD->getName(), vd->getName())
+                                       : PtrPrefix(false, info.hoist_ptr_counter++, FD->getName(), vd->getName());
+        info.hoistMap.insert({vd, VarHoistEntry{new_name, DeclTreatment::NewGlobal, FD}});
       }
 
       if (vd->hasLocalStorage() && is_record) {
         if (addr_taken_var || array_field_accessed_var) {
-          const auto new_name = recordPrefix(false, info.hoist_record_counter++,
-                                             FD->getName(), vd->getName());
-          info.hoistMap.insert(
-              {vd, VarHoistEntry{new_name, DeclTreatment::NewGlobal, FD}});
+          const auto new_name = RecordPrefix(false, info.hoist_record_counter++, FD->getName(), vd->getName());
+          info.hoistMap.insert({vd, VarHoistEntry{new_name, DeclTreatment::NewGlobal, FD}});
           continue;
         }
       }
 
       if (sc == clang::SC_Static && is_record) {
         if (addr_taken_var || array_field_accessed_var) {
-          const auto new_name = recordPrefix(true, info.hoist_record_counter++,
-                                             FD->getName(), vd->getName());
-          info.hoistMap.insert(
-              {vd, VarHoistEntry{new_name, DeclTreatment::StaticGlobal, FD}});
+          const auto new_name = RecordPrefix(true, info.hoist_record_counter++, FD->getName(), vd->getName());
+          info.hoistMap.insert({vd, VarHoistEntry{new_name, DeclTreatment::StaticGlobal, FD}});
           continue;
         }
       }
@@ -321,9 +290,7 @@ auto PassRename::VisitDeclStmt(clang::DeclStmt *DS) -> bool {
 
     case DeclTreatment::ExternRedecl:
       // Remove the local re-declaration; the external symbol already exists.
-      out << llvm::formatv(
-          "\n\n/* c2pancake: extern decl {0} was moved to global scope */\n",
-          vd->getName());
+      out << llvm::formatv("\n\n/* c2pancake: extern decl {0} was moved to global scope */\n", vd->getName());
       break;
 
     case DeclTreatment::StaticGlobal: {
@@ -343,17 +310,14 @@ auto PassRename::VisitDeclStmt(clang::DeclStmt *DS) -> bool {
         }
       }
       if (!emitted)
-        out << llvm::formatv(
-            "/* c2pancake: static decl {0} was moved to global scope */\n\n",
-            vd->getName());
+        out << llvm::formatv("/* c2pancake: static decl {0} was moved to global scope */\n\n", vd->getName());
       break;
     }
 
     case DeclTreatment::NewGlobal: {
       if (vd->hasInit()) {
         auto *init = vd->getInit();
-        emitNestedInits(init, vd->getType().getTypePtr(), entry.newName, "", pp,
-                        Ctx, out);
+        EmitNestedInits(init, vd->getType().getTypePtr(), entry.newName, "", pp, Ctx, out);
       }
       // If no init, then the global is already zero-initialised so we don't
       // need to do anything
@@ -363,28 +327,25 @@ auto PassRename::VisitDeclStmt(clang::DeclStmt *DS) -> bool {
   }
 
   llvm::StringRef const replacement_ref =
-      replacement.empty() ? llvm::StringRef("/* hoisted */\n")
-                          : llvm::StringRef(replacement);
+      replacement.empty() ? llvm::StringRef("/* hoisted */\n") : llvm::StringRef(replacement);
 
-  addReplacement(DS->getSourceRange(), replacement_ref);
+  AddReplacement(DS->getSourceRange(), replacement_ref);
   return true;
 }
 auto PassRename::VisitDeclRefExpr(clang::DeclRefExpr *DR) -> bool {
   if (auto *vd = dyn_cast<clang::VarDecl>(DR->getDecl())) {
     auto it = info.hoistMap.find(vd);
     if (it != info.hoistMap.end())
-      addReplacement(DR->getSourceRange(), it->second.newName);
+      AddReplacement(DR->getSourceRange(), it->second.newName);
   }
   return true;
 }
-void PassRename::addReplacement(clang::SourceRange range,
-                                llvm::StringRef text) {
+void PassRename::AddReplacement(clang::SourceRange range, llvm::StringRef text) {
   // Expand to account for macro expansions so we replace the spelling loc.
   auto char_range = clang::CharSourceRange::getTokenRange(range);
   clang::tooling::Replacement const repl(SM, char_range, text);
   if (auto err = Repls.add(repl)) {
-    llvm::errs() << "Replacement conflict: " << llvm::toString(std::move(err))
-                 << "\n";
+    llvm::errs() << "Replacement conflict: " << llvm::toString(std::move(err)) << "\n";
     has_replacement_error = true;
   }
 }
@@ -398,13 +359,7 @@ void Consumer::HandleTranslationUnit(clang::ASTContext &Ctx) {
   PassAnalyse cv(info, Ctx);
   cv.TraverseDecl(tu);
 
-  // copy source text to new file
-  const llvm::MemoryBufferRef buf =
-      sm.getBufferOrFake(sm.getMainFileID(), clang::SourceLocation{});
-  std::string const source_text(buf.getBuffer());
-
   if (info.hoistMap.empty()) {
-    emitToFile(source_text);
     return;
   }
 
@@ -417,13 +372,11 @@ void Consumer::HandleTranslationUnit(clang::ASTContext &Ctx) {
       clang::SourceLocation const loc = fd->getSourceRange().getBegin();
       if (!sm.isInMainFile(loc))
         continue;
-      if (first_func_loc.isInvalid() ||
-          sm.isBeforeInTranslationUnit(loc, first_func_loc))
+      if (first_func_loc.isInvalid() || sm.isBeforeInTranslationUnit(loc, first_func_loc))
         first_func_loc = loc;
     }
   }
 
-  clang::tooling::Replacements repls;
   bool insertion_failed = false;
 
   // insert global declarations before the first function definition
@@ -438,7 +391,7 @@ void Consumer::HandleTranslationUnit(clang::ASTContext &Ctx) {
       case DeclTreatment::NewGlobal:
         // omit init as it will be re-applied at each time the function is
         // called
-        gb << buildGlobalDecl(VD, entry.newName, Ctx, false) << "\n";
+        gb << BuildGlobalDecl(VD, entry.newName, Ctx, false) << "\n";
         break;
 
       case DeclTreatment::StaticGlobal: {
@@ -448,13 +401,13 @@ void Consumer::HandleTranslationUnit(clang::ASTContext &Ctx) {
           clang::Expr::EvalResult result;
           keep_init = VD->getInit()->EvaluateAsRValue(result, Ctx);
         }
-        gb << buildGlobalDecl(VD, entry.newName, Ctx, keep_init) << "\n";
+        gb << BuildGlobalDecl(VD, entry.newName, Ctx, keep_init) << "\n";
         break;
       }
 
       case DeclTreatment::ExternRedecl: {
         // extern can be emitted multipile times without issue
-        gb << buildGlobalDecl(VD, entry.newName, Ctx, false) << "\n";
+        gb << BuildGlobalDecl(VD, entry.newName, Ctx, false) << "\n";
         break;
       }
       }
@@ -465,12 +418,10 @@ void Consumer::HandleTranslationUnit(clang::ASTContext &Ctx) {
 
     // An insertion is modelled as a zero-length replacement at the offset.
     unsigned const insert_offset = sm.getFileOffset(first_func_loc);
-    const clang::tooling::Replacement ins(sm.getFilename(first_func_loc),
-                                          insert_offset, 0, global_block.str());
+    const clang::tooling::Replacement ins(sm.getFilename(first_func_loc), insert_offset, 0, global_block.str());
     if (auto err = repls.add(ins)) {
-      llvm::errs() << llvm::formatv(
-          "hoist_rewriter: failed to add global decls for '{0}': {1}\n",
-          sm.getFilename(first_func_loc), err);
+      llvm::errs() << llvm::formatv("hoist_rewriter: failed to add global decls for '{0}': {1}\n",
+                                    sm.getFilename(first_func_loc), err);
 
       insertion_failed = true;
     }
@@ -483,51 +434,8 @@ void Consumer::HandleTranslationUnit(clang::ASTContext &Ctx) {
   if (insertion_failed || crv.has_replacement_error) {
     llvm::errs() << llvm::formatv("hoist_rewriter: aborting due to replacement "
                                   "conflicts, no output written "
-                                  "for '{0}'\n",
-                                  output_path);
+                                  "for \n",
+                                  sm.getFileEntryForID(sm.getMainFileID())->tryGetRealPathName());
     return;
   }
-
-  // apply all replacements to the original source in one shot
-  llvm::Expected<std::string> result =
-      clang::tooling::applyAllReplacements(source_text, repls);
-  if (!result) {
-    llvm::errs() << "hoist_rewriter: failed to apply replacements: "
-                 << llvm::toString(result.takeError()) << "\n";
-    return;
-  }
-
-  emitToFile(*result);
-}
-void Consumer::emitToFile(const std::string &text) const {
-
-  std::error_code ec;
-  llvm::raw_fd_ostream out(output_path, ec, llvm::sys::fs::OF_None);
-  if (ec) {
-    llvm::errs() << llvm::formatv(
-        "pass_hoist_rewriter: cannot open '{0}': {1}\n", output_path,
-        ec.message());
-    return;
-  }
-  out << text;
-  llvm::outs() << llvm::formatv("pass_hoist_rewriter: wrote '{0}'\n",
-                                output_path);
-}
-
-auto Action::CreateASTConsumer(clang::CompilerInstance &CI,
-                               clang::StringRef file)
-    -> std::unique_ptr<clang::ASTConsumer> {
-  if (!file.ends_with(cur_suffix_)) {
-    llvm::errs() << llvm::formatv(
-        "pass_hoist_rewriter: warning: input file '{0}' does not end with the "
-        "expected suffix '{1}'; output path may be incorrect\n",
-        file, cur_suffix_);
-  }
-
-  auto consumer = std::make_unique<Consumer>(CI);
-  consumer->current_suffix = cur_suffix_;
-  auto original = file.drop_back(
-      cur_suffix_.size()); // remove current suffix to get original filename
-  consumer->output_path = llvm::formatv("{0}{1}", original, next_suffix_).str();
-  return consumer;
 }

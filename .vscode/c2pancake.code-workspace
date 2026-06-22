@@ -3,17 +3,5 @@
 		{
 			"path": ".."
 		}
-	],
-	"settings": {
-		"clang-tidy.executable": "/usr/bin/clang-tidy-22",
-		"clangd.path": "/usr/bin/clangd-22",
-		"clang-format.executable": "/usr/bin/clang-format-22",
-		"clang-tidy.buildPath": "build",
-		"lldb-dap.executable-path": "/usr/bin/lldb-dap-22",
-		"clang-tidy.lintOnSave": false,
-		"cmake.cmakePath": "/usr/bin/cmake",
-		"cmake.debugConfig": {
-			"type": "lldb-dap"
-		}
-	}
+	]
 }
