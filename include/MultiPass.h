@@ -13,6 +13,7 @@
 #include <llvm-22/llvm/Support/FormatVariadic.h>
 #include <llvm/ADT/StringRef.h>
 
+#include <cassert>
 #include <memory>
 #include <string>
 #include <utility>

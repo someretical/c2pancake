@@ -1,17 +1,13 @@
 #include "MultiPass.h"
+#include "Pass_CompoundAssignment.h"
 #include "Pass_HoistArraysAndAddresses.h"
 #include "Pass_PromoteRecords.h"
 
 #include <clang/Basic/LLVM.h>
 #include <clang/Tooling/CommonOptionsParser.h>
-#include <clang/Tooling/Core/Replacement.h>
 #include <llvm/ADT/StringRef.h>
 #include <llvm/Support/CommandLine.h>
-#include <llvm/Support/FormatVariadic.h>
 #include <llvm/Support/raw_ostream.h>
-
-#include <string>
-#include <vector>
 
 using namespace pancake;
 
@@ -52,6 +48,7 @@ auto main(int argc, const char **argv) -> int {
   Pipeline pipeline(*expected_parser);
   pipeline.AddPass<pass_promote_records::Action>();
   pipeline.AddPass<pass_hoist_arrays_and_addresses::Action>();
+  pipeline.AddPass<pass_compound_assignment::Action>();
   return pipeline.Run();
 
   return 0;

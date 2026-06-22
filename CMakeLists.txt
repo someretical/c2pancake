@@ -42,6 +42,7 @@ add_executable(
   src/Utils.cpp
   src/Pass_PromoteRecords.cpp
   src/Pass_HoistArraysAndAddresses.cpp
+  src/Pass_CompoundAssignment.cpp
   src/MultiPass.cpp
   src/CodeGen.cpp
   src/IRBuilder.cpp
@@ -117,10 +118,13 @@ target_include_directories(
 target_link_libraries(
   c2pancake
   PRIVATE clangTooling
+          clangToolingCore
+          clangTransformer
           clangASTMatchers
           clangAST
           clangRewrite
           clangFrontend
+          clangFormat
           clangSerialization
           clangDriver
           clangParse
@@ -130,3 +134,4 @@ target_link_libraries(
           clangLex
           clangBasic
           LLVMSupport)
+  

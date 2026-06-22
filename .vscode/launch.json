@@ -10,7 +10,7 @@
             "name": "Debug c2pancake",
             "program": "${command:cmake.launchTargetPath}",
             "args": [
-                "tests/array_and_addr_of.c",
+                "tests/compound_assignment.c",
                 "--"
             ],
             "cwd": "${workspaceFolder}",
