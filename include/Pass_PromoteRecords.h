@@ -1,7 +1,7 @@
 #ifndef C2PANCAKE_PASS_PROMOTERECORDS_H
 #define C2PANCAKE_PASS_PROMOTERECORDS_H
 
-#include "MultiPass.h"
+#include "Pipeline.h"
 
 #include <clang/AST/ASTConsumer.h>
 #include <clang/AST/ASTContext.h>

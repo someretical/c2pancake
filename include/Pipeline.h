@@ -23,13 +23,7 @@ class StagedCompilationDatabase : public clang::tooling::CompilationDatabase {
 private:
   clang::tooling::CompilationDatabase &base_db;
 
-  auto GetOriginalFilename(llvm::StringRef Filename) const -> llvm::StringRef {
-    const auto ref = Filename;
-    if (!current_suffix.empty() && ref.ends_with(current_suffix)) {
-      return ref.drop_back(current_suffix.size());
-    }
-    return ref;
-  }
+  auto GetOriginalFilename(llvm::StringRef Filename) const -> llvm::StringRef;
 
 public:
   std::string current_suffix;
@@ -37,34 +31,7 @@ public:
   StagedCompilationDatabase(clang::tooling::CompilationDatabase &db, std::string suffix)
       : base_db(db), current_suffix(std::move(suffix)) {}
 
-  auto getCompileCommands(llvm::StringRef Filename) const -> std::vector<clang::tooling::CompileCommand> override {
-    auto original_file = GetOriginalFilename(Filename);
-
-    auto commands = base_db.getCompileCommands(original_file);
-
-    std::vector<clang::tooling::CompileCommand> ret_commands;
-
-    for (auto &command : commands) {
-      bool found = false;
-      if (command.Filename == original_file) {
-        command.Filename = Filename;
-        found = true;
-      }
-
-      for (auto &arg : command.CommandLine) {
-        if (arg == original_file) {
-          arg = Filename;
-          found = true;
-        }
-      }
-
-      if (found) {
-        ret_commands.push_back(std::move(command));
-      }
-    }
-
-    return ret_commands;
-  }
+  auto getCompileCommands(llvm::StringRef Filename) const -> std::vector<clang::tooling::CompileCommand> override;
 
   auto getAllFiles() const -> std::vector<std::string> override { return base_db.getAllFiles(); }
 
@@ -93,13 +60,17 @@ struct PipelineActionCtx {
       : pass_number(pass_number), current_suffix(std::move(cur_suffix)), next_suffix(std::move(next_suffix)) {}
 };
 
+inline auto LogBegin(const PipelineActionCtx &ctx, const std::string &in_file) {
+  return llvm::formatv("[c2pancake] {0}: Pass {1}, iter {2}:", in_file, ctx.action_name, ctx.pass_number);
+}
+
+inline auto LogBeginShort(const std::string &in_file) { return llvm::formatv("[c2pancake] {0}:", in_file); }
+
 // This is what all passes should inherit from
 class C2PancakePass : public clang::ASTConsumer {
-private:
-  const clang::CompilerInstance &ci;
-  llvm::StringRef in_file;
-
 protected:
+  const clang::CompilerInstance &ci;
+  std::string in_file;
   PipelineActionCtx &pa_ctx;
 
 public:
@@ -133,8 +104,8 @@ public:
     auto result = applyAllReplacements(source_text, pa_ctx.replacements);
     if (!result) {
       // abnormal error!
-      llvm::errs() << llvm::formatv("{0}: {1} Failed to apply replacements: {2}\n", pa_ctx.action_name,
-                                    current_filename, llvm::toString(result.takeError()));
+      llvm::errs() << llvm::formatv("[c2pancake] {0}: {1} Failed to apply replacements: {2}\n", current_filename,
+                                    pa_ctx.action_name, current_filename, llvm::toString(result.takeError()));
       return;
     }
 
@@ -145,8 +116,8 @@ public:
     if (!ec) {
       out << *result;
     } else {
-      llvm::errs() << llvm::formatv("{0}: {1} Failed to open output file '{2}': {3}\n", pa_ctx.action_name,
-                                    current_filename, output_path, ec.message());
+      llvm::errs() << llvm::formatv("{0} Failed to open output file '{3}': {4}\n", LogBegin(pa_ctx, current_filename),
+                                    output_path, ec.message());
     }
   }
 };
@@ -154,7 +125,12 @@ public:
 class Pipeline {
 private:
   struct AbstractFactory : public clang::tooling::FrontendActionFactory {
+    AbstractFactory() = default;
     ~AbstractFactory() override = default;
+    AbstractFactory(const AbstractFactory &) = delete;
+    auto operator=(const AbstractFactory &) -> AbstractFactory & = delete;
+    AbstractFactory(AbstractFactory &&) = delete;
+    auto operator=(AbstractFactory &&) -> AbstractFactory & = delete;
     virtual auto BetterCreate(PipelineActionCtx &ctx) -> std::unique_ptr<clang::FrontendAction> = 0;
   };
 

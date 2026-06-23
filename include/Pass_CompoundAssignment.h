@@ -1,7 +1,7 @@
 #ifndef C2PANCAKE_PASS_COMPOUNDASSIGNMENT_H
 #define C2PANCAKE_PASS_COMPOUNDASSIGNMENT_H
 
-#include "MultiPass.h"
+#include "Pipeline.h"
 
 namespace pancake::pass_compound_assignment {
 class Consumer : public C2PancakePass {

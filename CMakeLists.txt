@@ -40,10 +40,11 @@ endforeach()
 add_executable(
   c2pancake
   src/Utils.cpp
+  src/Pipeline.cpp
+  src/Pass_LoopsToWhile.cpp
   src/Pass_PromoteRecords.cpp
   src/Pass_HoistArraysAndAddresses.cpp
   src/Pass_CompoundAssignment.cpp
-  src/MultiPass.cpp
   src/CodeGen.cpp
   src/IRBuilder.cpp
   src/main.cpp)

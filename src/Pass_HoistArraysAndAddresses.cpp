@@ -420,8 +420,7 @@ void Consumer::HandleTranslationUnit(clang::ASTContext &Ctx) {
     unsigned const insert_offset = sm.getFileOffset(first_func_loc);
     const clang::tooling::Replacement ins(sm.getFilename(first_func_loc), insert_offset, 0, global_block.str());
     if (auto err = pa_ctx.replacements.add(ins)) {
-      llvm::errs() << llvm::formatv("hoist_rewriter: failed to add global decls for '{0}': {1}\n",
-                                    sm.getFilename(first_func_loc), err);
+      llvm::errs() << llvm::formatv("{0} Replacement conflict\n", LogBegin(pa_ctx, in_file));
 
       insertion_failed = true;
     }
@@ -432,10 +431,8 @@ void Consumer::HandleTranslationUnit(clang::ASTContext &Ctx) {
   crv.TraverseDecl(tu);
 
   if (insertion_failed || crv.has_replacement_error) {
-    llvm::errs() << llvm::formatv("hoist_rewriter: aborting due to replacement "
-                                  "conflicts, no output written "
-                                  "for \n",
-                                  sm.getFileEntryForID(sm.getMainFileID())->tryGetRealPathName());
+    llvm::errs() << llvm::formatv("{0} Aborting due to replacement conflicts, no output written for \n",
+                                  LogBegin(pa_ctx, in_file));
     return;
   }
 }

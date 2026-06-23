@@ -12,12 +12,4 @@
 
 #include <string>
 
-auto exprToString(const clang::Expr *E, const clang::SourceManager &SM,
-                  const clang::LangOptions &LO) -> std::string;
-auto stmtToString(const clang::Stmt *S, const clang::SourceManager &SM,
-                  const clang::LangOptions &LO) -> std::string;
-auto hasSideEffect(const clang::Expr *E, const clang::ASTContext &Ctx) -> bool;
-auto isTopLevelStmt(const clang::UnaryOperator *UO,
-                    const clang::ASTContext &Ctx) -> bool;
-
 #endif // C2PANCAKE_UTILS_H

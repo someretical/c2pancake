@@ -1,7 +1,8 @@
-#include "MultiPass.h"
 #include "Pass_CompoundAssignment.h"
 #include "Pass_HoistArraysAndAddresses.h"
+#include "Pass_LoopsToWhile.h"
 #include "Pass_PromoteRecords.h"
+#include "Pipeline.h"
 
 #include <clang/Basic/LLVM.h>
 #include <clang/Tooling/CommonOptionsParser.h>
@@ -29,9 +30,8 @@ auto main(int argc, const char **argv) -> int {
   To add a new stage to the pipeline, use the following code.
   Consumer::HandleTranslationUnit is the entry point and must be implemented.
 
-  You should queue all replacements to the reference `repls` in the Consumer and they will be applied
-  automatically in PipelineAction::EndSourceFileAction after HandleTranslationUnit returns.
-  PipelineAction::EndSourceFileAction also handles writing to the output file.
+  The main thing HandleTranslationUnit should do is add Replacements to pa_ctx.replacements
+  The Pipeline will take care of applying the replacements and writing the output file
 
   class Consumer : public C2PancakePass {
   public:
@@ -39,16 +39,23 @@ auto main(int argc, const char **argv) -> int {
     void HandleTranslationUnit(clang::ASTContext &Ctx) override;
   };
 
-  class Action : public PipelineAction<Action, Consumer> {
+  class Action : public PipelineAction<Consumer> {
   public:
-    using PipelineAction<Action, Consumer>::PipelineAction; // inherit constructor
-    static auto GetActionName() -> std::string { return "YOUR_PASS_NAME_HERE"; }
+    explicit Action(PipelineActionCtx &ctx) : PipelineAction<Consumer>(ctx) {
+      ctx.action_name = "<name of pass>";
+      // Repeat the pass until no changes are made, and then move onto the next pass
+      ctx.failure_behaviour = FailureBehaviour::Repeat;
+    }
   };
   */
   Pipeline pipeline(*expected_parser);
-  pipeline.AddPass<pass_promote_records::Action>();
-  pipeline.AddPass<pass_hoist_arrays_and_addresses::Action>();
-  pipeline.AddPass<pass_compound_assignment::Action>();
+  pipeline.AddPass<pass_process_continue_in_for_loops::Action>();
+  pipeline.AddPass<pass_for_to_while::Action>();
+  pipeline.AddPass<pass_process_continue_in_do_while_loops::Action>();
+  pipeline.AddPass<pass_do_while_to_while::Action>();
+  // pipeline.AddPass<pass_promote_records::Action>();
+  // pipeline.AddPass<pass_hoist_arrays_and_addresses::Action>();
+  // pipeline.AddPass<pass_compound_assignment::Action>();
   return pipeline.Run();
 
   return 0;

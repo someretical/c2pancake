@@ -259,14 +259,22 @@ auto Consumer::HandleTranslationUnit(clang::ASTContext &Ctx) -> void {
   t.registerMatchers(&finder);
   finder.matchAST(Ctx);
 
+  bool add_error_occurred = false;
   for (const auto &change : changes) {
     for (const auto &r : change.getReplacements()) {
       if (auto err = pa_ctx.replacements.add(r)) {
-        llvm::errs() << llvm::formatv("{0}: Failed to add replacement: {1}, will try again next pass...\n",
-                                      pa_ctx.action_name, llvm::toString(std::move(err)));
-        pa_ctx.failure_mode = FailureMode::Repeat;
+        llvm::consumeError(std::move(err));
+        llvm::errs() << llvm::formatv("{0} Add replacement conflict, retrying next pass...\n",
+                                      LogBegin(pa_ctx, in_file));
+        add_error_occurred = true;
       }
     }
+  }
+
+  pa_ctx.failure_mode = FailureMode::Repeat;
+  if (!add_error_occurred && changes.empty()) {
+    // All edits successfully added; no need to repeat this pass
+    pa_ctx.failure_mode = FailureMode::None;
   }
 }
 
