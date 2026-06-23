@@ -53,10 +53,12 @@ private:
 };
 
 // frontend
-class Action : public PipelineAction<Action, Consumer> {
+class Action : public PipelineAction<Consumer> {
 public:
-  using PipelineAction<Action, Consumer>::PipelineAction; // inherit constructor
-  static auto GetActionName() -> std::string { return "PromoteRecords"; }
+  explicit Action(PipelineActionCtx &ctx) : PipelineAction<Consumer>(ctx) {
+    ctx.action_name = "PromoteRecords";
+    ctx.failure_behaviour = FailureBehaviour::Continue;
+  }
 };
 
 } // namespace pancake::pass_promote_records

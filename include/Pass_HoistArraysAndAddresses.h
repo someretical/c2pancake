@@ -79,7 +79,7 @@ public:
   auto VisitFunctionDecl(clang::FunctionDecl *FD) -> bool;
 
 private:
-  void walkStmt(clang::Stmt *S, clang::FunctionDecl *FD, PassFind &atf);
+  void WalkStmt(clang::Stmt *S, clang::FunctionDecl *FD, PassFind &atf);
 };
 
 // Accumulate replacements for DeclStmts and DeclRefExprs
@@ -111,10 +111,12 @@ public:
   void HandleTranslationUnit(clang::ASTContext &Ctx) override;
 };
 
-class Action : public PipelineAction<Action, Consumer> {
+class Action : public PipelineAction<Consumer> {
 public:
-  using PipelineAction<Action, Consumer>::PipelineAction; // inherit constructor
-  static auto GetActionName() -> std::string { return "HoistArraysAndAddresses"; }
+  explicit Action(PipelineActionCtx &ctx) : PipelineAction<Consumer>(ctx) {
+    ctx.action_name = "HoistArraysAndAddresses";
+    ctx.failure_behaviour = FailureBehaviour::Continue;
+  }
 };
 
 } // namespace pancake::pass_hoist_arrays_and_addresses

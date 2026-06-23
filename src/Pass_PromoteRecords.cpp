@@ -314,14 +314,14 @@ void Consumer::AddReplacement(clang::ASTContext &Ctx, clang::SourceRange SR, con
 
   auto char_range = clang::CharSourceRange::getTokenRange(SR);
   clang::tooling::Replacement const repl(Ctx.getSourceManager(), char_range, newText);
-  if (auto err = repls.add(repl)) {
+  if (auto err = pa_ctx.replacements.add(repl)) {
     llvm::errs() << "Replacement conflict: " << llvm::toString(std::move(err)) << "\n";
   }
 }
 
 void Consumer::InsertAtOffset(llvm::StringRef file, unsigned offset, const std::string &text) {
   clang::tooling::Replacement const r(file, offset, 0, text);
-  if (auto err = repls.add(r))
+  if (auto err = pa_ctx.replacements.add(r))
     llvm::errs() << "Insert conflict: " << llvm::toString(std::move(err)) << "\n";
 }
 

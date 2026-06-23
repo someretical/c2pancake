@@ -10,10 +10,12 @@ public:
   void HandleTranslationUnit(clang::ASTContext &Ctx) override;
 };
 
-class Action : public PipelineAction<Action, Consumer> {
+class Action : public PipelineAction<Consumer> {
 public:
-  using PipelineAction<Action, Consumer>::PipelineAction; // inherit constructor
-  static auto GetActionName() -> std::string { return "Pass_CompoundAssignment"; }
+  explicit Action(PipelineActionCtx &ctx) : PipelineAction<Consumer>(ctx) {
+    ctx.action_name = "ExpandCompoundAssignments";
+    ctx.failure_behaviour = FailureBehaviour::Repeat;
+  }
 };
 } // namespace pancake::pass_compound_assignment
 

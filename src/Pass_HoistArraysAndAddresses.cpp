@@ -180,12 +180,12 @@ auto PassAnalyse::VisitFunctionDecl(clang::FunctionDecl *FD) -> bool {
 
   PassFind atf;
   atf.TraverseStmt(FD->getBody());
-  walkStmt(FD->getBody(), FD, atf);
+  WalkStmt(FD->getBody(), FD, atf);
   return true;
 }
 
 // NOLINTNEXTLINE(misc-no-recursion)
-void PassAnalyse::walkStmt(clang::Stmt *S, clang::FunctionDecl *FD, PassFind &atf) {
+void PassAnalyse::WalkStmt(clang::Stmt *S, clang::FunctionDecl *FD, PassFind &atf) {
   if (S == nullptr)
     return;
 
@@ -241,7 +241,7 @@ void PassAnalyse::walkStmt(clang::Stmt *S, clang::FunctionDecl *FD, PassFind &at
   }
 
   for (auto *child : S->children())
-    walkStmt(child, FD, atf);
+    WalkStmt(child, FD, atf);
 }
 
 auto PassRename::VisitDeclStmt(clang::DeclStmt *DS) -> bool {
@@ -419,7 +419,7 @@ void Consumer::HandleTranslationUnit(clang::ASTContext &Ctx) {
     // An insertion is modelled as a zero-length replacement at the offset.
     unsigned const insert_offset = sm.getFileOffset(first_func_loc);
     const clang::tooling::Replacement ins(sm.getFilename(first_func_loc), insert_offset, 0, global_block.str());
-    if (auto err = repls.add(ins)) {
+    if (auto err = pa_ctx.replacements.add(ins)) {
       llvm::errs() << llvm::formatv("hoist_rewriter: failed to add global decls for '{0}': {1}\n",
                                     sm.getFilename(first_func_loc), err);
 
@@ -428,7 +428,7 @@ void Consumer::HandleTranslationUnit(clang::ASTContext &Ctx) {
   }
 
   // collect DeclStmt and DeclRefExpr replacements
-  PassRename crv(repls, Ctx, info);
+  PassRename crv(pa_ctx.replacements, Ctx, info);
   crv.TraverseDecl(tu);
 
   if (insertion_failed || crv.has_replacement_error) {

@@ -59,17 +59,6 @@ auto ExprText(const Expr *E, ASTContext &Ctx) -> std::string {
   return getText(CharSourceRange::getTokenRange(E->getSourceRange()), Ctx).str();
 }
 
-auto ExprContains(const Expr *haystack, const BinaryOperator *needle) -> bool {
-  if (haystack == needle)
-    return true;
-  for (const Stmt *child : haystack->children()) {
-    if (const auto *e = dyn_cast_or_null<Expr>(child))
-      if (ExprContains(e, needle))
-        return true;
-  }
-  return false;
-}
-
 // Recursively rebuilds a side-effect-free version of `E`. Each
 // side-effecting leaf produces:
 //   - a bare declaration appended to Decls ("T __cas_tmpN;")
@@ -113,7 +102,7 @@ auto Stabilise(const Expr *E, ASTContext &Ctx, std::vector<std::string> &Decls, 
   return tmp;
 }
 
-enum class AnchorKind { Direct, NeedsBraceWrap, Unsupported };
+enum class AnchorKind : uint8_t { Direct, NeedsBraceWrap, Unsupported };
 
 struct AnchorResult {
   const Stmt *Anchor;
@@ -206,16 +195,6 @@ auto CompoundAssignRule() -> RewriteRule {
     if (!op_spelling)
       return noEdits()(Result);
 
-    // Suppress inner compound-assignments that are nested in an outer one's LHS.
-    // The outer rewrite will handle them via Stabilise(); emitting independent
-    // replacements for them too causes overlapping-range conflicts.
-    for (DynTypedNode const &par : ctx.getParents(*bo)) {
-      if (const auto *outer = par.get<BinaryOperator>()) {
-        if (outer->isCompoundAssignmentOp() && ExprContains(outer->getLHS(), bo))
-          return noEdits()(Result);
-      }
-    }
-
     std::vector<std::string> decls;
     std::vector<std::string> inits;
     int counter = 0;
@@ -282,7 +261,11 @@ auto Consumer::HandleTranslationUnit(clang::ASTContext &Ctx) -> void {
 
   for (const auto &change : changes) {
     for (const auto &r : change.getReplacements()) {
-      llvm::cantFail(repls.add(r));
+      if (auto err = pa_ctx.replacements.add(r)) {
+        llvm::errs() << llvm::formatv("{0}: Failed to add replacement: {1}, will try again next pass...\n",
+                                      pa_ctx.action_name, llvm::toString(std::move(err)));
+        pa_ctx.failure_mode = FailureMode::Repeat;
+      }
     }
   }
 }
