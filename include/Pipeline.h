@@ -64,7 +64,13 @@ inline auto LogBegin(const PipelineActionCtx &ctx, const std::string &in_file) {
   return llvm::formatv("[c2pancake] {0}: Pass {1}, iter {2}:", in_file, ctx.action_name, ctx.pass_number);
 }
 
+inline auto LogBegin(const PipelineActionCtx &ctx, const llvm::StringRef in_file) {
+  return llvm::formatv("[c2pancake] {0}: Pass {1}, iter {2}:", in_file, ctx.action_name, ctx.pass_number);
+}
+
 inline auto LogBeginShort(const std::string &in_file) { return llvm::formatv("[c2pancake] {0}:", in_file); }
+
+inline auto LogBeginShort(const llvm::StringRef in_file) { return llvm::formatv("[c2pancake] {0}:", in_file); }
 
 // This is what all passes should inherit from
 class C2PancakePass : public clang::ASTConsumer {
