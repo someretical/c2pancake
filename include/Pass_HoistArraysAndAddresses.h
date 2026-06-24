@@ -115,7 +115,8 @@ class Action : public PipelineAction<Consumer> {
 public:
   explicit Action(PipelineActionCtx &ctx) : PipelineAction<Consumer>(ctx) {
     ctx.action_name = "HoistArraysAndAddresses";
-    ctx.failure_behaviour = FailureBehaviour::Continue;
+    ctx.failure_behaviour = FailureBehaviour::MoveToNextFile;
+    ctx.action_type = PipelineActionType::Rewriter;
   }
 };
 

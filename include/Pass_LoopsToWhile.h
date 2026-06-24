@@ -14,7 +14,8 @@ class Action : public PipelineAction<Consumer> {
 public:
   explicit Action(PipelineActionCtx &ctx) : PipelineAction<Consumer>(ctx) {
     ctx.action_name = "RewriteContinueInForLoops";
-    ctx.failure_behaviour = FailureBehaviour::Continue;
+    ctx.failure_behaviour = FailureBehaviour::MoveToNextFile;
+    ctx.action_type = PipelineActionType::Rewriter;
   }
 };
 } // namespace pancake::pass_process_continue_in_for_loops
@@ -30,7 +31,8 @@ class Action : public PipelineAction<Consumer> {
 public:
   explicit Action(PipelineActionCtx &ctx) : PipelineAction<Consumer>(ctx) {
     ctx.action_name = "RewriteForToWhile";
-    ctx.failure_behaviour = FailureBehaviour::Repeat;
+    ctx.failure_behaviour = FailureBehaviour::RepeatPass;
+    ctx.action_type = PipelineActionType::Rewriter;
   }
 };
 } // namespace pancake::pass_for_to_while
@@ -46,7 +48,8 @@ class Action : public PipelineAction<Consumer> {
 public:
   explicit Action(PipelineActionCtx &ctx) : PipelineAction<Consumer>(ctx) {
     ctx.action_name = "RewriteContinueInDoWhileLoops";
-    ctx.failure_behaviour = FailureBehaviour::Continue;
+    ctx.failure_behaviour = FailureBehaviour::MoveToNextFile;
+    ctx.action_type = PipelineActionType::Rewriter;
   }
 };
 } // namespace pancake::pass_process_continue_in_do_while_loops
@@ -62,7 +65,8 @@ class Action : public PipelineAction<Consumer> {
 public:
   explicit Action(PipelineActionCtx &ctx) : PipelineAction<Consumer>(ctx) {
     ctx.action_name = "RewriteDoWhileToWhile";
-    ctx.failure_behaviour = FailureBehaviour::Repeat;
+    ctx.failure_behaviour = FailureBehaviour::RepeatPass;
+    ctx.action_type = PipelineActionType::Rewriter;
   }
 };
 } // namespace pancake::pass_do_while_to_while

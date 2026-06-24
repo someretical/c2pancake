@@ -52,6 +52,7 @@ c2pancake tests/arith.c --
 1. Find any static symbols within functions that have non-zero initialisers. 
 1. Make those static symbols global, and move the non-zero initialising statements to the start of the entry point of the program. Since this transpiler doesn't act as a linker, you'll have to do this manually. 
 1. Rewrite any switch statements with loops inside them. This is problematic because the loops can have case statements inside them which cannot be correctly transpiled.
+1. Switch statement cases should be rewritten so they don't contain any `break;`s in the middle. Automatically rewriting this requires gotos (or advanced control flow analysis which is really annoying) which are not supported in Pancake.
 
 ### Other restrictions
 

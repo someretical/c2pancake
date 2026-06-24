@@ -420,7 +420,7 @@ void Consumer::HandleTranslationUnit(clang::ASTContext &Ctx) {
     unsigned const insert_offset = sm.getFileOffset(first_func_loc);
     const clang::tooling::Replacement ins(sm.getFilename(first_func_loc), insert_offset, 0, global_block.str());
     if (auto err = pa_ctx.replacements.add(ins)) {
-      llvm::errs() << llvm::formatv("{0} Replacement conflict\n", LogBegin(pa_ctx, in_file));
+      llvm::errs() << llvm::formatv("{0} Replacement conflict\n", LogBegin(pa_ctx));
 
       insertion_failed = true;
     }
@@ -432,7 +432,7 @@ void Consumer::HandleTranslationUnit(clang::ASTContext &Ctx) {
 
   if (insertion_failed || crv.has_replacement_error) {
     llvm::errs() << llvm::formatv("{0} Aborting due to replacement conflicts, no output written for \n",
-                                  LogBegin(pa_ctx, in_file));
+                                  LogBegin(pa_ctx));
     return;
   }
 }

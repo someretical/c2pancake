@@ -2,6 +2,7 @@
 #include "Pass_HoistArraysAndAddresses.h"
 #include "Pass_LoopsToWhile.h"
 #include "Pass_PromoteRecords.h"
+#include "Pass_SwitchToIf.h"
 #include "Pipeline.h"
 
 #include <clang/Basic/LLVM.h>
@@ -53,6 +54,7 @@ auto main(int argc, const char **argv) -> int {
   pipeline.AddPass<pass_for_to_while::Action>();
   pipeline.AddPass<pass_process_continue_in_do_while_loops::Action>();
   pipeline.AddPass<pass_do_while_to_while::Action>();
+  pipeline.AddPass<pancake::normalise_switches::Action>();
   // pipeline.AddPass<pass_promote_records::Action>();
   // pipeline.AddPass<pass_hoist_arrays_and_addresses::Action>();
   // pipeline.AddPass<pass_compound_assignment::Action>();

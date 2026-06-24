@@ -100,7 +100,7 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
   }
 
   // this pass should only be executed once!
-  pa_ctx.failure_mode = FailureMode::None;
+  pa_ctx.failure_mode = FailureMode::Success;
 }
 } // namespace pancake::pass_process_continue_in_for_loops
 
@@ -181,17 +181,16 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
     for (const auto &r : change.getReplacements()) {
       if (auto err = pa_ctx.replacements.add(r)) {
         llvm::consumeError(std::move(err));
-        llvm::errs() << llvm::formatv("{0} Add replacement conflict, retrying next pass...\n",
-                                      LogBegin(pa_ctx, in_file));
+        llvm::errs() << llvm::formatv("{0} Add replacement conflict, retrying next pass...\n", LogBegin(pa_ctx));
         add_error_occurred = true;
       }
     }
   }
 
-  pa_ctx.failure_mode = FailureMode::Repeat;
+  pa_ctx.failure_mode = FailureMode::RepeatPass;
   if (!add_error_occurred && changes.empty()) {
     // All edits successfully added; no need to repeat this pass
-    pa_ctx.failure_mode = FailureMode::None;
+    pa_ctx.failure_mode = FailureMode::Success;
   }
 }
 } // namespace pancake::pass_for_to_while
@@ -286,7 +285,7 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
   }
 
   // this pass should only be executed once!
-  pa_ctx.failure_mode = FailureMode::None;
+  pa_ctx.failure_mode = FailureMode::Success;
 }
 } // namespace pancake::pass_process_continue_in_do_while_loops
 
@@ -339,17 +338,16 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
     for (const auto &r : change.getReplacements()) {
       if (auto err = pa_ctx.replacements.add(r)) {
         llvm::consumeError(std::move(err));
-        llvm::errs() << llvm::formatv("{0} Add replacement conflict, retrying next pass...\n",
-                                      LogBegin(pa_ctx, in_file));
+        llvm::errs() << llvm::formatv("{0} Add replacement conflict, retrying next pass...\n", LogBegin(pa_ctx));
         add_error_occurred = true;
       }
     }
   }
 
-  pa_ctx.failure_mode = FailureMode::Repeat;
+  pa_ctx.failure_mode = FailureMode::RepeatPass;
   if (!add_error_occurred && changes.empty()) {
     // All edits successfully added; no need to repeat this pass
-    pa_ctx.failure_mode = FailureMode::None;
+    pa_ctx.failure_mode = FailureMode::Success;
   }
 }
 }; // namespace pancake::pass_do_while_to_while

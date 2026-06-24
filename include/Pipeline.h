@@ -1,6 +1,8 @@
 #ifndef C2PANCAKE_MULTIPASS_H
 #define C2PANCAKE_MULTIPASS_H
 
+#include "Utils.h"
+
 #include <clang/AST/ASTConsumer.h>
 #include <clang/AST/ASTContext.h>
 #include <clang/Frontend/CompilerInstance.h>
@@ -19,59 +21,6 @@
 #include <utility>
 
 namespace pancake {
-class StagedCompilationDatabase : public clang::tooling::CompilationDatabase {
-private:
-  clang::tooling::CompilationDatabase &base_db;
-
-  auto GetOriginalFilename(llvm::StringRef Filename) const -> llvm::StringRef;
-
-public:
-  std::string current_suffix;
-
-  StagedCompilationDatabase(clang::tooling::CompilationDatabase &db, std::string suffix)
-      : base_db(db), current_suffix(std::move(suffix)) {}
-
-  auto getCompileCommands(llvm::StringRef Filename) const -> std::vector<clang::tooling::CompileCommand> override;
-
-  auto getAllFiles() const -> std::vector<std::string> override { return base_db.getAllFiles(); }
-
-  auto getAllCompileCommands() const -> std::vector<clang::tooling::CompileCommand> override {
-    return base_db.getAllCompileCommands();
-  }
-};
-
-/*
-A new ASTFrontendAction is created for each TU for each pass
-So there's a 1-1 relationship between PipelineAction and C2PancakePass
-The Ctx is created inside of Pipeline::Run and passed by reference to each PipelineAction and then C2PancakePass
-*/
-enum class FailureBehaviour : uint8_t { NONE, Continue, Repeat };
-enum class FailureMode : uint8_t { None, Repeat, Fatal };
-struct PipelineActionCtx {
-  size_t pass_number;
-  clang::tooling::Replacements replacements;
-  std::string action_name; // set by the PipelineAction constructor
-  std::string current_suffix;
-  std::string next_suffix;
-  FailureBehaviour failure_behaviour = FailureBehaviour::NONE; // set by the PipelineAction constructor
-  FailureMode failure_mode = FailureMode::None;
-
-  explicit PipelineActionCtx(size_t pass_number, std::string cur_suffix, std::string next_suffix)
-      : pass_number(pass_number), current_suffix(std::move(cur_suffix)), next_suffix(std::move(next_suffix)) {}
-};
-
-inline auto LogBegin(const PipelineActionCtx &ctx, const std::string &in_file) {
-  return llvm::formatv("[c2pancake] {0}: Pass {1}, iter {2}:", in_file, ctx.action_name, ctx.pass_number);
-}
-
-inline auto LogBegin(const PipelineActionCtx &ctx, const llvm::StringRef in_file) {
-  return llvm::formatv("[c2pancake] {0}: Pass {1}, iter {2}:", in_file, ctx.action_name, ctx.pass_number);
-}
-
-inline auto LogBeginShort(const std::string &in_file) { return llvm::formatv("[c2pancake] {0}:", in_file); }
-
-inline auto LogBeginShort(const llvm::StringRef in_file) { return llvm::formatv("[c2pancake] {0}:", in_file); }
-
 // This is what all passes should inherit from
 class C2PancakePass : public clang::ASTConsumer {
 protected:
@@ -101,29 +50,43 @@ public:
   }
 
   auto EndSourceFileAction() -> void override {
-    auto &sm = getCompilerInstance().getSourceManager();
-    auto current_filename = getCurrentInput().getFile();
-
-    auto buf = sm.getBufferOrFake(sm.getMainFileID());
-    std::string source_text(buf.getBuffer());
-
-    auto result = applyAllReplacements(source_text, pa_ctx.replacements);
-    if (!result) {
-      // abnormal error!
-      llvm::errs() << llvm::formatv("[c2pancake] {0}: {1} Failed to apply replacements: {2}\n", current_filename,
-                                    pa_ctx.action_name, current_filename, llvm::toString(result.takeError()));
-      return;
+    if (!pa_ctx.action_type.has_value()) {
+      llvm_unreachable("Action did not set a failure behaviour");
     }
 
-    auto original_filename = current_filename.drop_back(pa_ctx.current_suffix.size());
-    std::string output_path = llvm::formatv("{0}{1}", original_filename, pa_ctx.next_suffix);
-    std::error_code ec;
-    llvm::raw_fd_ostream out(output_path, ec, llvm::sys::fs::OF_None);
-    if (!ec) {
-      out << *result;
-    } else {
-      llvm::errs() << llvm::formatv("{0} Failed to open output file '{3}': {4}\n", LogBegin(pa_ctx, current_filename),
-                                    output_path, ec.message());
+    switch (pa_ctx.action_type.value()) {
+    case PipelineActionType::Analyser:
+      // nothing to do for analysers
+      break;
+    case PipelineActionType::Rewriter: {
+      auto &sm = getCompilerInstance().getSourceManager();
+      auto current_filename = getCurrentInput().getFile();
+
+      auto buf = sm.getBufferOrFake(sm.getMainFileID());
+      std::string source_text(buf.getBuffer());
+
+      auto result = applyAllReplacements(source_text, pa_ctx.replacements);
+      if (!result) {
+        // abnormal error!
+        llvm::errs() << llvm::formatv("{0} {1}\n", LogBegin(pa_ctx), llvm::toString(result.takeError()));
+        break;
+      }
+
+      auto original_filename = current_filename.drop_back(pa_ctx.current_suffix.size());
+      std::string output_path = llvm::formatv("{0}{1}", original_filename, pa_ctx.next_suffix);
+      std::error_code ec;
+      llvm::raw_fd_ostream out(output_path, ec, llvm::sys::fs::OF_None);
+      if (!ec) {
+        out << *result;
+      } else {
+        llvm::errs() << llvm::formatv("{0} {1}\n", LogBegin(pa_ctx), ec.message());
+      }
+
+      break;
+    }
+    default: {
+      llvm_unreachable("Unknown PipelineActionType");
+    }
     }
   }
 };
