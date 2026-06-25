@@ -151,6 +151,13 @@ public:
 
     std::vector<Stmt *> stmt_buf;
     CaseInfo current_case_info;
+    /*
+    Set to true after we have processed a case statement.
+    When adding a new case statement that doesn't end with a terminating statement,
+    If this is true, we want to copy the previous case statement's body into the new one first because it's a fall
+    through case
+    */
+    bool encountered_case_label_just_before = false;
     for (auto it = body->body_rbegin(); it != body->body_rend(); ++it) {
       auto *stmt = *it;
 
