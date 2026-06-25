@@ -52,7 +52,7 @@ c2pancake tests/arith.c --
 1. Find any static symbols within functions that have non-zero initialisers. 
 1. Make those static symbols global, and move the non-zero initialising statements to the start of the entry point of the program. Since this transpiler doesn't act as a linker, you'll have to do this manually. 
 1. Rewrite any switch statements with loops inside them. This is problematic because the loops can have case statements inside them which cannot be correctly transpiled.
-1. Switch statement cases should be rewritten so they don't contain any `break;`s in the middle. Automatically rewriting this requires gotos (or advanced control flow analysis which is really annoying) which are not supported in Pancake.
+1. Switch statement cases should be rewritten so they don't contain any `break;`s in the middle. Automatically rewriting this requires gotos (or advanced control flow analysis which is really annoying) which are not supported in Pancake. Also, case statements are only allowed at the top level scope in the switch statement since it's too complicated to parse otherwise.
 
 ### Other restrictions
 
@@ -76,13 +76,13 @@ The instructions below are for Ubuntu 24.x
 
 ### Install LLVM + libstdc++ + other build tools
 
-Install dependencies first
+Install LLVM development dependencies first
 ```
 sudo apt update
 sudo apt install libedit-dev zlib1g-dev libzstd-dev libcurl4-openssl-dev -y
 ```
 
-Install LLVM, current supported version is 22.1.7
+Install LLVM development libraries, current supported version is 22.1.7
 ```
 wget https://apt.llvm.org/llvm.sh
 chmod +x llvm.sh
@@ -121,22 +121,18 @@ mkdir build && cd build && wget -c https://cakeml.org/regression/artefacts/3389/
 Install from command line
 ```
 code --install-extension \
-  cheshirekow.cmake-format \
-  cs128.cs128-clang-tidy \
-  llvm-vs-code-extensions.lldb-dap \
-  llvm-vs-code-extensions.vscode-clangd \
   ms-python.black-formatter \
   ms-python.debugpy \
   ms-python.isort \
   ms-python.python \
   ms-python.vscode-pylance \
   ms-python.vscode-python-envs \
+  llvm-vs-code-extensions.lldb-dap \
+  llvm-vs-code-extensions.vscode-clangd \
   ms-vscode.cmake-tools \
   ms-vscode.cpp-devtools \
   ms-vscode.cpptools \
-  twxs.cmake \
-  vadimcn.vscode-lldb \
-  xaver.clang-format
+  cheshirekow.cmake-format
 ```
 
 ### CMake
@@ -165,4 +161,11 @@ cmake --build build --config Debug --target all --
 Release build:
 ```
 cmake --build build --config Release --target all --
+```
+
+### Other commands
+
+Dump Clang AST
+```
+clang-22 -fsyntax-only -Xclang -ast-dump-all <file.c>
 ```

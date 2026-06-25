@@ -7,6 +7,7 @@
 
 #include <clang/Basic/LLVM.h>
 #include <clang/Tooling/CommonOptionsParser.h>
+#include <llvm-22/llvm/Support/FormatVariadic.h>
 #include <llvm/ADT/StringRef.h>
 #include <llvm/Support/CommandLine.h>
 #include <llvm/Support/raw_ostream.h>
@@ -20,10 +21,9 @@ const llvm::cl::extrahelp more_help("\nMore help text...\n");
 } // namespace
 
 auto main(int argc, const char **argv) -> int {
-
   auto expected_parser = clang::tooling::CommonOptionsParser::create(argc, argv, c2_pancake_options);
   if (!expected_parser) {
-    llvm::errs() << expected_parser.takeError();
+    llvm::errs() << llvm::formatv("[c2pancake] {0}", llvm::fmt_consume(expected_parser.takeError()));
     return 1;
   }
 
@@ -55,6 +55,7 @@ auto main(int argc, const char **argv) -> int {
   pipeline.AddPass<pass_process_continue_in_do_while_loops::Action>();
   pipeline.AddPass<pass_do_while_to_while::Action>();
   pipeline.AddPass<pancake::normalise_switches::Action>();
+  // pipeline.AddPass<pancake::pass_switch_to_if::Action>();
   // pipeline.AddPass<pass_promote_records::Action>();
   // pipeline.AddPass<pass_hoist_arrays_and_addresses::Action>();
   // pipeline.AddPass<pass_compound_assignment::Action>();

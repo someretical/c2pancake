@@ -65,7 +65,7 @@ struct PipelineActionCtx {
         next_suffix(next_suffix), replacements(replacements) {}
 };
 
-std::string LogBegin(const PipelineActionCtx &ctx);
+auto LogBegin(const PipelineActionCtx &ctx) -> std::string;
 
 inline auto LogBeginShort(const std::string &in_file) { return llvm::formatv("[c2pancake] {0}:", in_file); }
 

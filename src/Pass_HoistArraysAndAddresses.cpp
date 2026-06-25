@@ -19,6 +19,7 @@
 #include <llvm/Support/Casting.h>
 #include <llvm/Support/Error.h>
 #include <llvm/Support/FileSystem.h>
+#include <llvm/Support/FormatAdapters.h>
 #include <llvm/Support/FormatVariadic.h>
 #include <llvm/Support/MemoryBufferRef.h>
 #include <llvm/Support/raw_ostream.h>
@@ -345,7 +346,7 @@ void PassRename::AddReplacement(clang::SourceRange range, llvm::StringRef text) 
   auto char_range = clang::CharSourceRange::getTokenRange(range);
   clang::tooling::Replacement const repl(SM, char_range, text);
   if (auto err = Repls.add(repl)) {
-    llvm::errs() << "Replacement conflict: " << llvm::toString(std::move(err)) << "\n";
+    llvm::errs() << llvm::formatv("Replacement conflict: {0}\n", llvm::fmt_consume(std::move(err)));
     has_replacement_error = true;
   }
 }

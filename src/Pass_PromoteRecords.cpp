@@ -18,6 +18,7 @@
 #include <llvm/Support/Casting.h>
 #include <llvm/Support/Error.h>
 #include <llvm/Support/FileSystem.h>
+#include <llvm/Support/FormatAdapters.h>
 #include <llvm/Support/FormatVariadic.h>
 #include <llvm/Support/MemoryBufferRef.h>
 #include <llvm/Support/raw_ostream.h>
@@ -315,14 +316,14 @@ void Consumer::AddReplacement(clang::ASTContext &Ctx, clang::SourceRange SR, con
   auto char_range = clang::CharSourceRange::getTokenRange(SR);
   clang::tooling::Replacement const repl(Ctx.getSourceManager(), char_range, newText);
   if (auto err = pa_ctx.replacements.add(repl)) {
-    llvm::errs() << "Replacement conflict: " << llvm::toString(std::move(err)) << "\n";
+    llvm::errs() << llvm::formatv("Replacement conflict: {0}\n", llvm::fmt_consume(std::move(err)));
   }
 }
 
 void Consumer::InsertAtOffset(llvm::StringRef file, unsigned offset, const std::string &text) {
   clang::tooling::Replacement const r(file, offset, 0, text);
   if (auto err = pa_ctx.replacements.add(r))
-    llvm::errs() << "Insert conflict: " << llvm::toString(std::move(err)) << "\n";
+    llvm::errs() << llvm::formatv("Insert conflict: {0}\n", llvm::fmt_consume(std::move(err)));
 }
 
 namespace {

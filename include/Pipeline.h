@@ -12,6 +12,7 @@
 #include <clang/Tooling/CompilationDatabase.h>
 #include <clang/Tooling/Core/Replacement.h>
 #include <clang/Tooling/Tooling.h>
+#include <llvm-22/llvm/Support/FormatAdapters.h>
 #include <llvm-22/llvm/Support/FormatVariadic.h>
 #include <llvm/ADT/StringRef.h>
 
@@ -68,7 +69,7 @@ public:
       auto result = applyAllReplacements(source_text, pa_ctx.replacements);
       if (!result) {
         // abnormal error!
-        llvm::errs() << llvm::formatv("{0} {1}\n", LogBegin(pa_ctx), llvm::toString(result.takeError()));
+        llvm::errs() << llvm::formatv("{0} {1}\n", LogBegin(pa_ctx), llvm::fmt_consume(result.takeError()));
         break;
       }
 

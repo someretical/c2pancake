@@ -15,6 +15,7 @@
 #include <clang/Tooling/Transformer/Transformer.h>
 #include <llvm/Support/Error.h>
 #include <llvm/Support/ErrorHandling.h>
+#include <llvm/Support/FormatAdapters.h>
 
 #include <optional>
 #include <string>
@@ -94,7 +95,8 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
   for (const auto &change : changes) {
     for (const auto &r : change.getReplacements()) {
       if (auto err = pa_ctx.replacements.add(r)) {
-        llvm::reportFatalInternalError(llvm::formatv("Failed to add replacement: {0}", llvm::toString(std::move(err))));
+        llvm::reportFatalInternalError(
+            llvm::formatv("Failed to add replacement: {0}", llvm::fmt_consume(std::move(err))));
       }
     }
   }
@@ -279,7 +281,8 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
   for (const auto &change : changes) {
     for (const auto &r : change.getReplacements()) {
       if (auto err = pa_ctx.replacements.add(r)) {
-        llvm::reportFatalInternalError(llvm::formatv("Failed to add replacement: {0}", llvm::toString(std::move(err))));
+        llvm::reportFatalInternalError(
+            llvm::formatv("Failed to add replacement: {0}", llvm::fmt_consume(std::move(err))));
       }
     }
   }
