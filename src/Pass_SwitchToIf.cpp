@@ -20,12 +20,12 @@
 #include <clang/Tooling/Transformer/SourceCode.h>
 #include <clang/Tooling/Transformer/Stencil.h>
 #include <clang/Tooling/Transformer/Transformer.h>
+#include <llvm/ADT/StringRef.h>
 #include <llvm/Support/Error.h>
 #include <llvm/Support/ErrorHandling.h>
 #include <llvm/Support/FormatAdapters.h>
 
 #include <algorithm>
-#include <llvm-22/llvm/ADT/StringRef.h>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -157,7 +157,6 @@ public:
     If this is true, we want to copy the previous case statement's body into the new one first because it's a fall
     through case
     */
-    bool encountered_case_label_just_before = false;
     for (auto it = body->body_rbegin(); it != body->body_rend(); ++it) {
       auto *stmt = *it;
 
@@ -173,15 +172,20 @@ public:
         we need to check if the last statement is a break/return/continue statement
           - if it is, make a new CaseInfo with just this case label and the compound statement as the body and anything
           in current_case_info is just discarded because it is unreachable
-          - if it isn't, we add the compound statement to the current_case_info. Then we push this CaseInfo to the
-        vector and start a new one
+          - if it isn't,
+            1. push the current_case_info
+            2. make a new CaseInfo with this case label and copy the previous current_case_info's body into it
+            3. add the compound statement to the new CaseInfo's body and push it to the vector
 
         - a AttributedStmt containing a FallThroughAttr - this is done by the normalise_switches pass
         we add the case statement to the current_case_info
         */
 
         if (IsTerminatingStmt(case_body)) {
+          case_infos.push_back(current_case_info);
           current_case_info = CaseInfo{};
+          current_case_info.labels.push_back(case_stmt);
+          current_case_info.body.push_back(case_body);
         } else if (auto *attr_stmt = dyn_cast<AttributedStmt>(case_body)) {
           auto attrs = attr_stmt->getAttrs();
           if (attrs.front()->getKind() == attr::FallThrough) {
@@ -190,42 +194,92 @@ public:
         } else if (auto *compound_stmt = dyn_cast<CompoundStmt>(case_body)) {
           auto *last_stmt = compound_stmt->body_back();
           if (IsTerminatingStmt(last_stmt)) {
-            current_case_info = CaseInfo{};
-            current_case_info.labels.push_back(case_stmt);
-            current_case_info.body.push_back(compound_stmt);
             case_infos.push_back(current_case_info);
             current_case_info = CaseInfo{};
-          } else {
             current_case_info.labels.push_back(case_stmt);
             current_case_info.body.push_back(compound_stmt);
+          } else {
+            auto kept_stmts = current_case_info.body;
+            case_infos.push_back(current_case_info);
             current_case_info = CaseInfo{};
+            current_case_info.labels.push_back(case_stmt);
+            current_case_info.body.insert(current_case_info.body.end(), kept_stmts.begin(), kept_stmts.end());
+            current_case_info.body.push_back(compound_stmt);
           }
         } else {
           current_case_info.labels.push_back(case_stmt);
           current_case_info.body.push_back(case_body);
         }
-
       } else if (auto *default_stmt = dyn_cast<DefaultStmt>(stmt)) {
         auto *case_body = default_stmt->getSubStmt();
+
         /*
         default statement is treated the same as a case statement
         */
-
+        if (IsTerminatingStmt(case_body)) {
+          case_infos.push_back(current_case_info);
+          current_case_info = CaseInfo{};
+          current_case_info.labels.push_back(case_stmt);
+          current_case_info.body.push_back(case_body);
+        } else if (auto *attr_stmt = dyn_cast<AttributedStmt>(case_body)) {
+          auto attrs = attr_stmt->getAttrs();
+          if (attrs.front()->getKind() == attr::FallThrough) {
+            current_case_info.labels.push_back(case_stmt);
+          }
+        } else if (auto *compound_stmt = dyn_cast<CompoundStmt>(case_body)) {
+          auto *last_stmt = compound_stmt->body_back();
+          if (IsTerminatingStmt(last_stmt)) {
+            case_infos.push_back(current_case_info);
+            current_case_info = CaseInfo{};
+            current_case_info.labels.push_back(case_stmt);
+            current_case_info.body.push_back(compound_stmt);
+          } else {
+            auto kept_stmts = current_case_info.body;
+            case_infos.push_back(current_case_info);
+            current_case_info = CaseInfo{};
+            current_case_info.labels.push_back(case_stmt);
+            current_case_info.body.insert(current_case_info.body.end(), kept_stmts.begin(), kept_stmts.end());
+            current_case_info.body.push_back(compound_stmt);
+          }
+        } else {
+          current_case_info.labels.push_back(case_stmt);
+          current_case_info.body.push_back(case_body);
+        }
       } else {
         /*
         - a single terminating statement (break/return/continue)
-        discard the current_case_info and make a new CaseInfo with nothing in it
+        append the current_case_info to the vector and make a new CaseInfo with nothing in it
         - a single non-terminating statement/compound statement
         add that statement to the current_case_info
         */
 
         if (IsTerminatingStmt(stmt)) {
-          // discard current_case_info and make a new CaseInfo with nothing in it
+          case_infos.push_back(current_case_info);
           current_case_info = CaseInfo{};
         } else {
           current_case_info.body.push_back(stmt);
         }
       }
+    }
+
+    auto valid_case_infos = case_infos | std::views::filter([](const CaseInfo &ci) { return !ci.labels.empty(); });
+
+    for (const auto &case_info : valid_case_infos) {
+      for (const auto *label : case_info.labels) {
+        if (auto *case_stmt = dyn_cast<CaseStmt>(label)) {
+          os << "if (" << switchStmt->getCond()->IgnoreImpCasts()->IgnoreParens()->getStmtClassName()
+             << " == " << case_stmt->getLHS()->IgnoreImpCasts()->IgnoreParens()->getStmtClassName() << ") {\n";
+        } else if (auto *default_stmt = dyn_cast<DefaultStmt>(label)) {
+          os << "else {\n";
+        }
+      }
+
+      for (const auto *stmt : case_info.body) {
+        stmt->printPretty(os, nullptr, data.Ctx.getPrintingPolicy());
+        os << "\n";
+      }
+
+      os << "}\n";
     }
 
     // data.replacements.emplace_back(data.Ctx.getSourceManager(), switchStmt, replacement_text,

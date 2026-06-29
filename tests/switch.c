@@ -1,9 +1,7 @@
 int main(void) {
   int i = 2;
   switch (i) {
-    [[fallthrough]];
   case -1:
-    [[fallthrough]];
   case 0:
   case 1:
     break;
