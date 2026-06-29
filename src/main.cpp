@@ -55,7 +55,7 @@ auto main(int argc, const char **argv) -> int {
   pipeline.AddPass<pass_process_continue_in_do_while_loops::Action>();
   pipeline.AddPass<pass_do_while_to_while::Action>();
   pipeline.AddPass<pancake::normalise_switches::Action>();
-  // pipeline.AddPass<pancake::pass_switch_to_if::Action>();
+  pipeline.AddPass<pancake::pass_switch_to_if::Action>();
   // pipeline.AddPass<pass_promote_records::Action>();
   // pipeline.AddPass<pass_hoist_arrays_and_addresses::Action>();
   // pipeline.AddPass<pass_compound_assignment::Action>();

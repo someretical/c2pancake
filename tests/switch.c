@@ -3,8 +3,10 @@ int main(void) {
   switch (i) {
   case -1:
   case 0:
-  case 1:
+  case 1: {
     break;
+    i = 99;
+  }
   case 2:
     i = 3;
     i = 4;
@@ -22,11 +24,21 @@ int main(void) {
     i = 9;
     return 0; // also account for break and continue here...
 
-  default:
-    i = 10;
+    // default:
+    //   i = 10;
 
-  case 10:
-    i = 11;
+    // case 10:
+    //   i = 11;
+
+    // case 11: {
+    //   i = 12;
+    // }
+    //   {
+    //     break;
+    //   }
+
+    // case 12:
+    //   i = 13;
   }
 }
 

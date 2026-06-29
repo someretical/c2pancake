@@ -1,6 +1,5 @@
 #include "Pass_SwitchToIf.h"
 
-#include <cassert>
 #include <clang/AST/ASTConsumer.h>
 #include <clang/AST/ASTContext.h>
 #include <clang/AST/Expr.h>
@@ -25,9 +24,9 @@
 #include <llvm/Support/ErrorHandling.h>
 #include <llvm/Support/FormatAdapters.h>
 
-#include <algorithm>
+#include <cassert>
+#include <ranges>
 #include <string>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -39,8 +38,8 @@ using namespace clang::transformer;
 namespace pancake::normalise_switches {
 namespace {
 auto MakeRule() -> RewriteRule {
-  auto matcher = caseStmt(hasParent(caseStmt().bind("case_stmt")));
-  auto replacement = edit(insertBefore(node("case_stmt"), cat("[[fallthrough]];")));
+  auto matcher = caseStmt(hasParent(caseStmt())).bind("case_stmt");
+  auto replacement = edit(insertBefore(node("case_stmt"), cat("[[fallthrough]];\n")));
   return makeRule(matcher, replacement);
 }
 } // namespace
@@ -88,7 +87,7 @@ public:
   // process all inner switch statements first, then the outermost one
   auto shouldTraversePostOrder() -> bool { return true; }
 
-  static auto VerifySwitchStmt(SwitchStmt *switchStmt) -> bool {
+  auto VerifySwitchStmt(SwitchStmt *switchStmt) -> bool {
     // verify if switch statement needs rewriting
     // basically check that every case is followed by a compound statement which ends in either a break/return/continue
     // statement and there are no random statements in between the case labels and the compound statement this should be
@@ -103,9 +102,23 @@ public:
 
       if (auto *case_stmt = dyn_cast<CaseStmt>(stmt)) {
         auto *case_body = case_stmt->getSubStmt();
+        if (auto *attr_stmt = dyn_cast<AttributedStmt>(case_body)) {
+          auto attrs = attr_stmt->getAttrs();
+          if (attrs.front()->getKind() != attr::FallThrough) {
+            return false;
+          }
+          continue; // skip to next statement
+        }
         case_body_compound = dyn_cast<CompoundStmt>(case_body);
       } else if (auto *default_stmt = dyn_cast<DefaultStmt>(stmt)) {
         auto *case_body = default_stmt->getSubStmt();
+        if (auto *attr_stmt = dyn_cast<AttributedStmt>(case_body)) {
+          auto attrs = attr_stmt->getAttrs();
+          if (attrs.front()->getKind() != attr::FallThrough) {
+            return false;
+          }
+          continue; // skip to next statement
+        }
         case_body_compound = dyn_cast<CompoundStmt>(case_body);
       } else {
         return false;
@@ -131,11 +144,8 @@ public:
   }
 
   auto RebuildSwitchStmt(SwitchStmt *switchStmt) -> void {
-    std::string replacement_text{};
-    llvm::raw_string_ostream os(replacement_text);
-
-    auto *body = dyn_cast<CompoundStmt>(switchStmt->getBody());
-    if (body == nullptr) {
+    auto *switch_body = dyn_cast<CompoundStmt>(switchStmt->getBody());
+    if (switch_body == nullptr) {
       return;
     }
 
@@ -157,7 +167,8 @@ public:
     If this is true, we want to copy the previous case statement's body into the new one first because it's a fall
     through case
     */
-    for (auto it = body->body_rbegin(); it != body->body_rend(); ++it) {
+    bool just_processed_label = false;
+    for (auto it = switch_body->body_rbegin(); it != switch_body->body_rend(); ++it) {
       auto *stmt = *it;
 
       if (auto *case_stmt = dyn_cast<CaseStmt>(stmt)) {
@@ -182,34 +193,81 @@ public:
         */
 
         if (IsTerminatingStmt(case_body)) {
-          case_infos.push_back(current_case_info);
-          current_case_info = CaseInfo{};
-          current_case_info.labels.push_back(case_stmt);
-          current_case_info.body.push_back(case_body);
+          if (just_processed_label) {
+            // current_case_info is completely empty
+            current_case_info.labels.push_back(case_stmt);
+            current_case_info.body.push_back(case_body);
+            case_infos.push_back(current_case_info);
+            current_case_info = CaseInfo{};
+          } else {
+            current_case_info = CaseInfo{};
+            current_case_info.labels.push_back(case_stmt);
+            current_case_info.body.push_back(case_body);
+            case_infos.push_back(current_case_info);
+            current_case_info = CaseInfo{};
+          }
         } else if (auto *attr_stmt = dyn_cast<AttributedStmt>(case_body)) {
           auto attrs = attr_stmt->getAttrs();
           if (attrs.front()->getKind() == attr::FallThrough) {
-            current_case_info.labels.push_back(case_stmt);
+            // get previous current_case_info and copy this label into it
+            if (!case_infos.empty()) {
+              auto &prev_case_info = case_infos.back();
+              prev_case_info.labels.push_back(case_stmt);
+            }
           }
         } else if (auto *compound_stmt = dyn_cast<CompoundStmt>(case_body)) {
           auto *last_stmt = compound_stmt->body_back();
           if (IsTerminatingStmt(last_stmt)) {
-            case_infos.push_back(current_case_info);
-            current_case_info = CaseInfo{};
-            current_case_info.labels.push_back(case_stmt);
-            current_case_info.body.push_back(compound_stmt);
+            if (just_processed_label) {
+              // current_case_info is completely empty
+              current_case_info.labels.push_back(case_stmt);
+              current_case_info.body.push_back(case_body);
+              case_infos.push_back(current_case_info);
+              current_case_info = CaseInfo{};
+            } else {
+              current_case_info = CaseInfo{};
+              current_case_info.labels.push_back(case_stmt);
+              current_case_info.body.push_back(case_body);
+              case_infos.push_back(current_case_info);
+              current_case_info = CaseInfo{};
+            }
           } else {
-            auto kept_stmts = current_case_info.body;
-            case_infos.push_back(current_case_info);
-            current_case_info = CaseInfo{};
-            current_case_info.labels.push_back(case_stmt);
-            current_case_info.body.insert(current_case_info.body.end(), kept_stmts.begin(), kept_stmts.end());
-            current_case_info.body.push_back(compound_stmt);
+            if (just_processed_label) {
+              // current_case_info is completely empty
+              current_case_info.labels.push_back(case_stmt);
+              if (!case_infos.empty()) {
+                const auto &prev_body = case_infos.back().body;
+                current_case_info.body.insert(current_case_info.body.end(), prev_body.begin(), prev_body.end());
+              }
+              current_case_info.body.push_back(case_body);
+              case_infos.push_back(current_case_info);
+              current_case_info = CaseInfo{};
+            } else {
+              current_case_info.labels.push_back(case_stmt);
+              current_case_info.body.push_back(case_body);
+              case_infos.push_back(current_case_info);
+              current_case_info = CaseInfo{};
+            }
           }
         } else {
-          current_case_info.labels.push_back(case_stmt);
-          current_case_info.body.push_back(case_body);
+          if (just_processed_label) {
+            // current_case_info is completely empty
+            current_case_info.labels.push_back(case_stmt);
+            if (!case_infos.empty()) {
+              const auto &prev_body = case_infos.back().body;
+              current_case_info.body.insert(current_case_info.body.end(), prev_body.begin(), prev_body.end());
+            }
+            current_case_info.body.push_back(case_body);
+            case_infos.push_back(current_case_info);
+            current_case_info = CaseInfo{};
+          } else {
+            current_case_info.labels.push_back(case_stmt);
+            current_case_info.body.push_back(case_body);
+            case_infos.push_back(current_case_info);
+            current_case_info = CaseInfo{};
+          }
         }
+        just_processed_label = true;
       } else if (auto *default_stmt = dyn_cast<DefaultStmt>(stmt)) {
         auto *case_body = default_stmt->getSubStmt();
 
@@ -217,34 +275,77 @@ public:
         default statement is treated the same as a case statement
         */
         if (IsTerminatingStmt(case_body)) {
-          case_infos.push_back(current_case_info);
-          current_case_info = CaseInfo{};
-          current_case_info.labels.push_back(case_stmt);
-          current_case_info.body.push_back(case_body);
+          if (just_processed_label) {
+            // current_case_info is completely empty
+            current_case_info.labels.push_back(default_stmt);
+            current_case_info.body.push_back(case_body);
+            case_infos.push_back(current_case_info);
+            current_case_info = CaseInfo{};
+          } else {
+            current_case_info = CaseInfo{};
+            current_case_info.labels.push_back(default_stmt);
+            current_case_info.body.push_back(case_body);
+            case_infos.push_back(current_case_info);
+            current_case_info = CaseInfo{};
+          }
         } else if (auto *attr_stmt = dyn_cast<AttributedStmt>(case_body)) {
           auto attrs = attr_stmt->getAttrs();
           if (attrs.front()->getKind() == attr::FallThrough) {
-            current_case_info.labels.push_back(case_stmt);
+            current_case_info.labels.push_back(default_stmt);
           }
         } else if (auto *compound_stmt = dyn_cast<CompoundStmt>(case_body)) {
           auto *last_stmt = compound_stmt->body_back();
           if (IsTerminatingStmt(last_stmt)) {
-            case_infos.push_back(current_case_info);
-            current_case_info = CaseInfo{};
-            current_case_info.labels.push_back(case_stmt);
-            current_case_info.body.push_back(compound_stmt);
+            if (just_processed_label) {
+              // current_case_info is completely empty
+              current_case_info.labels.push_back(default_stmt);
+              current_case_info.body.push_back(case_body);
+              case_infos.push_back(current_case_info);
+              current_case_info = CaseInfo{};
+            } else {
+              current_case_info = CaseInfo{};
+              current_case_info.labels.push_back(default_stmt);
+              current_case_info.body.push_back(case_body);
+              case_infos.push_back(current_case_info);
+              current_case_info = CaseInfo{};
+            }
           } else {
-            auto kept_stmts = current_case_info.body;
-            case_infos.push_back(current_case_info);
-            current_case_info = CaseInfo{};
-            current_case_info.labels.push_back(case_stmt);
-            current_case_info.body.insert(current_case_info.body.end(), kept_stmts.begin(), kept_stmts.end());
-            current_case_info.body.push_back(compound_stmt);
+            if (just_processed_label) {
+              // current_case_info is completely empty
+              current_case_info.labels.push_back(default_stmt);
+              if (!case_infos.empty()) {
+                const auto &prev_body = case_infos.back().body;
+                current_case_info.body.insert(current_case_info.body.end(), prev_body.begin(), prev_body.end());
+              }
+              current_case_info.body.push_back(case_body);
+              case_infos.push_back(current_case_info);
+              current_case_info = CaseInfo{};
+            } else {
+              current_case_info.labels.push_back(default_stmt);
+              current_case_info.body.push_back(case_body);
+              case_infos.push_back(current_case_info);
+              current_case_info = CaseInfo{};
+            }
           }
         } else {
-          current_case_info.labels.push_back(case_stmt);
-          current_case_info.body.push_back(case_body);
+          if (just_processed_label) {
+            // current_case_info is completely empty
+            current_case_info.labels.push_back(default_stmt);
+            if (!case_infos.empty()) {
+              const auto &prev_body = case_infos.back().body;
+              current_case_info.body.insert(current_case_info.body.end(), prev_body.begin(), prev_body.end());
+            }
+            current_case_info.body.push_back(case_body);
+            case_infos.push_back(current_case_info);
+            current_case_info = CaseInfo{};
+          } else {
+            current_case_info.labels.push_back(default_stmt);
+            current_case_info.body.push_back(case_body);
+            case_infos.push_back(current_case_info);
+            current_case_info = CaseInfo{};
+          }
         }
+        just_processed_label = true;
       } else {
         /*
         - a single terminating statement (break/return/continue)
@@ -253,52 +354,110 @@ public:
         add that statement to the current_case_info
         */
 
-        if (IsTerminatingStmt(stmt)) {
-          case_infos.push_back(current_case_info);
-          current_case_info = CaseInfo{};
+        if (just_processed_label) {
+          // if we just processed a case label, then this statement is part of a new case body (but we don't know the
+          // label yet...)
+          if (!case_infos.empty()) {
+            const auto &prev_body = case_infos.back().body;
+            current_case_info.body.insert(current_case_info.body.end(), prev_body.begin(), prev_body.end());
+          }
+          current_case_info.body.push_back(stmt);
+
+          // auto tmp = current_case_info;
+          // case_infos.push_back(current_case_info);
+          // current_case_info = CaseInfo{};
+          // current_case_info.body.insert(current_case_info.body.end(), tmp.body.begin(), tmp.body.end());
+          // current_case_info.body.push_back(stmt);
         } else {
+          if (IsTerminatingStmt(stmt)) {
+            case_infos.push_back(current_case_info);
+            current_case_info = CaseInfo{};
+          }
+
           current_case_info.body.push_back(stmt);
         }
+        just_processed_label = false;
       }
     }
 
-    auto valid_case_infos = case_infos | std::views::filter([](const CaseInfo &ci) { return !ci.labels.empty(); });
+    case_infos.push_back(current_case_info);
+    current_case_info = CaseInfo{};
 
+    auto valid_case_infos = case_infos |
+                            std::views::filter([](const CaseInfo &ci) -> bool { return !ci.labels.empty(); }) |
+                            std::views::reverse;
+
+    std::string new_body;
+    llvm::raw_string_ostream os(new_body);
     for (const auto &case_info : valid_case_infos) {
-      for (const auto *label : case_info.labels) {
-        if (auto *case_stmt = dyn_cast<CaseStmt>(label)) {
-          os << "if (" << switchStmt->getCond()->IgnoreImpCasts()->IgnoreParens()->getStmtClassName()
-             << " == " << case_stmt->getLHS()->IgnoreImpCasts()->IgnoreParens()->getStmtClassName() << ") {\n";
-        } else if (auto *default_stmt = dyn_cast<DefaultStmt>(label)) {
-          os << "else {\n";
-        }
-      }
-
-      for (const auto *stmt : case_info.body) {
-        stmt->printPretty(os, nullptr, data.Ctx.getPrintingPolicy());
+      auto reverse_labels = case_info.labels | std::views::reverse;
+      for (const auto [index, label] : std::views::enumerate(reverse_labels)) {
         os << "\n";
-      }
 
-      os << "}\n";
+        if (const auto *case_stmt = dyn_cast<CaseStmt>(label)) {
+          const auto range = CharSourceRange::getTokenRange(case_stmt->getCaseLoc(), case_stmt->getColonLoc());
+          os << Lexer::getSourceText(range, data.Ctx.getSourceManager(), data.Ctx.getLangOpts());
+        } else if (const auto *default_stmt = dyn_cast<DefaultStmt>(label)) {
+          const auto range = CharSourceRange::getTokenRange(default_stmt->getDefaultLoc(), default_stmt->getColonLoc());
+          os << Lexer::getSourceText(range, data.Ctx.getSourceManager(), data.Ctx.getLangOpts());
+        }
+
+        if (case_info.body.empty() || index < case_info.labels.size() - 1) {
+          os << "[[fallthrough]];\n";
+          continue;
+        }
+
+        if (case_info.body.size() == 1) {
+          if (auto *compound_stmt = dyn_cast<CompoundStmt>(case_info.body[0])) {
+            if (compound_stmt->size() > 0 && !IsTerminatingStmt(compound_stmt->body_back())) {
+              os << "\n{\n";
+              case_info.body[0]->printPretty(os, nullptr, data.Ctx.getPrintingPolicy());
+              os << "\nbreak;\n}";
+            } else {
+              case_info.body[0]->printPretty(os, nullptr, data.Ctx.getPrintingPolicy());
+            }
+            continue;
+          }
+        }
+
+        os << "\n{\n";
+        bool terminating_stmt_found = false;
+        const auto body_it = case_info.body | std::views::reverse;
+        for (const auto &stmt : body_it) {
+          // stmt->printPretty(os, nullptr, data.Ctx.getPrintingPolicy());
+          os << Lexer::getSourceText(CharSourceRange::getTokenRange(stmt->getSourceRange()),
+                                     data.Ctx.getSourceManager(), data.Ctx.getLangOpts());
+          os << ";\n";
+          if (IsTerminatingStmt(stmt)) {
+            terminating_stmt_found = true;
+            break;
+          }
+        }
+        if (!terminating_stmt_found) {
+          os << "break;\n";
+        }
+        os << "}\n";
+      }
     }
 
-    // data.replacements.emplace_back(data.Ctx.getSourceManager(), switchStmt, replacement_text,
-    // data.Ctx.getLangOpts());
+    // get range between {} of switch body
+    const auto range =
+        CharSourceRange::getCharRange(switch_body->getLBracLoc().getLocWithOffset(1), switch_body->getRBracLoc());
+    data.replacements.emplace_back(data.Ctx.getSourceManager(), range, os.str(), data.Ctx.getLangOpts());
   }
 
   auto VisitSwitchStmt(SwitchStmt *switchStmt) -> bool {
-    if (!VerifySwitchStmt(switchStmt)) {
-      return true; // continue traversing the AST
+    if (VerifySwitchStmt(switchStmt)) {
+      return true; // continue traversing the AST if the switch statement is already valid
     }
 
     RebuildSwitchStmt(switchStmt);
 
-    // if there are any outer switch statements, their replacements will conflict so only the innermost switch statement
-    // should be rewritten
+    // if there are any outer switch statements, their replacements will conflict so only the innermost switch
+    // statement should be rewritten
     return true;
   }
 };
-
 } // namespace
 
 auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
