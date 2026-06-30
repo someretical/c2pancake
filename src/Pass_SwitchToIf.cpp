@@ -35,7 +35,7 @@ using namespace clang::tooling;
 using namespace clang::ast_matchers;
 using namespace clang::transformer;
 
-namespace pancake::normalise_switches {
+namespace pancake::pass_add_switch_fallthrough {
 namespace {
 auto MakeRule() -> RewriteRule {
   auto matcher = caseStmt(hasParent(caseStmt())).bind("case_stmt");
@@ -69,9 +69,9 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
   // this pass should only be executed once!
   pa_ctx.failure_mode = FailureMode::Success;
 }
-} // namespace pancake::normalise_switches
+} // namespace pancake::pass_add_switch_fallthrough
 
-namespace pancake::pass_switch_to_if {
+namespace pancake::pass_normalise_switches {
 namespace {
 struct WorkerData {
   ASTContext &Ctx;
@@ -188,7 +188,7 @@ public:
             2. make a new CaseInfo with this case label and copy the previous current_case_info's body into it
             3. add the compound statement to the new CaseInfo's body and push it to the vector
 
-        - a AttributedStmt containing a FallThroughAttr - this is done by the normalise_switches pass
+        - a AttributedStmt containing a FallThroughAttr - this is done by the pass_add_switch_fallthrough pass
         we add the case statement to the current_case_info
         */
 
@@ -481,5 +481,118 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
     pa_ctx.failure_mode = FailureMode::Success;
   }
 }
+} // namespace pancake::pass_normalise_switches
 
+namespace pancake::pass_switch_to_if {
+namespace {
+struct WorkerData {
+  ASTContext &Ctx;
+  std::vector<Replacement> &replacements;
+};
+
+class Worker : public RecursiveASTVisitor<Worker> {
+  struct WorkerData &data;
+
+public:
+  explicit Worker(struct WorkerData &data) : data(data) {}
+
+  // process all inner switch statements first, then the outermost one
+  auto shouldTraversePostOrder() -> bool { return true; }
+
+  auto ConvertSwitchStmt(SwitchStmt *switchStmt) -> void {
+    auto *switch_body = dyn_cast<CompoundStmt>(switchStmt->getBody());
+    if (switch_body == nullptr) {
+      return;
+    }
+
+    struct CaseInfo {
+      // The SwitchCase label nodes that head this block
+      llvm::SmallVector<SwitchCase *, 4> labels; // this is reverse order of the original source code
+
+      // The body statements belonging to this case block.
+      // CAN include the last break/return/continue statement
+      std::vector<Stmt *> body; // this is reverse order of the original source code
+    };
+    std::vector<CaseInfo> case_infos;
+
+    std::vector<Stmt *> stmt_buf;
+    CaseInfo current_case_info{};
+
+    for (auto it = switch_body->body_rbegin(); it != switch_body->body_rend(); ++it) {
+      auto *stmt = *it;
+
+      if (auto *case_stmt = dyn_cast<CaseStmt>(stmt)) {
+        auto *substmt = case_stmt->getSubStmt();
+        if (auto *attr_stmt = dyn_cast<AttributedStmt>(substmt)) {
+          auto attrs = attr_stmt->getAttrs();
+          if (attrs.front()->getKind() == attr::FallThrough) {
+            // get previous current_case_info and copy this label into it
+            if (!case_infos.empty()) {
+              auto &prev_case_info = case_infos.back();
+              prev_case_info.labels.push_back(case_stmt);
+            }
+          }
+        } else {
+          current_case_info.labels.push_back(case_stmt);
+          current_case_info.body.push_back(substmt);
+          case_infos.push_back(current_case_info);
+          current_case_info = CaseInfo{};
+        }
+      } else if (auto *default_stmt = dyn_cast<DefaultStmt>(stmt)) {
+        auto *substmt = default_stmt->getSubStmt();
+        if (auto *attr_stmt = dyn_cast<AttributedStmt>(substmt)) {
+          auto attrs = attr_stmt->getAttrs();
+          if (attrs.front()->getKind() == attr::FallThrough) {
+            // get previous current_case_info and copy this label into it
+            if (!case_infos.empty()) {
+              auto &prev_case_info = case_infos.back();
+              prev_case_info.labels.push_back(default_stmt);
+            }
+          }
+        } else {
+          current_case_info.labels.push_back(default_stmt);
+          current_case_info.body.push_back(substmt);
+          case_infos.push_back(current_case_info);
+          current_case_info = CaseInfo{};
+        }
+      }
+    }
+
+    auto valid_case_infos = case_infos |
+                            std::views::filter([](const CaseInfo &ci) -> bool { return !ci.labels.empty(); }) |
+                            std::views::reverse;
+    // first case gets turned into an "if"
+    // subsequent cases get turned into "else if"
+    // if any set of cases has a default, it becomes the last one and is turned into an "else"
+  }
+
+  auto VisitSwitchStmt(SwitchStmt *switchStmt) -> bool {
+    ConvertSwitchStmt(switchStmt);
+
+    return true;
+  }
+};
+} // namespace
+
+auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
+  std::vector<Replacement> replacements;
+  WorkerData data{.Ctx = Ctx, .replacements = replacements};
+  Worker w(data);
+  w.TraverseDecl(Ctx.getTranslationUnitDecl());
+
+  bool add_error_occurred = false;
+  for (const auto &r : replacements) {
+    if (auto err = pa_ctx.replacements.add(r)) {
+      llvm::consumeError(std::move(err));
+      llvm::errs() << llvm::formatv("{0} Add replacement conflict, retrying next pass...\n", LogBegin(pa_ctx));
+      add_error_occurred = true;
+    }
+  }
+
+  pa_ctx.failure_mode = FailureMode::RepeatPass;
+  if (!add_error_occurred && replacements.empty()) {
+    // All edits successfully added; no need to repeat this pass
+    pa_ctx.failure_mode = FailureMode::Success;
+  }
+}
 } // namespace pancake::pass_switch_to_if
