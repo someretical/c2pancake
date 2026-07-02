@@ -20,9 +20,11 @@
 #include <clang/Tooling/Transformer/Stencil.h>
 #include <clang/Tooling/Transformer/Transformer.h>
 #include <llvm/ADT/StringRef.h>
+#include <llvm/Support/Casting.h>
 #include <llvm/Support/Error.h>
 #include <llvm/Support/ErrorHandling.h>
 #include <llvm/Support/FormatAdapters.h>
+#include <llvm/Support/FormatVariadic.h>
 
 #include <cassert>
 #include <ranges>
@@ -85,7 +87,7 @@ public:
   explicit Worker(struct WorkerData &data) : data(data) {}
 
   // process all inner switch statements first, then the outermost one
-  auto shouldTraversePostOrder() -> bool { return true; }
+  auto shouldTraversePostOrder() const -> bool { return true; }
 
   auto VerifySwitchStmt(SwitchStmt *switchStmt) -> bool {
     // verify if switch statement needs rewriting
@@ -427,7 +429,11 @@ public:
           // stmt->printPretty(os, nullptr, data.Ctx.getPrintingPolicy());
           os << Lexer::getSourceText(CharSourceRange::getTokenRange(stmt->getSourceRange()),
                                      data.Ctx.getSourceManager(), data.Ctx.getLangOpts());
-          os << ";\n";
+          if (isa<CompoundStmt>(stmt)) {
+            os << "\n";
+          } else {
+            os << ";\n";
+          }
           if (IsTerminatingStmt(stmt)) {
             terminating_stmt_found = true;
             break;
@@ -487,7 +493,18 @@ namespace pancake::pass_switch_to_if {
 namespace {
 struct WorkerData {
   ASTContext &Ctx;
+  PipelineActionCtx &pa_ctx;
   std::vector<Replacement> &replacements;
+  size_t switch_cond_tmp_var_counter = 0;
+};
+
+struct CaseInfo {
+  // The SwitchCase label nodes that head this block
+  llvm::SmallVector<SwitchCase *, 4> labels; // this is reverse order of the original source code
+
+  // The body statements belonging to this case block.
+  // CAN include the last break/return/continue statement
+  std::vector<Stmt *> body; // this is reverse order of the original source code
 };
 
 class Worker : public RecursiveASTVisitor<Worker> {
@@ -497,7 +514,71 @@ public:
   explicit Worker(struct WorkerData &data) : data(data) {}
 
   // process all inner switch statements first, then the outermost one
-  auto shouldTraversePostOrder() -> bool { return true; }
+  auto shouldTraversePostOrder() const -> bool { return true; }
+
+  auto GetSwitchCondTempVarName() -> auto {
+    return llvm::formatv("__c2pnk_switch_cond_tmp_var_{0}_{1}_{2}", data.pa_ctx.major_pass_number,
+                         data.pa_ctx.minor_pass_number, data.switch_cond_tmp_var_counter++);
+  }
+
+  auto BuildConditionExpr(const CaseInfo &ci, const std::string &switch_cond_var,
+                          const bool contains_default_case) const -> auto {
+    std::string condition;
+    llvm::raw_string_ostream os(condition);
+
+    if (contains_default_case) {
+      os << "true";
+      return condition;
+    }
+
+    size_t label_count = 0;
+    for (const auto &label : ci.labels | std::views::reverse) {
+      if (const auto *case_stmt = dyn_cast<CaseStmt>(label)) {
+        if (label_count > 0) {
+          os << " || ";
+        }
+        label_count++;
+
+        os << "(";
+        case_stmt->getLHS()->printPretty(os, nullptr, data.Ctx.getPrintingPolicy());
+        os << " == ";
+        os << switch_cond_var;
+        os << ")";
+      }
+    }
+
+    return os.str();
+  }
+
+  auto BuildIfBody(const CaseInfo &ci) const -> auto {
+    std::string body;
+    llvm::raw_string_ostream os(body);
+
+    assert(ci.body.size() == 1);
+
+    if (const auto *body_stmt = dyn_cast<CompoundStmt>(ci.body.front())) {
+      os << "{\n";
+      for (const auto &stmt : body_stmt->body()) {
+        bool is_last = (stmt == body_stmt->body_back());
+        if (is_last && isa<BreakStmt>(stmt)) {
+          // don't output the last break statement
+        } else {
+          os << Lexer::getSourceText(CharSourceRange::getTokenRange(stmt->getSourceRange()),
+                                     data.Ctx.getSourceManager(), data.Ctx.getLangOpts());
+          if (isa<CompoundStmt>(stmt)) {
+            os << "\n";
+          } else {
+            os << ";\n";
+          }
+        }
+      }
+      os << "}\n";
+    } else {
+      llvm_unreachable("Case body is not a compound statement");
+    }
+
+    return os.str();
+  }
 
   auto ConvertSwitchStmt(SwitchStmt *switchStmt) -> void {
     auto *switch_body = dyn_cast<CompoundStmt>(switchStmt->getBody());
@@ -505,14 +586,6 @@ public:
       return;
     }
 
-    struct CaseInfo {
-      // The SwitchCase label nodes that head this block
-      llvm::SmallVector<SwitchCase *, 4> labels; // this is reverse order of the original source code
-
-      // The body statements belonging to this case block.
-      // CAN include the last break/return/continue statement
-      std::vector<Stmt *> body; // this is reverse order of the original source code
-    };
     std::vector<CaseInfo> case_infos;
 
     std::vector<Stmt *> stmt_buf;
@@ -560,10 +633,66 @@ public:
 
     auto valid_case_infos = case_infos |
                             std::views::filter([](const CaseInfo &ci) -> bool { return !ci.labels.empty(); }) |
-                            std::views::reverse;
+                            std::views::reverse | std::ranges::to<std::vector>();
+    std::string converted;
+    llvm::raw_string_ostream os(converted);
+
+    // first hoist the switch condition into a new tmp var
+    auto *switch_cond = switchStmt->getCond();
+    auto tmp_var_name = GetSwitchCondTempVarName();
+    os << llvm::formatv("{0} {1} = {2};\n", switch_cond->getType().getAsString(), tmp_var_name,
+                        Lexer::getSourceText(CharSourceRange::getTokenRange(switch_cond->getSourceRange()),
+                                             data.Ctx.getSourceManager(), data.Ctx.getLangOpts()));
+
     // first case gets turned into an "if"
     // subsequent cases get turned into "else if"
     // if any set of cases has a default, it becomes the last one and is turned into an "else"
+    for (size_t i = 0; i < valid_case_infos.size(); ++i) {
+      bool is_first = (i == 0);
+      bool is_last = (i + 1 == valid_case_infos.size());
+      const CaseInfo &ci = valid_case_infos[i];
+      bool has_default = std::ranges::any_of(ci.labels, [](SwitchCase *sc) -> bool { return isa<DefaultStmt>(sc); });
+
+      if (is_first) {
+        if (has_default) {
+          // just output the default case body by itself
+          os << BuildIfBody(ci);
+          break;
+        }
+
+        // output the first case as an if statement
+        os << "if (";
+        os << BuildConditionExpr(ci, tmp_var_name, has_default);
+        os << ") ";
+        os << BuildIfBody(ci);
+      } else if (is_last) {
+        if (has_default) {
+          os << "else ";
+          os << BuildIfBody(ci);
+          break;
+        }
+
+        os << "else if (";
+        os << BuildConditionExpr(ci, tmp_var_name, has_default);
+        os << ") ";
+        os << BuildIfBody(ci);
+      } else {
+        if (has_default) {
+          os << "else ";
+          os << BuildIfBody(ci);
+          break;
+        }
+
+        os << "else if (";
+        os << BuildConditionExpr(ci, tmp_var_name, has_default);
+        os << ") ";
+        os << BuildIfBody(ci);
+      }
+    }
+
+    data.replacements.emplace_back(data.Ctx.getSourceManager(),
+                                   CharSourceRange::getTokenRange(switchStmt->getSourceRange()), os.str(),
+                                   data.Ctx.getLangOpts());
   }
 
   auto VisitSwitchStmt(SwitchStmt *switchStmt) -> bool {
@@ -576,7 +705,7 @@ public:
 
 auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
   std::vector<Replacement> replacements;
-  WorkerData data{.Ctx = Ctx, .replacements = replacements};
+  WorkerData data{.Ctx = Ctx, .pa_ctx = pa_ctx, .replacements = replacements};
   Worker w(data);
   w.TraverseDecl(Ctx.getTranslationUnitDecl());
 

@@ -18,7 +18,7 @@ auto Pipeline::Run() -> int {
 
     for (size_t j = 0; j < factories.size(); ++j) {
       auto &factory = factories.at(j);
-      for (size_t k = 0; k < 4; ++k) {
+      for (size_t k = 0; k < 10; ++k) {
         std::string next_suffix = llvm::formatv(".{0}-{1}-c2pnk.c", j, k);
         StagedCompilationDatabase db(options_parser.getCompilations(), current_suffix);
         std::string current_file = llvm::formatv("{0}{1}", initial_file, current_suffix);
@@ -26,7 +26,7 @@ auto Pipeline::Run() -> int {
         clang::tooling::ClangTool tool(db, std::vector{current_file});
 
         clang::tooling::Replacements replacements;
-        PipelineActionCtx ctx(k, replacements, current_file, current_suffix, next_file, next_suffix);
+        PipelineActionCtx ctx(j, k, replacements, current_file, current_suffix, next_file, next_suffix);
         auto action = factory->BetterCreate(ctx);
         if (!ctx.failure_behaviour.has_value()) {
           llvm_unreachable("Action did not set a failure behaviour");

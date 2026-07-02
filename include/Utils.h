@@ -46,7 +46,8 @@ enum class FailureBehaviour : uint8_t { MoveToNextPass, RepeatPass, MoveToNextFi
 enum class FailureMode : uint8_t { Success, RepeatPass, Fail };
 enum class PipelineActionType : uint8_t { None, Rewriter, Analyser };
 struct PipelineActionCtx {
-  const size_t &pass_number;         // provided by Pipeline::Run
+  const size_t major_pass_number;    // provided by Pipeline::Run
+  const size_t minor_pass_number;    // provided by Pipeline::Run
   const std::string &current_file;   // provided by Pipeline::Run
   const std::string &current_suffix; // provided by Pipeline::Run
   const std::string &next_file;      // provided by Pipeline::Run
@@ -58,11 +59,12 @@ struct PipelineActionCtx {
   clang::tooling::Replacements &replacements;        // provided by Pipeline::Run, the pass adds to it
   FailureMode failure_mode = FailureMode::Success;   // set by the pass itself at the end of HandleTranslationUnit
 
-  explicit PipelineActionCtx(const size_t &pass_number, clang::tooling::Replacements &replacements,
-                             const std::string &current_file, const std::string &current_suffix,
-                             const std::string &next_file, const std::string &next_suffix)
-      : pass_number(pass_number), current_file(current_file), current_suffix(current_suffix), next_file(next_file),
-        next_suffix(next_suffix), replacements(replacements) {}
+  explicit PipelineActionCtx(const size_t pass_number, const size_t minor_pass_number,
+                             clang::tooling::Replacements &replacements, const std::string &current_file,
+                             const std::string &current_suffix, const std::string &next_file,
+                             const std::string &next_suffix)
+      : major_pass_number(pass_number), minor_pass_number(minor_pass_number), current_file(current_file),
+        current_suffix(current_suffix), next_file(next_file), next_suffix(next_suffix), replacements(replacements) {}
 };
 
 auto LogBegin(const PipelineActionCtx &ctx) -> std::string;

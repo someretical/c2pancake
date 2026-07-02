@@ -21,7 +21,7 @@ std::string pancake::LogBegin(const PipelineActionCtx &ctx) {
                                 : action_type == PipelineActionType::Analyser ? "Analyser"
                                                                               : "UnknownActionType";
   return llvm::formatv("[c2pancake] {0} -> {1}: {2}(i={4:02}) {3}:", ctx.current_file, ctx.next_file, action_type_str,
-                       ctx.action_name.value_or("UnknownAction"), ctx.pass_number);
+                       ctx.action_name.value_or("UnknownAction"), ctx.major_pass_number);
 }
 
 auto pancake::StagedCompilationDatabase::GetOriginalFilename(llvm::StringRef Filename) const -> llvm::StringRef {

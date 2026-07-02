@@ -10,7 +10,7 @@
             "name": "Debug c2pancake",
             "program": "${command:cmake.launchTargetPath}",
             "args": [
-                "tests/switch.c.5-0-c2pnk.c",
+                "tests/switch.c",
                 "--"
             ],
             "cwd": "${workspaceFolder}",

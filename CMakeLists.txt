@@ -41,6 +41,7 @@ add_executable(
   c2pancake
   src/Utils.cpp
   src/Pipeline.cpp
+  src/Pass_NormaliseIfStatements.cpp
   src/Pass_SwitchToIf.cpp
   src/Pass_LoopsToWhile.cpp
   src/Pass_PromoteRecords.cpp

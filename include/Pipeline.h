@@ -19,7 +19,6 @@
 #include <cassert>
 #include <memory>
 #include <string>
-#include <utility>
 
 namespace pancake {
 // This is what all passes should inherit from
