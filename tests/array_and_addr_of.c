@@ -49,9 +49,8 @@ void static_array(void) {
 /*  Case 5: static local with constant initialiser  */
 void static_const_init(void) {
   /* The initialiser is a compile-time constant → kept in the global decl */
-  static int threshold[4] = {10, 20, 30,
-                             40}; /* hoisted: static array, const init */
-  static int base = 100; /* hoisted: static, address taken, const init */
+  static int threshold[4] = {10, 20, 30, 40}; /* hoisted: static array, const init */
+  static int base = 100;                      /* hoisted: static, address taken, const init */
   int *bp = &base;
   for (int i = 0; i < 4; i++)
     printf("%d ", threshold[i] + *bp);
@@ -81,8 +80,7 @@ void nested(int n) {
 
 /*  Case 8: multi-dimensional array */
 void matrix(void) {
-  float mat[3][3] = {
-      {1.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f}, {0.0f, 0.0f, 1.0f}};
+  float mat[3][3] = {{1.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f}, {0.0f, 0.0f, 1.0f}};
   printf("%f\n", mat[1][1]);
 }
 
@@ -142,8 +140,7 @@ void array_of_structs(void) {
     int x;
     int y;
   };
-  struct S points[3] = {
-      {1, 2}, {3, 4}, {5, 6}}; /* hoisted: auto array of structs */
+  struct S points[3] = {{1, 2}, {3, 4}, {5, 6}}; /* hoisted: auto array of structs */
   for (int i = 0; i < 3; i++)
     printf("point %d: (%d, %d)\n", i, points[i].x, points[i].y);
 }
