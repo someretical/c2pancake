@@ -98,19 +98,34 @@ public:
     auto tmp_var_name = GetTempVarName("While");
     std::string replacement_text;
     llvm::raw_string_ostream os(replacement_text);
+    os << "while (1) {\n";
     os << llvm::formatv("int {0} = ({1});\n", tmp_var_name,
                         Lexer::getSourceText(CharSourceRange::getTokenRange(cond->getSourceRange()),
                                              data.Ctx.getSourceManager(), data.Ctx.getLangOpts())
                             .str());
-    os << llvm::formatv("while ({0}) ", tmp_var_name);
+    os << llvm::formatv("if (!{0}) break;\n", tmp_var_name);
 
-    // we just want to replace the "while (COND)" part
-    data.replacements.emplace_back(
-        data.Ctx.getSourceManager(),
-        CharSourceRange::getTokenRange(SourceRange(
-            whileStmt->getWhileLoc(),
-            Lexer::getLocForEndOfToken(cond->getEndLoc(), 0, data.Ctx.getSourceManager(), data.Ctx.getLangOpts()))),
-        os.str());
+    // fill in rest of the while body
+    auto *body = whileStmt->getBody();
+    if (const auto *compound_stmt = dyn_cast<CompoundStmt>(body)) {
+      for (const auto *stmt : compound_stmt->body()) {
+        os << Lexer::getSourceText(CharSourceRange::getTokenRange(stmt->getSourceRange()), data.Ctx.getSourceManager(),
+                                   data.Ctx.getLangOpts())
+                  .str()
+           << "\n";
+      }
+    } else {
+      os << Lexer::getSourceText(CharSourceRange::getTokenRange(body->getSourceRange()), data.Ctx.getSourceManager(),
+                                 data.Ctx.getLangOpts())
+                .str()
+         << "\n";
+    }
+
+    os << "}\n";
+
+    // we want to replace the entire while statement
+    data.replacements.emplace_back(data.Ctx.getSourceManager(),
+                                   CharSourceRange::getTokenRange(whileStmt->getSourceRange()), os.str());
 
     return true;
   }
