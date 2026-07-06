@@ -112,13 +112,13 @@ public:
         os << Lexer::getSourceText(CharSourceRange::getTokenRange(stmt->getSourceRange()), data.Ctx.getSourceManager(),
                                    data.Ctx.getLangOpts())
                   .str()
-           << "\n";
+           << ";\n";
       }
     } else {
       os << Lexer::getSourceText(CharSourceRange::getTokenRange(body->getSourceRange()), data.Ctx.getSourceManager(),
                                  data.Ctx.getLangOpts())
                 .str()
-         << "\n";
+         << ";\n";
     }
 
     os << "}\n";
@@ -181,62 +181,6 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
   }
 }
 } // namespace pancake::pass_hoist_condition_expressions
-
-namespace pancake::pass_transform_logical_expressions {
-namespace {
-struct WorkerData {
-  ASTContext &Ctx;
-  PipelineActionCtx &pa_ctx;
-  std::vector<Replacement> &replacements;
-  size_t if_cond_tmp_var_counter = 0;
-};
-
-class Worker : public RecursiveASTVisitor<Worker> {
-  struct WorkerData &data;
-
-public:
-  explicit Worker(struct WorkerData &data) : data(data) {}
-
-  // process all inner if statements first, then the outermost one
-  auto shouldTraversePostOrder() const -> bool { return false; }
-
-  auto GetIfCondTempVarName() -> auto {
-    return llvm::formatv("__c2pnk_if_cond_tmp_var_{0}_{1}_{2}", data.pa_ctx.major_pass_number,
-                         data.pa_ctx.minor_pass_number, data.if_cond_tmp_var_counter++);
-  }
-
-  auto ConvertIfStmt(IfStmt *ifStmt) -> void {}
-
-  auto VisitIfStmt(IfStmt *ifStmt) -> bool {
-    ConvertIfStmt(ifStmt);
-
-    return true;
-  }
-};
-} // namespace
-
-auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
-  std::vector<Replacement> replacements;
-  WorkerData data{.Ctx = Ctx, .pa_ctx = pa_ctx, .replacements = replacements};
-  Worker w(data);
-  w.TraverseDecl(Ctx.getTranslationUnitDecl());
-
-  bool add_error_occurred = false;
-  for (const auto &r : replacements) {
-    if (auto err = pa_ctx.replacements.add(r)) {
-      llvm::consumeError(std::move(err));
-      llvm::errs() << llvm::formatv("{0} Add replacement conflict, retrying next pass...\n", LogBegin(pa_ctx));
-      add_error_occurred = true;
-    }
-  }
-
-  pa_ctx.failure_mode = FailureMode::RepeatPass;
-  if (!add_error_occurred && replacements.empty()) {
-    // All edits successfully added; no need to repeat this pass
-    pa_ctx.failure_mode = FailureMode::Success;
-  }
-}
-} // namespace pancake::pass_transform_logical_expressions
 
 // TODO turn conditional operators into if statements FIRST
 namespace pancake::pass_lower_nested_expressions {
@@ -348,6 +292,47 @@ public:
                 .str());
         os << lhs_res.final_expr;
       }
+    } else if (auto *conditional_operator = dyn_cast<ConditionalOperator>(expr)) {
+      auto *cond = conditional_operator->getCond()->IgnoreParenImpCasts();
+      auto *lhs = conditional_operator->getTrueExpr()->IgnoreParenImpCasts();
+      auto *rhs = conditional_operator->getFalseExpr()->IgnoreParenImpCasts();
+
+      auto cond_res = BuildExpr(cond, depth + 1);
+      auto lhs_res = BuildExpr(lhs, depth + 1);
+      auto rhs_res = BuildExpr(rhs, depth + 1);
+
+      std::string tmp_var_name = GetTempVarName("TernaryResult");
+      std::string tmp_cond_name = GetTempVarName("TernaryCond");
+      std::string if_cond = llvm::formatv(
+          /*
+          0 = var for result of ?:
+          1 = condition bool pre stmts
+          2 = condition bool name
+          3 = condition bool final expr
+          4 = lhs pre stmts
+          5 = lhs final expr
+          6 = rhs pre stmts
+          7 = rhs final expr
+          8 = var for result of ?: (without type)
+          */
+          R"({0};
+{1}
+int {2} = {3};
+if ({2}) {
+  {4}
+  {8} = {5};
+} else {
+  {6}
+  {8} = {7};
+}
+)",
+          PrintType(conditional_operator->getType(), tmp_var_name),
+          llvm::join(cond_res.pre_stmts | std::views::reverse, "\n"), tmp_cond_name, cond_res.final_expr,
+          llvm::join(lhs_res.pre_stmts | std::views::reverse, "\n"), lhs_res.final_expr,
+          llvm::join(rhs_res.pre_stmts | std::views::reverse, "\n"), rhs_res.final_expr, tmp_var_name);
+
+      pre_stmts.push_back(if_cond);
+      os << tmp_var_name;
     } else if (auto *binary_operator = dyn_cast<BinaryOperator>(expr)) {
       auto *lhs = binary_operator->getLHS()->IgnoreParenImpCasts();
       auto *rhs = binary_operator->getRHS()->IgnoreParenImpCasts();

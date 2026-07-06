@@ -61,7 +61,6 @@ auto main(int argc, const char **argv) -> int {
   pipeline.AddPass<pass_switch_to_if::Action>();
   pipeline.AddPass<pass_normalise_if_statements::Action>();
   pipeline.AddPass<pass_hoist_condition_expressions::Action>();
-  pipeline.AddPass<pass_transform_logical_expressions::Action>();
   pipeline.AddPass<pass_lower_nested_expressions::Action>();
   // pipeline.AddPass<pass_promote_records::Action>();
   // pipeline.AddPass<pass_hoist_arrays_and_addresses::Action>();

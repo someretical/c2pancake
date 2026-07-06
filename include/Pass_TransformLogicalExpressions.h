@@ -25,26 +25,6 @@ public:
 } // namespace pancake::pass_hoist_condition_expressions
 
 /*
-turn all logical OR and ANDs into if-else statements if they have side effects
-*/
-namespace pancake::pass_transform_logical_expressions {
-class Consumer : public C2PancakePass {
-public:
-  using C2PancakePass::C2PancakePass; // inherit constructor
-  void HandleTranslationUnit(clang::ASTContext &Ctx) override;
-};
-
-class Action : public PipelineAction<Consumer> {
-public:
-  explicit Action(PipelineActionCtx &ctx) : PipelineAction<Consumer>(ctx) {
-    ctx.action_name = "TransformLogicalExpressions";
-    ctx.failure_behaviour = FailureBehaviour::RepeatPass;
-    ctx.action_type = PipelineActionType::Rewriter;
-  }
-};
-} // namespace pancake::pass_transform_logical_expressions
-
-/*
 Turn all nested expressions with side effects into temporary variables, so that all expressions are pure variable
 references
 */

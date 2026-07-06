@@ -41,6 +41,7 @@ add_executable(
   c2pancake
   src/Utils.cpp
   src/Pipeline.cpp
+  src/Pass_LowerBitfieldOps.cpp
   src/Pass_TransformLogicalExpressions.cpp
   src/Pass_NormaliseIfStatements.cpp
   src/Pass_SwitchToIf.cpp
