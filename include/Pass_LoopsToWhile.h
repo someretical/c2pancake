@@ -3,6 +3,23 @@
 
 #include "Pipeline.h"
 
+namespace pancake::pass_normalise_while_loops {
+class Consumer : public C2PancakePass {
+public:
+  using C2PancakePass::C2PancakePass; // inherit constructor
+  void HandleTranslationUnit(clang::ASTContext &Ctx) override;
+};
+
+class Action : public PipelineAction<Consumer> {
+public:
+  explicit Action(PipelineActionCtx &ctx) : PipelineAction<Consumer>(ctx) {
+    ctx.action_name = "NormaliseWhileLoops";
+    ctx.failure_behaviour = FailureBehaviour::RepeatPass;
+    ctx.action_type = PipelineActionType::Rewriter;
+  }
+};
+} // namespace pancake::pass_normalise_while_loops
+
 namespace pancake::pass_process_continue_in_for_loops {
 class Consumer : public C2PancakePass {
 public:

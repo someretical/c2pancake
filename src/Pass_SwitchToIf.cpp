@@ -581,6 +581,11 @@ public:
   }
 
   auto ConvertSwitchStmt(SwitchStmt *switchStmt) -> void {
+    auto &sm = data.Ctx.getSourceManager();
+    if (switchStmt == nullptr || sm.isInSystemHeader(sm.getSpellingLoc(switchStmt->getBeginLoc()))) {
+      return;
+    }
+
     auto *switch_body = dyn_cast<CompoundStmt>(switchStmt->getBody());
     if (switch_body == nullptr) {
       return;

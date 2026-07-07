@@ -1,6 +1,6 @@
-#include "Pass_CompoundAssignment.h"
 #include "Pass_HoistArraysAndAddresses.h"
 #include "Pass_LoopsToWhile.h"
+#include "Pass_LowerBitfieldOps.h"
 #include "Pass_NormaliseIfStatements.h"
 #include "Pass_PromoteRecords.h"
 #include "Pass_SwitchToIf.h"
@@ -52,6 +52,7 @@ auto main(int argc, const char **argv) -> int {
   };
   */
   Pipeline pipeline(*expected_parser);
+  pipeline.AddPass<pass_normalise_while_loops::Action>();
   pipeline.AddPass<pass_process_continue_in_for_loops::Action>();
   pipeline.AddPass<pass_for_to_while::Action>();
   pipeline.AddPass<pass_process_continue_in_do_while_loops::Action>();
@@ -62,37 +63,11 @@ auto main(int argc, const char **argv) -> int {
   pipeline.AddPass<pass_normalise_if_statements::Action>();
   pipeline.AddPass<pass_hoist_condition_expressions::Action>();
   pipeline.AddPass<pass_lower_nested_expressions::Action>();
+  pipeline.AddPass<pass_lower_arrow_accesses::Action>();
+  // pipeline.AddPass<pass_lower_bitfield_ops::Action>();
   // pipeline.AddPass<pass_promote_records::Action>();
   // pipeline.AddPass<pass_hoist_arrays_and_addresses::Action>();
-  // pipeline.AddPass<pass_compound_assignment::Action>();
   return pipeline.Run();
-
-  // hoist if-statement conditions with side effects to temporary variables
-  // hoist while-statement conditions with side effects to temporary variables
-  // hoist return statements with side effects to temporary variables
-
-  // logical operators can still occur in:
-  // assignment expressions, e.g. a = b && c;
-  // function call arguments, e.g. f(a && b);
-  // comma expressions
-  // array subscripts
-  // operands of other operators, e.g. a + (b && c)
-
-  // loop the following steps until no changes across all steps:
-  // - hoist array indices with side effects to temporary variable
-  // this can ONLY happen if the indexing happens at the top level of an assignment expression, e.g. a[b++] = c;
-  // - hoist array assignment ops RHS with side effects to temporary variables
-  // this can ONLY happen if the assignment happens at the top level of an assignment expression, e.g. a[b] = c++ + d;
-  // - hoist assignment ops RHS with side effects to temporary variables
-  // this can ONLY happen if the assignment happens at the top level of an assignment expression, e.g. a = b++ + c;
-  // - hoist function call arguments with side effects to temporary variables
-  // this can ONLY happen if the function call is at the top level of an assignment expression, e.g. f(a++, b++);
-  // - expand comma expressions into multiple statements
-  // this can ONLY happen if the comma expression is at the top level of an assignment expression, e.g. a = (b++, c++);
-  // - expand compound assignment operators into simple assignment operators with temp vars
-  // this can ONLY happen if the compound assignment is at the top level of an assignment expression, e.g. a += b;
-  // - expand logical operators into if statements with temp vars
-  // this can ONLY happen if the logical operator is at the top level of an assignment expression, e.g. a = b && c;
 
   return 0;
 }

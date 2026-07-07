@@ -12,9 +12,9 @@
 #include <clang/Tooling/CompilationDatabase.h>
 #include <clang/Tooling/Core/Replacement.h>
 #include <clang/Tooling/Tooling.h>
-#include <llvm-22/llvm/Support/FormatAdapters.h>
-#include <llvm-22/llvm/Support/FormatVariadic.h>
 #include <llvm/ADT/StringRef.h>
+#include <llvm/Support/FormatAdapters.h>
+#include <llvm/Support/FormatVariadic.h>
 
 #include <cassert>
 #include <memory>
@@ -27,10 +27,24 @@ protected:
   const clang::CompilerInstance &ci;
   std::string in_file;
   PipelineActionCtx &pa_ctx;
+  size_t tmp_var_counter = 0;
 
 public:
   explicit C2PancakePass(const clang::CompilerInstance &CI, llvm::StringRef in_file, PipelineActionCtx &pa_ctx)
       : ci(CI), in_file(in_file), pa_ctx(pa_ctx) {}
+
+  auto GetTempVarName(std::string hint) -> auto {
+    return llvm::formatv("__c2pnk_{0}_{1}_{2}_{3}", hint, pa_ctx.major_pass_number, pa_ctx.minor_pass_number,
+                         tmp_var_counter++);
+  }
+
+  static auto PrintType(clang::ASTContext &context, const clang::QualType ty, const llvm::StringRef var_name)
+      -> std::string {
+    std::string s;
+    llvm::raw_string_ostream os(s);
+    ty.print(os, context.getPrintingPolicy(), var_name);
+    return os.str();
+  }
 
   // children must implement HandleTranslationUnit
 };

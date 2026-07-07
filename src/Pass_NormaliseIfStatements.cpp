@@ -62,6 +62,11 @@ public:
   }
 
   auto ConvertIfStmt(IfStmt *ifStmt) -> void {
+    auto &sm = data.Ctx.getSourceManager();
+    if (ifStmt == nullptr || sm.isInSystemHeader(sm.getSpellingLoc(ifStmt->getBeginLoc()))) {
+      return;
+    }
+
     const auto *cond = ifStmt->getCond()->IgnoreParenImpCasts();
     const auto *then_stmt = ifStmt->getThen();
     const auto *else_stmt = ifStmt->getElse();
@@ -100,7 +105,6 @@ public:
                                                .str();
     const std::string cond_name = needs_cond_hoist ? GetIfCondTempVarName() : original_cond_text;
     if (needs_cond_hoist) {
-      os << "{\n";
       os << llvm::formatv("int {0} = ({1});\n", cond_name, original_cond_text);
     }
 
@@ -126,10 +130,6 @@ public:
                                    data.Ctx.getSourceManager(), data.Ctx.getLangOpts());
         os << "\n}";
       }
-    }
-
-    if (needs_cond_hoist) {
-      os << "\n}";
     }
 
     data.replacements.emplace_back(data.Ctx.getSourceManager(),

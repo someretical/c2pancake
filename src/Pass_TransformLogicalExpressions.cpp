@@ -89,47 +89,6 @@ public:
     return true;
   }
 
-  auto VisitWhileStmt(WhileStmt *whileStmt) -> bool {
-    const auto *cond = whileStmt->getCond()->IgnoreParenImpCasts();
-    if (!cond->HasSideEffects(data.Ctx)) {
-      return true;
-    }
-
-    auto tmp_var_name = GetTempVarName("While");
-    std::string replacement_text;
-    llvm::raw_string_ostream os(replacement_text);
-    os << "while (1) {\n";
-    os << llvm::formatv("int {0} = ({1});\n", tmp_var_name,
-                        Lexer::getSourceText(CharSourceRange::getTokenRange(cond->getSourceRange()),
-                                             data.Ctx.getSourceManager(), data.Ctx.getLangOpts())
-                            .str());
-    os << llvm::formatv("if (!{0}) break;\n", tmp_var_name);
-
-    // fill in rest of the while body
-    auto *body = whileStmt->getBody();
-    if (const auto *compound_stmt = dyn_cast<CompoundStmt>(body)) {
-      for (const auto *stmt : compound_stmt->body()) {
-        os << Lexer::getSourceText(CharSourceRange::getTokenRange(stmt->getSourceRange()), data.Ctx.getSourceManager(),
-                                   data.Ctx.getLangOpts())
-                  .str()
-           << ";\n";
-      }
-    } else {
-      os << Lexer::getSourceText(CharSourceRange::getTokenRange(body->getSourceRange()), data.Ctx.getSourceManager(),
-                                 data.Ctx.getLangOpts())
-                .str()
-         << ";\n";
-    }
-
-    os << "}\n";
-
-    // we want to replace the entire while statement
-    data.replacements.emplace_back(data.Ctx.getSourceManager(),
-                                   CharSourceRange::getTokenRange(whileStmt->getSourceRange()), os.str());
-
-    return true;
-  }
-
   auto VisitReturnStmt(ReturnStmt *returnStmt) -> bool {
     const auto *ret_expr = returnStmt->getRetValue();
     if (ret_expr == nullptr) {
@@ -182,7 +141,6 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
 }
 } // namespace pancake::pass_hoist_condition_expressions
 
-// TODO turn conditional operators into if statements FIRST
 namespace pancake::pass_lower_nested_expressions {
 namespace {
 struct WorkerData {
@@ -273,10 +231,7 @@ public:
       auto *rhs = compound_assign_operator->getRHS()->IgnoreParenImpCasts();
 
       auto rhs_res = BuildExpr(rhs, depth + 1);
-      pre_stmts.insert(pre_stmts.end(), rhs_res.pre_stmts.begin(), rhs_res.pre_stmts.end());
-
       auto lhs_res = BuildExpr(lhs, depth + 1);
-      pre_stmts.insert(pre_stmts.end(), lhs_res.pre_stmts.begin(), lhs_res.pre_stmts.end());
 
       if (depth == 0) {
         // semi-colon is added by the caller
@@ -292,6 +247,8 @@ public:
                 .str());
         os << lhs_res.final_expr;
       }
+      pre_stmts.insert(pre_stmts.end(), rhs_res.pre_stmts.begin(), rhs_res.pre_stmts.end());
+      pre_stmts.insert(pre_stmts.end(), lhs_res.pre_stmts.begin(), lhs_res.pre_stmts.end());
     } else if (auto *conditional_operator = dyn_cast<ConditionalOperator>(expr)) {
       auto *cond = conditional_operator->getCond()->IgnoreParenImpCasts();
       auto *lhs = conditional_operator->getTrueExpr()->IgnoreParenImpCasts();
@@ -405,9 +362,7 @@ if ({2}) {
 
       case BO_Assign: {
         auto rhs_res = BuildExpr(rhs, depth + 1);
-        pre_stmts.insert(pre_stmts.end(), rhs_res.pre_stmts.begin(), rhs_res.pre_stmts.end());
         auto lhs_res = BuildExpr(lhs, depth + 1);
-        pre_stmts.insert(pre_stmts.end(), lhs_res.pre_stmts.begin(), lhs_res.pre_stmts.end());
 
         if (depth == 0) {
           // semi-colon is added by the caller
@@ -418,6 +373,9 @@ if ({2}) {
           os << lhs_res.final_expr;
         }
 
+        pre_stmts.insert(pre_stmts.end(), rhs_res.pre_stmts.begin(), rhs_res.pre_stmts.end());
+        pre_stmts.insert(pre_stmts.end(), lhs_res.pre_stmts.begin(), lhs_res.pre_stmts.end());
+
         break;
       }
 
@@ -426,8 +384,8 @@ if ({2}) {
         // RHS is returned
 
         auto rhs_res = BuildExpr(rhs, depth + 1);
-        pre_stmts.insert(pre_stmts.end(), rhs_res.pre_stmts.begin(), rhs_res.pre_stmts.end());
         auto lhs_res = BuildExpr(lhs, depth + 1);
+        pre_stmts.insert(pre_stmts.end(), rhs_res.pre_stmts.begin(), rhs_res.pre_stmts.end());
         pre_stmts.insert(pre_stmts.end(), lhs_res.pre_stmts.begin(), lhs_res.pre_stmts.end());
 
         os << rhs_res.final_expr;
@@ -466,8 +424,8 @@ if ({2}) {
         [[fallthrough]];
       case BO_Or: {
         auto rhs_res = BuildExpr(rhs, depth + 1);
-        pre_stmts.insert(pre_stmts.end(), rhs_res.pre_stmts.begin(), rhs_res.pre_stmts.end());
         auto lhs_res = BuildExpr(lhs, depth + 1);
+        pre_stmts.insert(pre_stmts.end(), rhs_res.pre_stmts.begin(), rhs_res.pre_stmts.end());
         pre_stmts.insert(pre_stmts.end(), lhs_res.pre_stmts.begin(), lhs_res.pre_stmts.end());
 
         // recursion level doesn't matter
@@ -484,7 +442,6 @@ if ({2}) {
     } else if (auto *unary_operator = dyn_cast<UnaryOperator>(expr)) {
       auto *sub_expr = unary_operator->getSubExpr()->IgnoreParenImpCasts();
       auto res = BuildExpr(sub_expr, depth + 1);
-      pre_stmts.insert(pre_stmts.end(), res.pre_stmts.begin(), res.pre_stmts.end());
 
       switch (unary_operator->getOpcode()) {
       case UO_PostInc:
@@ -548,13 +505,12 @@ if ({2}) {
         break;
       }
       }
+
+      pre_stmts.insert(pre_stmts.end(), res.pre_stmts.begin(), res.pre_stmts.end());
     } else if (auto *call_expr = dyn_cast<CallExpr>(expr)) {
       llvm::SmallVector<BuiltExpr, 4> arg_built_exprs;
       for (auto *arg : call_expr->arguments()) {
         arg_built_exprs.push_back(BuildExpr(arg, depth + 1));
-      }
-      for (auto &&built_expr : arg_built_exprs | std::views::reverse) {
-        pre_stmts.insert(pre_stmts.end(), built_expr.pre_stmts.begin(), built_expr.pre_stmts.end());
       }
       // TODO
       // it's possible for getDirectCallee to return nullptr, but I don't know what to do in that case...
@@ -563,6 +519,9 @@ if ({2}) {
                                        return e.final_expr;
                                      }),
                                      ", "));
+      for (auto &&built_expr : arg_built_exprs | std::views::reverse) {
+        pre_stmts.insert(pre_stmts.end(), built_expr.pre_stmts.begin(), built_expr.pre_stmts.end());
+      }
     } else if (auto *array_subscript_expr = dyn_cast<ArraySubscriptExpr>(expr)) {
       auto *idx = array_subscript_expr->getIdx();
       auto *base = array_subscript_expr->getBase();
@@ -585,7 +544,8 @@ if ({2}) {
   }
 
   auto TraverseDeclStmt(DeclStmt *declStmt) -> bool {
-    if (declStmt == nullptr || data.Ctx.getSourceManager().isInSystemHeader(declStmt->getBeginLoc())) {
+    auto &sm = data.Ctx.getSourceManager();
+    if (declStmt == nullptr || sm.isInSystemHeader(sm.getSpellingLoc(declStmt->getBeginLoc()))) {
       return true;
     }
 
@@ -618,7 +578,8 @@ if ({2}) {
   }
 
   auto TraverseStmt(Stmt *stmt) -> bool {
-    if (stmt == nullptr || data.Ctx.getSourceManager().isInSystemHeader(stmt->getBeginLoc())) {
+    auto &sm = data.Ctx.getSourceManager();
+    if (stmt == nullptr || sm.isInSystemHeader(sm.getSpellingLoc(stmt->getBeginLoc()))) {
       return true;
     }
 

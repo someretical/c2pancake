@@ -1,8 +1,9 @@
 #include "Pipeline.h"
 
 #include <clang/Tooling/Core/Replacement.h>
-#include <llvm-22/llvm/Support/raw_ostream.h>
 #include <llvm/Support/ErrorHandling.h>
+#include <llvm/Support/raw_ostream.h>
+
 #include <string>
 
 using namespace pancake;

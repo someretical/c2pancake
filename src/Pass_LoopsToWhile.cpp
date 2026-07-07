@@ -30,6 +30,69 @@ using namespace clang::ast_matchers;
 using namespace clang::transformer;
 using namespace clang::tooling;
 
+namespace pancake::pass_normalise_while_loops {
+namespace {
+const std::string while_bind = "while_stmt";
+const std::string cond_bind = "while_cond";
+const std::string body_bind = "while_body";
+
+auto MakeRule() -> RewriteRule {
+  /*
+  Moves while loop conditions into the body of the loop
+  */
+  return applyFirst(
+      {makeRule(whileStmt(anyOf(hasCondition(expr().bind(cond_bind)), anything()),
+                          hasBody(compoundStmt(
+                                      // Bind the body as a compoundStmt so statements() can extract its interior.
+                                      anything())
+                                      .bind(body_bind)))
+                    .bind(while_bind),
+                changeTo(node(while_bind),
+                         cat("while (1) {\n", statements(body_bind), "\nif (!(", node(cond_bind), ")) break;", "\n}"))),
+       makeRule(whileStmt(anyOf(hasCondition(expr().bind(cond_bind)), anything()),
+                          hasBody(
+                              // Exclude compoundStmt so Case A takes priority in applyFirst.
+                              stmt(unless(compoundStmt())).bind(body_bind)))
+                    .bind(while_bind),
+                changeTo(node(while_bind),
+                         cat("while (1) {\n", node(body_bind), ";\nif (!(", node(cond_bind), ")) break;", "\n}")))}
+
+  );
+}
+} // namespace
+
+auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
+  std::vector<AtomicChange> changes;
+  auto t = Transformer(MakeRule(), [&changes](llvm::Expected<llvm::MutableArrayRef<AtomicChange>> c) -> void {
+    if (c)
+      changes.insert(changes.end(), c->begin(), c->end());
+    else
+      llvm::consumeError(c.takeError());
+  });
+
+  MatchFinder finder;
+  t.registerMatchers(&finder);
+  finder.matchAST(Ctx);
+
+  bool add_error_occurred = false;
+  for (const auto &change : changes) {
+    for (const auto &r : change.getReplacements()) {
+      if (auto err = pa_ctx.replacements.add(r)) {
+        llvm::consumeError(std::move(err));
+        llvm::errs() << llvm::formatv("{0} Add replacement conflict, retrying next pass...\n", LogBegin(pa_ctx));
+        add_error_occurred = true;
+      }
+    }
+  }
+
+  pa_ctx.failure_mode = FailureMode::RepeatPass;
+  if (!add_error_occurred && changes.empty()) {
+    // All edits successfully added; no need to repeat this pass
+    pa_ctx.failure_mode = FailureMode::Success;
+  }
+}
+} // namespace pancake::pass_normalise_while_loops
+
 namespace pancake::pass_process_continue_in_for_loops {
 namespace {
 auto IsContinueDirectlyInsideFor(const ContinueStmt *CS, const ForStmt *FS, ASTContext &Ctx) {
@@ -312,14 +375,24 @@ auto MakeRule() -> RewriteRule {
     }
   }
   */
-  return makeRule(
-      doStmt(anyOf(hasCondition(expr().bind(cond_bind)), anything()),
+  return applyFirst(
+      {makeRule(doStmt(anyOf(hasCondition(expr().bind(cond_bind)), anything()),
+                       hasBody(compoundStmt(
+                                   // Bind the body as a compoundStmt so statements() can extract its interior.
+                                   anything())
+                                   .bind(body_bind)))
+                    .bind(do_bind),
+                changeTo(node(do_bind),
+                         cat("while (1) {\n", statements(body_bind), "\nif (!(", node(cond_bind), ")) break;", "\n}"))),
+       makeRule(doStmt(anyOf(hasCondition(expr().bind(cond_bind)), anything()),
+                       hasBody(
+                           // Exclude compoundStmt so Case A takes priority in applyFirst.
+                           stmt(unless(compoundStmt())).bind(body_bind)))
+                    .bind(do_bind),
+                changeTo(node(do_bind),
+                         cat("while (1) {\n", node(body_bind), ";\nif (!(", node(cond_bind), ")) break;", "\n}")))}
 
-             hasBody(
-                 // Exclude compoundStmt so Case A takes priority in applyFirst.
-                 stmt().bind(body_bind)))
-          .bind(do_bind),
-      changeTo(node(do_bind), cat("while (1) {\n", node(body_bind), "if (!(", node(cond_bind), ")) break;", "\n}")));
+  );
 }
 } // namespace
 
