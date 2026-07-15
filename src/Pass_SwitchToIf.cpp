@@ -449,7 +449,8 @@ public:
     // get range between {} of switch body
     const auto range =
         CharSourceRange::getCharRange(switch_body->getLBracLoc().getLocWithOffset(1), switch_body->getRBracLoc());
-    data.replacements.emplace_back(data.Ctx.getSourceManager(), range, os.str(), data.Ctx.getLangOpts());
+    os.flush();
+    data.replacements.emplace_back(data.Ctx.getSourceManager(), range, new_body, data.Ctx.getLangOpts());
   }
 
   auto VisitSwitchStmt(SwitchStmt *switchStmt) -> bool {
@@ -695,8 +696,9 @@ public:
       }
     }
 
+    os.flush();
     data.replacements.emplace_back(data.Ctx.getSourceManager(),
-                                   CharSourceRange::getTokenRange(switchStmt->getSourceRange()), os.str(),
+                                   CharSourceRange::getTokenRange(switchStmt->getSourceRange()), converted,
                                    data.Ctx.getLangOpts());
   }
 

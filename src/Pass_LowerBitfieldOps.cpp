@@ -1,5 +1,11 @@
 #include "Pass_LowerBitfieldOps.h"
 
+#include "third_party/Address.h"
+#include "third_party/CGRecordLayout.h"
+#include "third_party/CodeGenFunction.h"
+#include "third_party/CodeGenModule.h"
+#include "third_party/CodeGenTypes.h"
+
 #include <clang/AST/ASTConsumer.h>
 #include <clang/AST/ASTContext.h>
 #include <clang/AST/Expr.h>
@@ -334,7 +340,8 @@ public:
     os.flush();
     if (!replacement_text.empty()) {
       data.replacements.emplace_back(data.Ctx.getSourceManager(),
-                                     CharSourceRange::getTokenRange(declStmt->getSourceRange()), replacement_text);
+                                     CharSourceRange::getTokenRange(declStmt->getSourceRange()), replacement_text,
+                                     data.Ctx.getLangOpts());
       return true;
     }
 
@@ -359,7 +366,8 @@ public:
 
       if (!replacement_text.empty()) {
         data.replacements.emplace_back(data.Ctx.getSourceManager(),
-                                       CharSourceRange::getTokenRange(stmt->getSourceRange()), os.str());
+                                       CharSourceRange::getTokenRange(stmt->getSourceRange()), replacement_text,
+                                       data.Ctx.getLangOpts());
       }
       return true;
     }
@@ -396,6 +404,7 @@ namespace pancake::pass_lower_bitfield_ops {
 namespace {
 struct WorkerData {
   ASTContext &Ctx;
+  CodeGen::CodeGenModule &code_gen_module;
   PipelineActionCtx &pa_ctx;
   std::vector<Replacement> &replacements;
   size_t tmp_var_counter = 0;
@@ -419,8 +428,59 @@ public:
     return os.str();
   }
 
+  static auto GetIntTypeName(unsigned bit_width, bool is_signed) -> std::string {
+    const char *prefix = is_signed ? "int" : "uint";
+    unsigned width = bit_width <= 8 ? 8 : bit_width <= 16 ? 16 : bit_width <= 32 ? 32 : 64;
+    return llvm::formatv("{0}{1}_t", prefix, width).str();
+  }
+
+  static auto FormatAPIntHex(const llvm::APInt &ap_int) -> std::string {
+    llvm::SmallString<32> small_str;
+    ap_int.toString(small_str, 16, false, true);
+    return small_str.str().str();
+  }
+
+  static auto IsAAPCS(const TargetInfo &targetInfo) -> bool { return targetInfo.getABI().starts_with("aapcs"); }
+
+  auto IsRead(const MemberExpr *member_expr) -> bool {
+    const Stmt *stmt = member_expr;
+    while (true) {
+      auto parents = data.Ctx.getParents(*stmt);
+      if (parents.empty())
+        return false;
+
+      const auto *implicit_cast = parents[0].get<ImplicitCastExpr>();
+      if (implicit_cast == nullptr)
+        return false;
+
+      switch (implicit_cast->getCastKind()) {
+      case CK_LValueToRValue: {
+        return true;
+      }
+
+      /*
+      A CK_NoOp cast (qualification adjustment e.g., adding/dropping const/volatile on an lvalue, or a no-op cast to
+      an equivalent type) can sit between the MemberExpr and the LValueToRValue cast.
+
+      However, when a loaded value undergoes further conversion (integer promotion, usual arithmetic conversion, pointer
+      decay of the result, etc.), those additional ImplicitCastExpr nodes wrap around the LValueToRValue cast so it's
+      not a problem in this case.
+      */
+      case CK_NoOp: {
+        stmt = implicit_cast;
+        continue; // keep climbing
+      }
+
+      default: {
+        return false; // ArrayToPointerDecay, etc.
+      }
+      }
+    }
+  }
+
   struct BuiltExpr {
     llvm::SmallVector<std::string, 4> pre_stmts;
+    llvm::SmallVector<std::string, 4> post_stmts;
     std::string final_expr;
     QualType final_expr_type;
   };
@@ -429,10 +489,105 @@ public:
     size_t depth = 0;
   };
 
+  // Equivalent to
+  // https://clang.llvm.org/doxygen/classclang_1_1CodeGen_1_1CodeGenFunction.html#abce29203390acfa7bfcda7d0c9101629
+  auto BuildLoadOfBitFieldLValue(const MemberExpr *member_expr, const BuiltExprCtx &ctx) -> BuiltExpr {
+    const FieldDecl *fd = cast<FieldDecl>(member_expr->getMemberDecl());
+    assert(fd->isBitField());
+
+    const CodeGen::CGBitFieldInfo &info =
+        data.code_gen_module.getTypes().getCGRecordLayout(fd->getParent()).getBitFieldInfo(fd);
+
+    QualType ft = member_expr->getType();
+
+    // Build the base object subexpression (e.g. "s" for s.field, or the pointer expression for p->field)
+    BuiltExpr base_built_expr = BuildExpr(member_expr->getBase(), {.depth = ctx.depth + 1});
+
+    llvm::SmallVector<std::string, 4> pre_stmts;
+    // pre_stmts.insert(pre_stmts.end(), base_built_expr.pre_stmts.begin(), base_built_expr.pre_stmts.end());
+
+    std::string base_addr =
+        member_expr->isArrow() ? base_built_expr.final_expr : llvm::formatv("(&{0})", base_built_expr.final_expr);
+
+    const auto is_volatile = ft.isVolatileQualified();
+    const auto use_volatile =
+        is_volatile && info.VolatileStorageSize != 0 && IsAAPCS(data.code_gen_module.getTypes().getTarget());
+
+    const auto offset = use_volatile ? info.VolatileOffset : info.Offset;
+    const auto storage_size = use_volatile ? info.VolatileStorageSize : info.StorageSize;
+    const auto storage_offset = use_volatile ? info.VolatileStorageOffset : info.StorageOffset;
+
+    // Compute the storage-unit pointer, equivalent to LV.getBitFieldAddress()
+    std::string storage_type_name = GetIntTypeName(storage_size, false);
+    auto storage_ptr =
+        llvm::formatv("(({0} *)((char *){1} + {2}))", storage_type_name, base_addr, storage_offset.getQuantity());
+
+    std::string load_temp = GetTempVarName("bf_load");
+    pre_stmts.push_back(llvm::formatv("{0} {1} {2} = *{3};", is_volatile ? "volatile " : "", storage_type_name,
+                                      load_temp, storage_ptr));
+    std::string current_temp = load_temp;
+
+    if (info.IsSigned) {
+      assert(static_cast<unsigned>(offset + info.Size) <= storage_size);
+      unsigned high_bits = storage_size - offset - info.Size;
+      std::string signed_type_name = GetIntTypeName(storage_size, true);
+
+      // Reinterpret as signed before shifting, so ">>" is an arithmetic shift
+      // (mirrors CreateShl/CreateAShr operating on a signed value).
+      std::string signed_temp = GetTempVarName("bf_signed");
+      pre_stmts.push_back(llvm::formatv("{0} {1} = ({0}){2};", signed_type_name, signed_temp, current_temp));
+      current_temp = signed_temp;
+
+      // Val = Builder.CreateShl(Val, HighBits, "bf.shl");
+      if (high_bits != 0U) {
+        std::string shl_temp = GetTempVarName("bf_shl");
+        pre_stmts.push_back(
+            llvm::formatv("{0} {1} = {2} << {3};", signed_type_name, shl_temp, current_temp, high_bits));
+        current_temp = shl_temp;
+      }
+      // Val = Builder.CreateAShr(Val, Offset + HighBits, "bf.ashr");
+      if (offset + high_bits != 0U) {
+        std::string ashr_temp = GetTempVarName("bf_ashr");
+        pre_stmts.push_back(
+            llvm::formatv("{0} {1} = {2} >> {3};", signed_type_name, ashr_temp, current_temp, offset + high_bits));
+        current_temp = ashr_temp;
+      }
+    } else {
+      // Val = Builder.CreateLShr(Val, Offset, "bf.lshr");
+      if (offset != 0U) {
+        std::string lshr_temp = GetTempVarName("bf_lshr");
+        pre_stmts.push_back(llvm::formatv("{0} {1} = {2} >> {3};", storage_type_name, lshr_temp, current_temp, offset));
+        current_temp = lshr_temp;
+      }
+      // Val = Builder.CreateAnd(Val, getLowBitsSet(StorageSize, Size), "bf.clear");
+      if (static_cast<unsigned>(offset) + info.Size < storage_size) {
+        llvm::APInt mask = llvm::APInt::getLowBitsSet(storage_size, info.Size);
+        std::string clear_temp = GetTempVarName("bf_clear");
+        pre_stmts.push_back(
+            llvm::formatv("{0} {1} = {2} & {3};", storage_type_name, clear_temp, current_temp, FormatAPIntHex(mask)));
+        current_temp = clear_temp;
+      }
+    }
+
+    // Val = Builder.CreateIntCast(Val, ResLTy, IsSigned, "bf.cast");
+    std::string result_type_name = ft.getAsString();
+    std::string cast_temp = GetTempVarName("bf_cast");
+    pre_stmts.push_back(
+        llvm::formatv("{0} {1} = ({2}){3};", result_type_name, cast_temp, result_type_name, current_temp));
+
+    auto final_pre_stmts = pre_stmts | std::views::reverse | std::ranges::to<llvm::SmallVector<std::string, 4>>();
+    final_pre_stmts.insert(final_pre_stmts.end(), base_built_expr.pre_stmts.begin(), base_built_expr.pre_stmts.end());
+    return {.pre_stmts = std::move(final_pre_stmts),
+            .post_stmts = std::move(base_built_expr.post_stmts),
+            .final_expr = cast_temp,
+            .final_expr_type = ft};
+  }
+
   auto BuildExpr(Expr *expr, const BuiltExprCtx ctx) -> BuiltExpr {
     expr = expr->IgnoreParenImpCasts();
 
     llvm::SmallVector<std::string, 4> pre_stmts;
+    llvm::SmallVector<std::string, 4> post_stmts;
     std::string replacement_text;
     llvm::raw_string_ostream os(replacement_text);
     QualType final_expr_type = expr->getType();
@@ -460,6 +615,9 @@ public:
       case BO_Assign: {
         auto rhs_res = BuildExpr(rhs, {.depth = ctx.depth + 1});
         auto lhs_res = BuildExpr(lhs, {.depth = ctx.depth + 1});
+
+        post_stmts.insert(post_stmts.end(), rhs_res.post_stmts.begin(), rhs_res.post_stmts.end());
+        post_stmts.insert(post_stmts.end(), lhs_res.post_stmts.begin(), lhs_res.post_stmts.end());
 
         if (ctx.depth == 0) {
           // semi-colon is added by the caller
@@ -530,6 +688,8 @@ public:
       auto *sub_expr = unary_operator->getSubExpr()->IgnoreParenImpCasts();
       auto res = BuildExpr(sub_expr, {.depth = ctx.depth + 1});
 
+      post_stmts.insert(post_stmts.end(), res.post_stmts.begin(), res.post_stmts.end());
+
       switch (unary_operator->getOpcode()) {
       case UO_AddrOf:
         [[fallthrough]];
@@ -572,6 +732,7 @@ public:
                                      }),
                                      ", "));
       for (auto &&built_expr : arg_built_exprs | std::views::reverse) {
+        post_stmts.insert(post_stmts.end(), built_expr.post_stmts.begin(), built_expr.post_stmts.end());
         pre_stmts.insert(pre_stmts.end(), built_expr.pre_stmts.begin(), built_expr.pre_stmts.end());
       }
     } else if (auto *array_subscript_expr = dyn_cast<ArraySubscriptExpr>(expr)) {
@@ -579,56 +740,23 @@ public:
       auto *base = array_subscript_expr->getBase();
 
       auto res = BuildExpr(idx, {.depth = ctx.depth + 1});
+      post_stmts.insert(post_stmts.end(), res.post_stmts.begin(), res.post_stmts.end());
       os << llvm::formatv("{0}[{1}]",
                           Lexer::getSourceText(CharSourceRange::getTokenRange(base->getSourceRange()),
                                                data.Ctx.getSourceManager(), data.Ctx.getLangOpts()),
                           res.final_expr);
       pre_stmts.insert(pre_stmts.end(), res.pre_stmts.begin(), res.pre_stmts.end());
     } else if (auto *member_expr = dyn_cast<MemberExpr>(expr)) {
-      if (auto *field_decl = llvm::dyn_cast<clang::FieldDecl>(member_expr->getMemberDecl())) {
-        auto *record = field_decl->getParent();
-        const auto &layout = data.Ctx.getASTRecordLayout(record);
-
-        if (field_decl->isBitField()) {
-          // check if field_decl is spread across word boundaries
-          const auto bit_offset = layout.getFieldOffset(field_decl->getFieldIndex());
-          const auto width = field_decl->getBitWidthValue();
-          const auto type = field_decl->getType();
-          const auto base_bits = data.Ctx.getTypeSize(type);
-
-          // compute allocation units
-          const auto first_unit = bit_offset / base_bits;
-          const auto last_unit = (bit_offset + width - 1) / base_bits;
-          const bool crosses_allocation_units = first_unit != last_unit;
-
-          if (member_expr->isLValue()) {
-            std::string tmp_var_name = GetTempVarName("BitfieldWrite");
-            if (crosses_allocation_units) {
-              std::string expanded = llvm::formatv(
-                  /*
-                  0 = low mask
-                  1 = high mask
-                  2
-                  */
-                  R"(
-  )");
-            } else {
-            }
-
-            pre_stmts.push_back(
-                llvm::formatv("{0} = {1};", PrintType(final_expr_type, tmp_var_name),
-                              Lexer::getSourceText(CharSourceRange::getTokenRange(member_expr->getSourceRange()),
-                                                   data.Ctx.getSourceManager(), data.Ctx.getLangOpts()))
-                    .str());
-          } else {
-            std::string tmp_var_name = GetTempVarName("BitfieldRead");
-            pre_stmts.push_back(
-                llvm::formatv("{0} = {1};", PrintType(final_expr_type, tmp_var_name),
-                              Lexer::getSourceText(CharSourceRange::getTokenRange(member_expr->getSourceRange()),
-                                                   data.Ctx.getSourceManager(), data.Ctx.getLangOpts()))
-                    .str());
+      // writes are handled by the assignment operator
+      if (IsRead(member_expr)) {
+        if (auto *field_decl = llvm::dyn_cast<clang::FieldDecl>(member_expr->getMemberDecl())) {
+          if (field_decl->isBitField()) {
+            auto res = BuildLoadOfBitFieldLValue(member_expr, {.depth = ctx.depth + 1});
+            post_stmts.insert(post_stmts.end(), res.post_stmts.begin(), res.post_stmts.end());
+            pre_stmts.insert(pre_stmts.end(), res.pre_stmts.begin(), res.pre_stmts.end());
+            os << res.final_expr;
+            goto build_expr_end;
           }
-          goto build_expr_end;
         }
       }
       goto build_expr_else;
@@ -641,6 +769,7 @@ public:
   build_expr_end:
     os.flush();
     return {.pre_stmts = std::move(pre_stmts),
+            .post_stmts = std::move(post_stmts),
             .final_expr = std::move(replacement_text),
             .final_expr_type = final_expr_type};
   }
@@ -661,17 +790,18 @@ public:
           continue;
         }
 
-        auto res =
-            BuildExpr(init_expr->IgnoreParenImpCasts(), {.depth = 0, .encountered_top_most_arrow_access = false});
+        auto res = BuildExpr(init_expr->IgnoreParenImpCasts(), {.depth = 0});
         os << llvm::join(res.pre_stmts | std::views::reverse, "\n");
         os << llvm::formatv("{0} = {1};", PrintType(var_decl->getType(), var_decl->getName()), res.final_expr);
+        os << llvm::join(res.post_stmts | std::views::reverse, "\n");
       }
     }
 
     os.flush();
     if (!replacement_text.empty()) {
       data.replacements.emplace_back(data.Ctx.getSourceManager(),
-                                     CharSourceRange::getTokenRange(declStmt->getSourceRange()), replacement_text);
+                                     CharSourceRange::getTokenRange(declStmt->getSourceRange()), replacement_text,
+                                     data.Ctx.getLangOpts());
       return true;
     }
 
@@ -688,15 +818,17 @@ public:
 
       std::string replacement_text;
       llvm::raw_string_ostream os(replacement_text);
-      auto res = BuildExpr(expr, {.depth = 0, .encountered_top_most_arrow_access = false});
+      auto res = BuildExpr(expr, {.depth = 0});
       os << llvm::join(res.pre_stmts | std::views::reverse, "\n");
       // for some reason we don't need a ; after this...
       os << llvm::formatv("{0}", res.final_expr);
+      os << llvm::join(res.post_stmts | std::views::reverse, "\n");
       os.flush();
 
       if (!replacement_text.empty()) {
         data.replacements.emplace_back(data.Ctx.getSourceManager(),
-                                       CharSourceRange::getTokenRange(stmt->getSourceRange()), os.str());
+                                       CharSourceRange::getTokenRange(stmt->getSourceRange()), replacement_text,
+                                       data.Ctx.getLangOpts());
       }
       return true;
     }
@@ -707,8 +839,20 @@ public:
 } // namespace
 
 auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
+  // this code is incredibly fucked...
+  // the codegen stuff in clang is all considered "private" and not part of the public clang C++ API
+  // but the headers can just be downloaded and included anyway
+  // all the compiled object code is available already...
+  // this means these headers are incredibly brittle :skull:
+  CodeGenOptions code_gen_options;
+  llvm::LLVMContext llvm_ctx;
+  auto layout_probe = std::make_unique<llvm::Module>("layout_probe", llvm_ctx);
+  CodeGen::CodeGenModule code_gen_module(Ctx, ci.getVirtualFileSystemPtr(), ci.getHeaderSearchOpts(),
+                                         ci.getPreprocessorOpts(), code_gen_options, *layout_probe,
+                                         ci.getDiagnostics());
+
   std::vector<Replacement> replacements;
-  WorkerData data{.Ctx = Ctx, .pa_ctx = pa_ctx, .replacements = replacements};
+  WorkerData data{.Ctx = Ctx, .code_gen_module = code_gen_module, .pa_ctx = pa_ctx, .replacements = replacements};
   Worker w(data);
   w.TraverseDecl(Ctx.getTranslationUnitDecl());
 

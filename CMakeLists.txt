@@ -126,6 +126,7 @@ target_link_libraries(
           clangTransformer
           clangASTMatchers
           clangAST
+          clangCodeGen
           clangRewrite
           clangFrontend
           clangFormat

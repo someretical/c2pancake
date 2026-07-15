@@ -10,8 +10,9 @@
             "name": "Debug c2pancake",
             "program": "${command:cmake.launchTargetPath}",
             "args": [
-                "tests/struct_stab.c",
-                "--"
+                "tests/bitfield.c",
+                "--",
+                "-std=c23",
             ],
             "cwd": "${workspaceFolder}",
             "console": "integratedTerminal"

@@ -29,7 +29,7 @@ Checks: >
 
 WarningsAsErrors: '*'
 SystemHeaders: false
-HeaderFilterRegex: '^(clang|llvm)/.*'
+HeaderFilterRegex: '^(clang|llvm|third_party)/.*'
 
 CheckOptions:
   - key:             readability-identifier-naming.VariableCase

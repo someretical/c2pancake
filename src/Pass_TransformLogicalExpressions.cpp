@@ -79,12 +79,13 @@ public:
     os << llvm::formatv("if ({0}) ", tmp_var_name);
 
     // we just want to replace the "if (COND)" part
+    os.flush();
     data.replacements.emplace_back(
         data.Ctx.getSourceManager(),
         CharSourceRange::getTokenRange(SourceRange(
             ifStmt->getIfLoc(),
             Lexer::getLocForEndOfToken(cond->getEndLoc(), 0, data.Ctx.getSourceManager(), data.Ctx.getLangOpts()))),
-        os.str());
+        replacement_text, data.Ctx.getLangOpts());
 
     return true;
   }
@@ -110,8 +111,10 @@ public:
     os << llvm::formatv("return {0};", tmp_var_name);
 
     // we want to replace the "return EXPR;" part
+    os.flush();
     data.replacements.emplace_back(data.Ctx.getSourceManager(),
-                                   CharSourceRange::getTokenRange(returnStmt->getSourceRange()), os.str());
+                                   CharSourceRange::getTokenRange(returnStmt->getSourceRange()), replacement_text,
+                                   data.Ctx.getLangOpts());
 
     return true;
   }
@@ -570,7 +573,8 @@ if ({2}) {
     os.flush();
     if (!replacement_text.empty()) {
       data.replacements.emplace_back(data.Ctx.getSourceManager(),
-                                     CharSourceRange::getTokenRange(declStmt->getSourceRange()), replacement_text);
+                                     CharSourceRange::getTokenRange(declStmt->getSourceRange()), replacement_text,
+                                     data.Ctx.getLangOpts());
       return true;
     }
 
@@ -596,7 +600,8 @@ if ({2}) {
 
       if (!replacement_text.empty()) {
         data.replacements.emplace_back(data.Ctx.getSourceManager(),
-                                       CharSourceRange::getTokenRange(stmt->getSourceRange()), os.str());
+                                       CharSourceRange::getTokenRange(stmt->getSourceRange()), replacement_text,
+                                       data.Ctx.getLangOpts());
       }
       return true;
     }

@@ -61,15 +61,28 @@ public:
                          data.pa_ctx.minor_pass_number, data.if_cond_tmp_var_counter++);
   }
 
-  auto ConvertIfStmt(IfStmt *ifStmt) -> void {
+  auto IsPartOfElseIfChain(const IfStmt *if_stmt) -> bool {
+    const auto &parents = data.Ctx.getParents(*if_stmt);
+    if (parents.empty())
+      return false;
+
+    if (const auto *parent_if = parents[0].get<clang::IfStmt>()) {
+      if (parent_if->getElse() == if_stmt) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  auto ConvertIfStmt(IfStmt *if_stmt) -> void {
     auto &sm = data.Ctx.getSourceManager();
-    if (ifStmt == nullptr || sm.isInSystemHeader(sm.getSpellingLoc(ifStmt->getBeginLoc()))) {
+    if (if_stmt == nullptr || sm.isInSystemHeader(sm.getSpellingLoc(if_stmt->getBeginLoc()))) {
       return;
     }
 
-    const auto *cond = ifStmt->getCond()->IgnoreParenImpCasts();
-    const auto *then_stmt = ifStmt->getThen();
-    const auto *else_stmt = ifStmt->getElse();
+    const auto *cond = if_stmt->getCond()->IgnoreParenImpCasts();
+    const auto *then_stmt = if_stmt->getThen();
+    const auto *else_stmt = if_stmt->getElse();
 
     bool needs_rewrite = true;
     bool needs_cond_hoist = false;
@@ -104,6 +117,12 @@ public:
                                                                 data.Ctx.getSourceManager(), data.Ctx.getLangOpts())
                                                .str();
     const std::string cond_name = needs_cond_hoist ? GetIfCondTempVarName() : original_cond_text;
+
+    // if this if-statement is part of an else-if chain, we need to wrap it in a compound statement no matter what
+    if (IsPartOfElseIfChain(if_stmt)) {
+      os << "{\n";
+    }
+
     if (needs_cond_hoist) {
       os << llvm::formatv("int {0} = ({1});\n", cond_name, original_cond_text);
     }
@@ -132,8 +151,14 @@ public:
       }
     }
 
+    if (IsPartOfElseIfChain(if_stmt)) {
+      os << "\n}";
+    }
+
+    os.flush();
     data.replacements.emplace_back(data.Ctx.getSourceManager(),
-                                   CharSourceRange::getTokenRange(ifStmt->getSourceRange()), os.str());
+                                   CharSourceRange::getTokenRange(if_stmt->getSourceRange()), replacement_text,
+                                   data.Ctx.getLangOpts());
   }
 
   auto VisitIfStmt(IfStmt *ifStmt) -> bool {
