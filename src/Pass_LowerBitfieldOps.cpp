@@ -39,7 +39,6 @@
 #include <ranges>
 #include <string>
 #include <utility>
-#include <vector>
 
 using namespace clang;
 using namespace clang::tooling;
@@ -53,7 +52,7 @@ namespace {
 struct WorkerData {
   ASTContext &Ctx;
   PipelineActionCtx &pa_ctx;
-  std::vector<Replacement> &replacements;
+  llvm::SmallVector<Replacement, 64> &replacements;
   size_t tmp_var_counter = 0;
 };
 
@@ -378,7 +377,7 @@ public:
 } // namespace
 
 auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
-  std::vector<Replacement> replacements;
+  llvm::SmallVector<Replacement, 64> replacements;
   WorkerData data{.Ctx = Ctx, .pa_ctx = pa_ctx, .replacements = replacements};
   Worker w(data);
   w.TraverseDecl(Ctx.getTranslationUnitDecl());
@@ -402,11 +401,97 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
 
 namespace pancake::pass_lower_bitfield_ops {
 namespace {
+// This helper code facilitates non-volatile bitfield operations.
+const char *NON_VOLATILE_BITFIELD_HELPERS =
+    R"(/* c2pancake generated code start: helpers for non-volatile bitfield operations */
+#include <stdint.h>
+
+static inline uint64_t __c2pnk_get_bit_u64(uint64_t value, uint64_t bit) { return ((value >> bit) & 1ULL) != 0; }
+
+static inline void __c2pnk_set_bit(uint8_t *byte, uint64_t bit) {
+  uint64_t val = (uint64_t)*byte;
+  // truncation
+  *byte = (uint8_t)(val | (uint64_t)(1ULL << bit));
+}
+
+static inline void __c2pnk_clear_bit(uint8_t *byte, uint64_t bit) {
+  uint64_t val = (uint64_t)*byte;
+  // truncation
+  *byte = (uint8_t)(val & ~(1ULL << bit));
+}
+
+/* [lhs_bit, rhs_bit) */
+static void __c2pnk_set_bitfield_u64(uint64_t value, uint8_t *field, uint64_t lhs_bit, uint64_t rhs_bit) {
+  uint64_t width = rhs_bit - lhs_bit;
+
+  uint64_t i = 0;
+  while (i < width) {
+    uint64_t bit_index = lhs_bit + i;
+    uint8_t *byte = &field[bit_index >> 3]; // / 8
+
+    uint64_t cond = __c2pnk_get_bit_u64(value, i);
+    uint64_t index = bit_index & 7; // % 8
+    if (cond) {
+      __c2pnk_set_bit(byte, index);
+    } else {
+      __c2pnk_clear_bit(byte, index);
+    }
+
+    i = i + 1;
+  }
+}
+
+/* [lhs_bit, rhs_bit) */
+static uint64_t __c2pnk_get_bitfield_u64(const uint8_t *field, uint64_t lhs_bit, uint64_t rhs_bit) {
+  uint64_t value = 0;
+  uint64_t width = rhs_bit - lhs_bit;
+
+  uint64_t i = 0;
+  while (i < width) {
+    uint64_t bit_index = lhs_bit + i;
+
+    uint64_t byte = (uint64_t)field[bit_index >> 3]; // / 8
+    uint64_t index = bit_index & 7;                  // % 8
+    uint64_t mask = (uint64_t)(1ULL << index);
+
+    if (byte & mask) {
+      value = value | (1ULL << i);
+    }
+
+    i = i + 1;
+  }
+
+  return value;
+}
+
+/* [lhs_bit, rhs_bit) */
+static int64_t __c2pnk_get_bitfield_i64(const uint8_t *field, uint64_t lhs_bit, uint64_t rhs_bit) {
+  uint64_t value = __c2pnk_get_bitfield_u64(field, lhs_bit, rhs_bit);
+
+  uint64_t width = rhs_bit - lhs_bit;
+
+  /* manual sign-extend if the extracted field is narrower than 64 bits */
+  if (width < 64) {
+    uint64_t sign = 1ULL << (width - 1);
+    return (int64_t)((value ^ sign) - sign);
+  }
+
+  return (int64_t)value;
+}
+
+/* [lhs_bit, rhs_bit) */
+static void __c2pnk_set_bitfield_i64(int64_t value, uint8_t *field, uint64_t lhs_bit, uint64_t rhs_bit) {
+  __c2pnk_set_bitfield_u64((uint64_t)value, field, lhs_bit, rhs_bit);
+}
+/* c2pancake generated code end: helpers for non-volatile bitfield operations */
+
+)";
+
 struct WorkerData {
   ASTContext &Ctx;
   CodeGen::CodeGenModule &code_gen_module;
   PipelineActionCtx &pa_ctx;
-  std::vector<Replacement> &replacements;
+  llvm::SmallVector<Replacement, 64> &replacements;
   size_t tmp_var_counter = 0;
 };
 
@@ -430,8 +515,7 @@ public:
 
   static auto GetIntTypeName(unsigned bit_width, bool is_signed) -> std::string {
     const char *prefix = is_signed ? "int" : "uint";
-    unsigned width = bit_width <= 8 ? 8 : bit_width <= 16 ? 16 : bit_width <= 32 ? 32 : 64;
-    return llvm::formatv("{0}{1}_t", prefix, width).str();
+    return llvm::formatv("{0}{1}_t", prefix, bit_width).str();
   }
 
   static auto FormatAPIntHex(const llvm::APInt &ap_int) -> std::string {
@@ -480,7 +564,6 @@ public:
 
   struct BuiltExpr {
     llvm::SmallVector<std::string, 4> pre_stmts;
-    llvm::SmallVector<std::string, 4> post_stmts;
     std::string final_expr;
     QualType final_expr_type;
   };
@@ -491,6 +574,8 @@ public:
 
   // Equivalent to
   // https://clang.llvm.org/doxygen/classclang_1_1CodeGen_1_1CodeGenFunction.html#abce29203390acfa7bfcda7d0c9101629
+  // We only use this function for VOLATILE bitfields since the loads/stores generated should be always 8,16,32,64
+  // If this ever changes, then we're fucked because clang IR can generate arbitrary width loads/stores
   auto BuildLoadOfBitFieldLValue(const MemberExpr *member_expr, const BuiltExprCtx &ctx) -> BuiltExpr {
     const FieldDecl *fd = cast<FieldDecl>(member_expr->getMemberDecl());
     assert(fd->isBitField());
@@ -502,10 +587,7 @@ public:
 
     // Build the base object subexpression (e.g. "s" for s.field, or the pointer expression for p->field)
     BuiltExpr base_built_expr = BuildExpr(member_expr->getBase(), {.depth = ctx.depth + 1});
-
     llvm::SmallVector<std::string, 4> pre_stmts;
-    // pre_stmts.insert(pre_stmts.end(), base_built_expr.pre_stmts.begin(), base_built_expr.pre_stmts.end());
-
     std::string base_addr =
         member_expr->isArrow() ? base_built_expr.final_expr : llvm::formatv("(&{0})", base_built_expr.final_expr);
 
@@ -529,29 +611,35 @@ public:
 
     if (info.IsSigned) {
       assert(static_cast<unsigned>(offset + info.Size) <= storage_size);
-      unsigned high_bits = storage_size - offset - info.Size;
       std::string signed_type_name = GetIntTypeName(storage_size, true);
 
-      // Reinterpret as signed before shifting, so ">>" is an arithmetic shift
-      // (mirrors CreateShl/CreateAShr operating on a signed value).
-      std::string signed_temp = GetTempVarName("bf_signed");
-      pre_stmts.push_back(llvm::formatv("{0} {1} = ({0}){2};", signed_type_name, signed_temp, current_temp));
-      current_temp = signed_temp;
+      // Extract the field: (current_temp >> offset) & low_bits_mask(Size)
+      // (equivalent to what the shl/ashr pair achieved implicitly, but as a plain unsigned extraction)
+      std::string extracted_temp = current_temp;
+      if (offset != 0U) {
+        std::string lshr_temp = GetTempVarName("bf_lshr");
+        pre_stmts.push_back(
+            llvm::formatv("{0} {1} = {2} >> {3};", storage_type_name, lshr_temp, extracted_temp, offset));
+        extracted_temp = lshr_temp;
+      }
+      if (static_cast<unsigned>(offset) + info.Size < storage_size) {
+        llvm::APInt low_mask = llvm::APInt::getLowBitsSet(storage_size, info.Size);
+        std::string mask_temp = GetTempVarName("bf_mask");
+        pre_stmts.push_back(llvm::formatv("{0} {1} = {2} & {3};", storage_type_name, mask_temp, extracted_temp,
+                                          FormatAPIntHex(low_mask)));
+        extracted_temp = mask_temp;
+      }
+      current_temp = extracted_temp;
 
-      // Val = Builder.CreateShl(Val, HighBits, "bf.shl");
-      if (high_bits != 0U) {
-        std::string shl_temp = GetTempVarName("bf_shl");
-        pre_stmts.push_back(
-            llvm::formatv("{0} {1} = {2} << {3};", signed_type_name, shl_temp, current_temp, high_bits));
-        current_temp = shl_temp;
-      }
-      // Val = Builder.CreateAShr(Val, Offset + HighBits, "bf.ashr");
-      if (offset + high_bits != 0U) {
-        std::string ashr_temp = GetTempVarName("bf_ashr");
-        pre_stmts.push_back(
-            llvm::formatv("{0} {1} = {2} >> {3};", signed_type_name, ashr_temp, current_temp, offset + high_bits));
-        current_temp = ashr_temp;
-      }
+      // Sign-extend: sign = 1ULL << (Size - 1); (T)((value ^ sign) - sign)
+      llvm::APInt sign_bit_mask = llvm::APInt::getOneBitSet(storage_size, info.Size - 1);
+      std::string sign_temp = GetTempVarName("bf_sign");
+      pre_stmts.push_back(llvm::formatv("{0} {1} = {2};", storage_type_name, sign_temp, FormatAPIntHex(sign_bit_mask)));
+
+      std::string signed_temp = GetTempVarName("bf_signed");
+      pre_stmts.push_back(
+          llvm::formatv("{0} {1} = ({0})(({2} ^ {3}) - {3});", signed_type_name, signed_temp, current_temp, sign_temp));
+      current_temp = signed_temp;
     } else {
       // Val = Builder.CreateLShr(Val, Offset, "bf.lshr");
       if (offset != 0U) {
@@ -577,17 +665,144 @@ public:
 
     auto final_pre_stmts = pre_stmts | std::views::reverse | std::ranges::to<llvm::SmallVector<std::string, 4>>();
     final_pre_stmts.insert(final_pre_stmts.end(), base_built_expr.pre_stmts.begin(), base_built_expr.pre_stmts.end());
-    return {.pre_stmts = std::move(final_pre_stmts),
-            .post_stmts = std::move(base_built_expr.post_stmts),
-            .final_expr = cast_temp,
-            .final_expr_type = ft};
+    return {.pre_stmts = std::move(final_pre_stmts), .final_expr = cast_temp, .final_expr_type = ft};
+  }
+
+  auto BuildStoreThroughBitFieldLValue(const MemberExpr *member_expr, Expr *src_expr, const BuiltExprCtx &ctx)
+      -> BuiltExpr {
+    const FieldDecl *fd = cast<FieldDecl>(member_expr->getMemberDecl());
+    assert(fd->isBitField());
+
+    const CodeGen::CGBitFieldInfo &info =
+        data.code_gen_module.getTypes().getCGRecordLayout(fd->getParent()).getBitFieldInfo(fd);
+
+    QualType ft = member_expr->getType();
+
+    // Build the base object subexpression (e.g. "s" for s.field, or the pointer expression for p->field)
+    BuiltExpr base_built_expr = BuildExpr(member_expr->getBase(), {.depth = ctx.depth + 1});
+    BuiltExpr src_built_expr = BuildExpr(src_expr, {.depth = ctx.depth + 1});
+    llvm::SmallVector<std::string, 4> pre_stmts;
+    std::string base_addr =
+        member_expr->isArrow() ? base_built_expr.final_expr : llvm::formatv("(&{0})", base_built_expr.final_expr);
+
+    llvm::outs() << "processing bitfield store: "
+                 << member_expr->getSourceRange().printToString(data.Ctx.getSourceManager()) << "\n";
+
+    const auto is_volatile = ft.isVolatileQualified();
+    const auto use_volatile =
+        is_volatile && info.VolatileStorageSize != 0 && IsAAPCS(data.code_gen_module.getTypes().getTarget());
+
+    const auto offset = use_volatile ? info.VolatileOffset : info.Offset;
+    const auto storage_size = use_volatile ? info.VolatileStorageSize : info.StorageSize;
+    const auto storage_offset = use_volatile ? info.VolatileStorageOffset : info.StorageOffset;
+
+    // Compute the storage-unit pointer, equivalent to Dst.getBitFieldAddress()
+    std::string storage_type_name = GetIntTypeName(storage_size, false);
+    auto storage_ptr =
+        llvm::formatv("(({0} *)((char *){1} + {2}))", storage_type_name, base_addr, storage_offset.getQuantity());
+
+    // SrcVal = Builder.CreateIntCast(SrcVal, Ptr.getElementType(), /*isSigned=*/false);
+    std::string src_cast_temp = GetTempVarName("bf_srccast");
+    pre_stmts.push_back(
+        llvm::formatv("{0} {1} = ({0}){2};", storage_type_name, src_cast_temp, src_built_expr.final_expr));
+    std::string src_temp = src_cast_temp;
+    // MaskedVal = SrcVal (pre-shift, pre-merge)
+    std::string masked_temp = src_cast_temp;
+
+    if (storage_size != info.Size) {
+      assert(storage_size > info.Size && "Invalid bitfield size.");
+
+      // Val = Builder.CreateLoad(Ptr, Dst.isVolatileQualified(), "bf.load");
+      std::string load_temp = GetTempVarName("bf_load");
+      pre_stmts.push_back(llvm::formatv("{0} {1} {2} = *{3};", is_volatile ? "volatile " : "", storage_type_name,
+                                        load_temp, storage_ptr));
+
+      // Mask the source value as needed, unless the destination has a boolean representation.
+      if (!ft->hasBooleanRepresentation()) {
+        llvm::APInt low_mask = llvm::APInt::getLowBitsSet(storage_size, info.Size);
+        std::string value_temp = GetTempVarName("bf_value");
+        pre_stmts.push_back(
+            llvm::formatv("{0} {1} = {2} & {3};", storage_type_name, value_temp, src_temp, FormatAPIntHex(low_mask)));
+        src_temp = value_temp;
+        masked_temp = value_temp;
+      }
+
+      // if (Offset) SrcVal = Builder.CreateShl(SrcVal, Offset, "bf.shl");
+      if (offset != 0U) {
+        std::string shl_temp = GetTempVarName("bf_shl");
+        pre_stmts.push_back(llvm::formatv("{0} {1} = {2} << {3};", storage_type_name, shl_temp, src_temp, offset));
+        src_temp = shl_temp;
+      }
+
+      // Val = Builder.CreateAnd(Val, ~getBitsSet(StorageSize, Offset, Offset + Size), "bf.clear");
+      llvm::APInt clear_mask = ~llvm::APInt::getBitsSet(storage_size, offset, offset + info.Size);
+      std::string clear_temp = GetTempVarName("bf_clear");
+      pre_stmts.push_back(
+          llvm::formatv("{0} {1} = {2} & {3};", storage_type_name, clear_temp, load_temp, FormatAPIntHex(clear_mask)));
+
+      // SrcVal = Builder.CreateOr(Val, SrcVal, "bf.set");
+      std::string set_temp = GetTempVarName("bf_set");
+      pre_stmts.push_back(llvm::formatv("{0} {1} = {2} | {3};", storage_type_name, set_temp, clear_temp, src_temp));
+      src_temp = set_temp;
+    } else {
+      assert(offset == 0);
+      // According to the AACPS:
+      // When a volatile bit-field is written, and its container does not overlap
+      // with any non-bit-field member, its container must be read exactly once
+      // and written exactly once using the access width appropriate to the type
+      // of the container. The two accesses are not atomic.
+      if (is_volatile && IsAAPCS(data.code_gen_module.getTypes().getTarget()) &&
+          data.code_gen_module.getCodeGenOpts().ForceAAPCSBitfieldLoad) {
+        std::string discard_temp = GetTempVarName("AAPCS_bf_load");
+        pre_stmts.push_back(llvm::formatv("volatile {0} {1} = *{2};", storage_type_name, discard_temp, storage_ptr));
+        pre_stmts.push_back(llvm::formatv("(void){0};", discard_temp));
+      }
+    }
+
+    // Write the new value back out: *Ptr = SrcVal
+    pre_stmts.push_back(llvm::formatv("*{0} = {1};", storage_ptr, src_temp));
+
+    // Return the new value of the bit-field
+    std::string result_val_temp = masked_temp;
+    // explicit sign extend the value
+    if (info.IsSigned) {
+      assert(info.Size <= storage_size);
+      unsigned high_bits = storage_size - info.Size;
+
+      if (high_bits != 0U) {
+        std::string signed_type_name = GetIntTypeName(storage_size, true);
+
+        // sign = 1ULL << (Size - 1)
+        llvm::APInt sign_bit_mask = llvm::APInt::getOneBitSet(storage_size, info.Size - 1);
+        std::string sign_temp = GetTempVarName("bf_result_sign");
+        pre_stmts.push_back(
+            llvm::formatv("{0} {1} = {2};", storage_type_name, sign_temp, FormatAPIntHex(sign_bit_mask)));
+
+        // (int)((value ^ sign) - sign)
+        std::string result_extend_temp = GetTempVarName("bf_result_extend");
+        pre_stmts.push_back(llvm::formatv("{0} {1} = ({0})(({2} ^ {3}) - {3});", signed_type_name, result_extend_temp,
+                                          result_val_temp, sign_temp));
+        result_val_temp = result_extend_temp;
+      }
+    }
+
+    // ResultVal = Builder.CreateIntCast(ResultVal, ResLTy, Info.IsSigned, "bf.result.cast");
+    std::string result_type_name = ft.getAsString();
+    std::string result_cast_temp = GetTempVarName("bf_result_cast");
+    pre_stmts.push_back(llvm::formatv("{0} {1} = ({0}){2};", result_type_name, result_cast_temp, result_val_temp));
+    std::string result_expr = result_cast_temp;
+
+    auto final_pre_stmts = pre_stmts | std::views::reverse | std::ranges::to<llvm::SmallVector<std::string, 4>>();
+    final_pre_stmts.insert(final_pre_stmts.end(), src_built_expr.pre_stmts.begin(), src_built_expr.pre_stmts.end());
+    final_pre_stmts.insert(final_pre_stmts.end(), base_built_expr.pre_stmts.begin(), base_built_expr.pre_stmts.end());
+
+    return {.pre_stmts = std::move(final_pre_stmts), .final_expr = result_expr, .final_expr_type = ft};
   }
 
   auto BuildExpr(Expr *expr, const BuiltExprCtx ctx) -> BuiltExpr {
     expr = expr->IgnoreParenImpCasts();
 
     llvm::SmallVector<std::string, 4> pre_stmts;
-    llvm::SmallVector<std::string, 4> post_stmts;
     std::string replacement_text;
     llvm::raw_string_ostream os(replacement_text);
     QualType final_expr_type = expr->getType();
@@ -613,11 +828,48 @@ public:
 
       switch (binary_operator->getOpcode()) {
       case BO_Assign: {
+        // always a store operation here
+        if (auto *member_expr = dyn_cast<MemberExpr>(lhs)) {
+          if (auto *field_decl = llvm::dyn_cast<clang::FieldDecl>(member_expr->getMemberDecl())) {
+            if (field_decl->isBitField()) {
+              const CodeGen::CGBitFieldInfo &info = data.code_gen_module.getTypes()
+                                                        .getCGRecordLayout(field_decl->getParent())
+                                                        .getBitFieldInfo(field_decl);
+              QualType ft = member_expr->getType();
+              const auto use_volatile =
+                  ft.isVolatileQualified() && IsAAPCS(data.code_gen_module.getTypes().getTarget());
+              // stupid AAPCS ABI requires volatile bitfields to be loaded/stored along with their whole container...
+              // note that the FIRST volatile bitfield will always have info.VolatileStorageSize == 0 so we omit the
+              // check here however, in BuildStoreThroughBitFieldLValue, we check for info.VolatileStorageSize != 0 to
+              // determine if we should use the volatile path
+              if (use_volatile) {
+                auto built_expr = BuildStoreThroughBitFieldLValue(member_expr, rhs, {.depth = ctx.depth + 1});
+                os << built_expr.final_expr;
+                pre_stmts.insert(pre_stmts.end(), built_expr.pre_stmts.begin(), built_expr.pre_stmts.end());
+              } else {
+                // otherwise we can use the non-volatile helpers to do the bitfield store
+                BuiltExpr base_built_expr = BuildExpr(member_expr->getBase(), {.depth = ctx.depth + 1});
+                BuiltExpr rhs_built_expr = BuildExpr(rhs, {.depth = ctx.depth + 1});
+                llvm::SmallVector<std::string, 4> pre_stmts;
+                std::string base_addr = member_expr->isArrow() ? base_built_expr.final_expr
+                                                               : llvm::formatv("(&{0})", base_built_expr.final_expr);
+                uint64_t start_bit = ((uint64_t)(info.StorageOffset.getQuantity()) * 8) + info.Offset;
+                uint64_t end_bit = start_bit + info.Size; // info.Size = bitfield width in bits
+
+                os << llvm::formatv("__c2pnk_set_bitfield_{0}(({1}){2}, (uint8_t *){3}, {4}, {5})",
+                                    info.IsSigned ? "i64" : "u64", info.IsSigned ? "int64_t" : "uint64_t",
+                                    rhs_built_expr.final_expr, base_addr, start_bit, end_bit);
+                pre_stmts.insert(pre_stmts.end(), rhs_built_expr.pre_stmts.begin(), rhs_built_expr.pre_stmts.end());
+                pre_stmts.insert(pre_stmts.end(), base_built_expr.pre_stmts.begin(), base_built_expr.pre_stmts.end());
+              }
+
+              goto build_expr_end;
+            }
+          }
+        }
+
         auto rhs_res = BuildExpr(rhs, {.depth = ctx.depth + 1});
         auto lhs_res = BuildExpr(lhs, {.depth = ctx.depth + 1});
-
-        post_stmts.insert(post_stmts.end(), rhs_res.post_stmts.begin(), rhs_res.post_stmts.end());
-        post_stmts.insert(post_stmts.end(), lhs_res.post_stmts.begin(), lhs_res.post_stmts.end());
 
         if (ctx.depth == 0) {
           // semi-colon is added by the caller
@@ -688,8 +940,6 @@ public:
       auto *sub_expr = unary_operator->getSubExpr()->IgnoreParenImpCasts();
       auto res = BuildExpr(sub_expr, {.depth = ctx.depth + 1});
 
-      post_stmts.insert(post_stmts.end(), res.post_stmts.begin(), res.post_stmts.end());
-
       switch (unary_operator->getOpcode()) {
       case UO_AddrOf:
         [[fallthrough]];
@@ -732,7 +982,6 @@ public:
                                      }),
                                      ", "));
       for (auto &&built_expr : arg_built_exprs | std::views::reverse) {
-        post_stmts.insert(post_stmts.end(), built_expr.post_stmts.begin(), built_expr.post_stmts.end());
         pre_stmts.insert(pre_stmts.end(), built_expr.pre_stmts.begin(), built_expr.pre_stmts.end());
       }
     } else if (auto *array_subscript_expr = dyn_cast<ArraySubscriptExpr>(expr)) {
@@ -740,7 +989,6 @@ public:
       auto *base = array_subscript_expr->getBase();
 
       auto res = BuildExpr(idx, {.depth = ctx.depth + 1});
-      post_stmts.insert(post_stmts.end(), res.post_stmts.begin(), res.post_stmts.end());
       os << llvm::formatv("{0}[{1}]",
                           Lexer::getSourceText(CharSourceRange::getTokenRange(base->getSourceRange()),
                                                data.Ctx.getSourceManager(), data.Ctx.getLangOpts()),
@@ -751,10 +999,34 @@ public:
       if (IsRead(member_expr)) {
         if (auto *field_decl = llvm::dyn_cast<clang::FieldDecl>(member_expr->getMemberDecl())) {
           if (field_decl->isBitField()) {
-            auto res = BuildLoadOfBitFieldLValue(member_expr, {.depth = ctx.depth + 1});
-            post_stmts.insert(post_stmts.end(), res.post_stmts.begin(), res.post_stmts.end());
-            pre_stmts.insert(pre_stmts.end(), res.pre_stmts.begin(), res.pre_stmts.end());
-            os << res.final_expr;
+            const CodeGen::CGBitFieldInfo &info =
+                data.code_gen_module.getTypes().getCGRecordLayout(field_decl->getParent()).getBitFieldInfo(field_decl);
+            QualType ft = member_expr->getType();
+            const auto use_volatile = ft.isVolatileQualified() && IsAAPCS(data.code_gen_module.getTypes().getTarget());
+            // stupid AAPCS ABI requires volatile bitfields to be loaded/stored along with their whole container...
+            // note that the FIRST volatile bitfield will always have info.VolatileStorageSize == 0 so we omit the
+            // check here however, in BuildLoadOfBitFieldLValue, we check for info.VolatileStorageSize != 0 to
+            // determine if we should use the volatile path
+
+            if (use_volatile) {
+              auto res = BuildLoadOfBitFieldLValue(member_expr, {.depth = ctx.depth + 1});
+              os << res.final_expr;
+              pre_stmts.insert(pre_stmts.end(), res.pre_stmts.begin(), res.pre_stmts.end());
+            } else {
+              // otherwise fallback to helper functions
+
+              // Build the base object subexpression (e.g. "s" for s.field, or the pointer expression for p->field)
+              BuiltExpr base_built_expr = BuildExpr(member_expr->getBase(), {.depth = ctx.depth + 1});
+              llvm::SmallVector<std::string, 4> pre_stmts;
+              std::string base_addr = member_expr->isArrow() ? base_built_expr.final_expr
+                                                             : llvm::formatv("(&{0})", base_built_expr.final_expr);
+              uint64_t start_bit = ((uint64_t)(info.StorageOffset.getQuantity()) * 8) + info.Offset;
+              uint64_t end_bit = start_bit + info.Size; // info.Size = bitfield width in bits
+              os << llvm::formatv("__c2pnk_get_bitfield_{0}((const uint8_t *){1}, {2}, {3})",
+                                  info.IsSigned ? "i64" : "u64", base_addr, start_bit, end_bit);
+              pre_stmts.insert(pre_stmts.end(), base_built_expr.pre_stmts.begin(), base_built_expr.pre_stmts.end());
+            }
+
             goto build_expr_end;
           }
         }
@@ -769,7 +1041,6 @@ public:
   build_expr_end:
     os.flush();
     return {.pre_stmts = std::move(pre_stmts),
-            .post_stmts = std::move(post_stmts),
             .final_expr = std::move(replacement_text),
             .final_expr_type = final_expr_type};
   }
@@ -793,7 +1064,6 @@ public:
         auto res = BuildExpr(init_expr->IgnoreParenImpCasts(), {.depth = 0});
         os << llvm::join(res.pre_stmts | std::views::reverse, "\n");
         os << llvm::formatv("{0} = {1};", PrintType(var_decl->getType(), var_decl->getName()), res.final_expr);
-        os << llvm::join(res.post_stmts | std::views::reverse, "\n");
       }
     }
 
@@ -822,7 +1092,6 @@ public:
       os << llvm::join(res.pre_stmts | std::views::reverse, "\n");
       // for some reason we don't need a ; after this...
       os << llvm::formatv("{0}", res.final_expr);
-      os << llvm::join(res.post_stmts | std::views::reverse, "\n");
       os.flush();
 
       if (!replacement_text.empty()) {
@@ -851,7 +1120,10 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
                                          ci.getPreprocessorOpts(), code_gen_options, *layout_probe,
                                          ci.getDiagnostics());
 
-  std::vector<Replacement> replacements;
+  llvm::SmallVector<Replacement, 64> replacements;
+  replacements.emplace_back(Ctx.getSourceManager(),
+                            Ctx.getSourceManager().getLocForStartOfFile(Ctx.getSourceManager().getMainFileID()), 0,
+                            NON_VOLATILE_BITFIELD_HELPERS);
   WorkerData data{.Ctx = Ctx, .code_gen_module = code_gen_module, .pa_ctx = pa_ctx, .replacements = replacements};
   Worker w(data);
   w.TraverseDecl(Ctx.getTranslationUnitDecl());

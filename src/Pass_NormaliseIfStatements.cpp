@@ -19,6 +19,7 @@
 #include <clang/Tooling/Transformer/SourceCode.h>
 #include <clang/Tooling/Transformer/Stencil.h>
 #include <clang/Tooling/Transformer/Transformer.h>
+#include <llvm-22/llvm/ADT/SmallVector.h>
 #include <llvm/ADT/StringRef.h>
 #include <llvm/Support/Casting.h>
 #include <llvm/Support/Error.h>
@@ -28,10 +29,8 @@
 #include <llvm/Support/raw_ostream.h>
 
 #include <cassert>
-#include <ranges>
 #include <string>
 #include <utility>
-#include <vector>
 
 using namespace clang;
 using namespace clang::tooling;
@@ -43,7 +42,7 @@ namespace {
 struct WorkerData {
   ASTContext &Ctx;
   PipelineActionCtx &pa_ctx;
-  std::vector<Replacement> &replacements;
+  llvm::SmallVector<Replacement, 64> &replacements;
   size_t if_cond_tmp_var_counter = 0;
 };
 
@@ -170,7 +169,7 @@ public:
 } // namespace
 
 auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
-  std::vector<Replacement> replacements;
+  llvm::SmallVector<Replacement, 64> replacements;
   WorkerData data{.Ctx = Ctx, .pa_ctx = pa_ctx, .replacements = replacements};
   Worker w(data);
   w.TraverseDecl(Ctx.getTranslationUnitDecl());

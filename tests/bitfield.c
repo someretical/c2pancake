@@ -4,11 +4,11 @@
 #include <string.h>
 
 struct bitfieldtest {
-  uint64_t a : 23;
-  uint64_t b : 45;
-  uint64_t c : 12;
-  uint64_t d : 54;
-  uint64_t e : 6;
+  uint64_t a : 2;
+  uint64_t b : 64;
+  uint64_t c : 62;
+  uint64_t d : 2;
+  uint64_t e : 64;
 };
 
 int main(void) {
@@ -21,22 +21,22 @@ int main(void) {
   // assert(pbf->d == 0);
   // assert(pbf->e == 0);
 
-  pbf->a = 8200709;           // max 8388608
-  pbf->b = 35184372080000;    // max 35184372088831
-  pbf->c = 2657;              // max 4095
-  pbf->d = 18014398509400000; // max 18014398509481983
-  pbf->e = 44;                // max 63
+  pbf->a = 1;              // max 8388608
+  pbf->b = 35184372080000; // max 35184372088831
+  pbf->c = 2657;           // max 4095
+  pbf->d = 3;              // max 18014398509481983
+  pbf->e = 123123123123;   // max 63
 
   uint64_t a = pbf->a;
-  assert(a == 8200709);
+  assert(a == 1);
   uint64_t b = pbf->b;
   assert(b == 35184372080000);
   uint64_t c = pbf->c;
   assert(c == 2657);
   uint64_t d = pbf->d;
-  assert(d == 18014398509400000);
+  assert(d == 3);
   uint64_t e = pbf->e;
-  assert(e == 44);
+  assert(e == 123123123123);
 
   // pbf->a = 1;
   // pbf->b = 1;

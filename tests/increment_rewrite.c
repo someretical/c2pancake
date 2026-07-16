@@ -2,7 +2,7 @@
 // Each case is isolated in its own block.
 // Dummy types/functions are provided so the file parses.
 
-#include <cstddef>
+#include <stddef.h>
 
 struct Child {
   int value;
@@ -11,7 +11,7 @@ struct Child {
 struct Obj {
   int field;
   int arr[16];
-  Child child;
+  struct Child child;
 };
 
 int foo() { return 123; }
@@ -181,30 +181,30 @@ int main() {
 
   // struct field access
   {
-    Obj obj{};
+    struct Obj obj;
     obj.field++;
   }
 
   {
-    Obj obj{};
+    struct Obj obj;
     ++obj.field;
   }
 
   {
-    Obj obj{};
+    struct Obj obj;
     int i = 0;
     obj.arr[i++]++;
   }
 
   {
-    Obj obj{};
+    struct Obj obj;
     ++obj.child.value;
   }
 
   {
     int arr[10] = {};
     int i = 0;
-    Obj obj{};
+    struct Obj obj;
     arr[obj.arr[i++]]++;
   }
 
@@ -244,11 +244,6 @@ int main() {
   }
 
   // chaining
-  {
-    int x = 5;
-    ++ + +x; // tokenization stress: ++(++x)
-  }
-
   {
     int x = 5;
     - - --x; // tokenization stress
@@ -340,13 +335,6 @@ int main() {
     int a = 5;
     int b = 2;
     int r = a-- - b; // (a--) - b
-    (void)r;
-  }
-
-  {
-    int a = 5;
-    int b = 2;
-    int r = a++ ++ +b;
     (void)r;
   }
 

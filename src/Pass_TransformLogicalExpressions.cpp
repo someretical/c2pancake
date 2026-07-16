@@ -32,7 +32,6 @@
 #include <ranges>
 #include <string>
 #include <utility>
-#include <vector>
 
 using namespace clang;
 using namespace clang::tooling;
@@ -45,7 +44,7 @@ namespace {
 struct WorkerData {
   ASTContext &Ctx;
   PipelineActionCtx &pa_ctx;
-  std::vector<Replacement> &replacements;
+  llvm::SmallVector<Replacement, 64> &replacements;
   size_t tmp_var_counter = 0;
 };
 
@@ -122,7 +121,7 @@ public:
 } // namespace
 
 auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
-  std::vector<Replacement> replacements;
+  llvm::SmallVector<Replacement, 64> replacements;
   WorkerData data{.Ctx = Ctx, .pa_ctx = pa_ctx, .replacements = replacements};
   Worker w(data);
   w.TraverseDecl(Ctx.getTranslationUnitDecl());
@@ -149,7 +148,7 @@ namespace {
 struct WorkerData {
   ASTContext &Ctx;
   PipelineActionCtx &pa_ctx;
-  std::vector<Replacement> &replacements;
+  llvm::SmallVector<Replacement, 64> &replacements;
   size_t tmp_var_counter = 0;
 };
 
@@ -453,14 +452,13 @@ if ({2}) {
         if (depth == 0) {
           os << llvm::formatv("{0} = {0} {1} 1", res.final_expr, unary_operator->getOpcode() == UO_PostInc ? "+" : "-");
         } else {
-          std::string tmp_var_name = GetTempVarName(
-              llvm::formatv("{0}", unary_operator->getOpcode() == UO_PostInc ? "PostInc" : "PostDec").str());
+          std::string tmp_var_name =
+              GetTempVarName(llvm::formatv("{0}", unary_operator->getOpcode() == UO_PostInc ? "PostInc" : "PostDec"));
           // push in REVERSE order!
           pre_stmts.push_back(
-              llvm::formatv("{0} = {0} {1} 1;", res.final_expr, unary_operator->getOpcode() == UO_PostInc ? "+" : "-")
-                  .str());
+              llvm::formatv("{0} = {0} {1} 1;", res.final_expr, unary_operator->getOpcode() == UO_PostInc ? "+" : "-"));
           pre_stmts.push_back(
-              llvm::formatv("{0} = ({1});", PrintType(res.final_expr_type, tmp_var_name), res.final_expr).str());
+              llvm::formatv("{0} = ({1});", PrintType(res.final_expr_type, tmp_var_name), res.final_expr));
           os << tmp_var_name;
         }
         break;
@@ -472,11 +470,12 @@ if ({2}) {
         if (depth == 0) {
           os << llvm::formatv("{0} = {0} {1} 1", res.final_expr, unary_operator->getOpcode() == UO_PreInc ? "+" : "-");
         } else {
-          std::string tmp_var_name = GetTempVarName(
-              llvm::formatv("{0}", unary_operator->getOpcode() == UO_PreInc ? "PreInc" : "PreDec").str());
+          std::string tmp_var_name =
+              GetTempVarName(llvm::formatv("{0}", unary_operator->getOpcode() == UO_PreInc ? "PreInc" : "PreDec"));
           pre_stmts.push_back(
-              llvm::formatv("{0} = {0} {1} 1;", res.final_expr, unary_operator->getOpcode() == UO_PreInc ? "+" : "-")
-                  .str());
+              llvm::formatv("{0} = ({1});", PrintType(res.final_expr_type, tmp_var_name), res.final_expr));
+          pre_stmts.push_back(
+              llvm::formatv("{0} = {0} {1} 1;", res.final_expr, unary_operator->getOpcode() == UO_PreInc ? "+" : "-"));
           os << tmp_var_name;
         }
         break;
@@ -562,7 +561,8 @@ if ({2}) {
           continue;
         }
 
-        auto res = BuildExpr(init_expr->IgnoreParenImpCasts(), 0);
+        // depth is 1 because the decl stmt has depth 0
+        auto res = BuildExpr(init_expr->IgnoreParenImpCasts(), 1);
         for (auto &&pre_stmt : res.pre_stmts | std::views::reverse) {
           os << pre_stmt << "\n";
         }
@@ -612,7 +612,7 @@ if ({2}) {
 } // namespace
 
 auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
-  std::vector<Replacement> replacements;
+  llvm::SmallVector<Replacement, 64> replacements;
   WorkerData data{.Ctx = Ctx, .pa_ctx = pa_ctx, .replacements = replacements};
   Worker w(data);
   w.TraverseDecl(Ctx.getTranslationUnitDecl());
