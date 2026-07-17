@@ -61,6 +61,8 @@ jobs:
           -DCMAKE_EXPORT_COMPILE_COMMANDS:BOOL=TRUE 
           -DCMAKE_C_COMPILER:FILEPATH=/usr/bin/clang-22 
           -DCMAKE_CXX_COMPILER:FILEPATH=/usr/bin/clang++-22 
+          -DSECURE_BUILD_FOR_PRODUCTION=ON 
+          -DSECURE_BUILD_FOR_DEVELOPMENT=OFF 
           --no-warn-unused-cli 
           -S ${{ github.workspace }} 
           -B ${{ steps.strings.outputs.build-output-dir }} 
