@@ -1,32 +1,34 @@
 #include "Pass_SwitchToIf.h"
+#include "Utils.h"
 
 #include <clang/AST/ASTConsumer.h>
 #include <clang/AST/ASTContext.h>
 #include <clang/AST/Expr.h>
-#include <clang/AST/OperationKinds.h>
 #include <clang/AST/RecursiveASTVisitor.h>
 #include <clang/AST/Stmt.h>
 #include <clang/ASTMatchers/ASTMatchFinder.h>
 #include <clang/ASTMatchers/ASTMatchers.h>
+#include <clang/Basic/AttrKinds.h>
 #include <clang/Basic/LLVM.h>
 #include <clang/Basic/SourceLocation.h>
 #include <clang/Frontend/CompilerInstance.h>
 #include <clang/Lex/Lexer.h>
 #include <clang/Rewrite/Core/Rewriter.h>
 #include <clang/Tooling/Core/Replacement.h>
+#include <clang/Tooling/Refactoring/AtomicChange.h>
 #include <clang/Tooling/Transformer/RangeSelector.h>
 #include <clang/Tooling/Transformer/RewriteRule.h>
-#include <clang/Tooling/Transformer/SourceCode.h>
 #include <clang/Tooling/Transformer/Stencil.h>
 #include <clang/Tooling/Transformer/Transformer.h>
-#include <llvm/ADT/StringRef.h>
-#include <llvm/Support/Casting.h>
 #include <llvm/Support/Error.h>
 #include <llvm/Support/ErrorHandling.h>
 #include <llvm/Support/FormatAdapters.h>
 #include <llvm/Support/FormatVariadic.h>
+#include <llvm/Support/raw_ostream.h>
 
+#include <algorithm>
 #include <cassert>
+#include <cstddef>
 #include <ranges>
 #include <string>
 #include <utility>
@@ -87,9 +89,9 @@ public:
   explicit Worker(struct WorkerData &data) : data(data) {}
 
   // process all inner switch statements first, then the outermost one
-  auto shouldTraversePostOrder() const -> bool { return true; }
+  static auto shouldTraversePostOrder() -> bool { return true; }
 
-  auto VerifySwitchStmt(SwitchStmt *switchStmt) -> bool {
+  static auto VerifySwitchStmt(SwitchStmt *switchStmt) -> bool {
     // verify if switch statement needs rewriting
     // basically check that every case is followed by a compound statement which ends in either a break/return/continue
     // statement and there are no random statements in between the case labels and the compound statement this should be
@@ -161,7 +163,7 @@ public:
     };
     std::vector<CaseInfo> case_infos;
 
-    std::vector<Stmt *> stmt_buf;
+    std::vector<Stmt *> const stmt_buf;
     CaseInfo current_case_info;
     /*
     Set to true after we have processed a case statement.
@@ -410,13 +412,13 @@ public:
         }
 
         if (case_info.body.size() == 1) {
-          if (auto *compound_stmt = dyn_cast<CompoundStmt>(case_info.body[0])) {
+          if (auto *compound_stmt = dyn_cast<CompoundStmt>(case_info.body.at(0))) {
             if (compound_stmt->size() > 0 && !IsTerminatingStmt(compound_stmt->body_back())) {
               os << "\n{\n";
-              case_info.body[0]->printPretty(os, nullptr, data.Ctx.getPrintingPolicy());
+              case_info.body.at(0)->printPretty(os, nullptr, data.Ctx.getPrintingPolicy());
               os << "\nbreak;\n}";
             } else {
-              case_info.body[0]->printPretty(os, nullptr, data.Ctx.getPrintingPolicy());
+              case_info.body.at(0)->printPretty(os, nullptr, data.Ctx.getPrintingPolicy());
             }
             continue;
           }
@@ -515,7 +517,7 @@ public:
   explicit Worker(struct WorkerData &data) : data(data) {}
 
   // process all inner switch statements first, then the outermost one
-  auto shouldTraversePostOrder() const -> bool { return true; }
+  static auto shouldTraversePostOrder() -> bool { return true; }
 
   auto GetSwitchCondTempVarName() -> auto {
     return llvm::formatv("__c2pnk_switch_cond_tmp_var_{0}_{1}_{2}", data.pa_ctx.major_pass_number,
@@ -560,7 +562,7 @@ public:
     if (const auto *body_stmt = dyn_cast<CompoundStmt>(ci.body.front())) {
       os << "{\n";
       for (const auto &stmt : body_stmt->body()) {
-        bool is_last = (stmt == body_stmt->body_back());
+        bool const is_last = (stmt == body_stmt->body_back());
         if (is_last && isa<BreakStmt>(stmt)) {
           // don't output the last break statement
         } else {
@@ -594,7 +596,7 @@ public:
 
     std::vector<CaseInfo> case_infos;
 
-    std::vector<Stmt *> stmt_buf;
+    std::vector<Stmt *> const stmt_buf;
     CaseInfo current_case_info{};
 
     for (auto it = switch_body->body_rbegin(); it != switch_body->body_rend(); ++it) {
@@ -654,10 +656,11 @@ public:
     // subsequent cases get turned into "else if"
     // if any set of cases has a default, it becomes the last one and is turned into an "else"
     for (size_t i = 0; i < valid_case_infos.size(); ++i) {
-      bool is_first = (i == 0);
-      bool is_last = (i + 1 == valid_case_infos.size());
-      const CaseInfo &ci = valid_case_infos[i];
-      bool has_default = std::ranges::any_of(ci.labels, [](SwitchCase *sc) -> bool { return isa<DefaultStmt>(sc); });
+      bool const is_first = (i == 0);
+      // bool const is_last = (i + 1 == valid_case_infos.size());
+      const CaseInfo &ci = valid_case_infos.at(i);
+      bool const has_default =
+          std::ranges::any_of(ci.labels, [](SwitchCase *sc) -> bool { return isa<DefaultStmt>(sc); });
 
       if (is_first) {
         if (has_default) {
@@ -671,7 +674,8 @@ public:
         os << BuildConditionExpr(ci, tmp_var_name, has_default);
         os << ") ";
         os << BuildIfBody(ci);
-      } else if (is_last) {
+      }
+      /* else if (is_last) {
         if (has_default) {
           os << "else ";
           os << BuildIfBody(ci);
@@ -682,7 +686,8 @@ public:
         os << BuildConditionExpr(ci, tmp_var_name, has_default);
         os << ") ";
         os << BuildIfBody(ci);
-      } else {
+      } */
+      else {
         if (has_default) {
           os << "else ";
           os << BuildIfBody(ci);

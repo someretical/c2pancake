@@ -1,49 +1,46 @@
 #include "Pass_LowerBitfieldOps.h"
+#include "Utils.h"
 
-#include "third_party/Address.h"
-#include "third_party/CGRecordLayout.h"
-#include "third_party/CodeGenFunction.h"
-#include "third_party/CodeGenModule.h"
-#include "third_party/CodeGenTypes.h"
+#include "clang/lib/CodeGen/Address.h"
+#include "clang/lib/CodeGen/CGRecordLayout.h"
+#include "clang/lib/CodeGen/CodeGenFunction.h"
+#include "clang/lib/CodeGen/CodeGenModule.h"
+#include "clang/lib/CodeGen/CodeGenTypes.h"
 
 #include <clang/AST/ASTConsumer.h>
 #include <clang/AST/ASTContext.h>
+#include <clang/AST/Decl.h>
 #include <clang/AST/Expr.h>
 #include <clang/AST/OperationKinds.h>
+#include <clang/AST/ParentMapContext.h>
 #include <clang/AST/RecordLayout.h>
 #include <clang/AST/RecursiveASTVisitor.h>
 #include <clang/AST/Stmt.h>
-#include <clang/ASTMatchers/ASTMatchFinder.h>
-#include <clang/ASTMatchers/ASTMatchers.h>
 #include <clang/Basic/LLVM.h>
 #include <clang/Basic/SourceLocation.h>
 #include <clang/Frontend/CompilerInstance.h>
 #include <clang/Lex/Lexer.h>
 #include <clang/Rewrite/Core/Rewriter.h>
 #include <clang/Tooling/Core/Replacement.h>
-#include <clang/Tooling/Transformer/RangeSelector.h>
-#include <clang/Tooling/Transformer/RewriteRule.h>
-#include <clang/Tooling/Transformer/SourceCode.h>
-#include <clang/Tooling/Transformer/Stencil.h>
-#include <clang/Tooling/Transformer/Transformer.h>
 #include <llvm/ADT/SmallVector.h>
+#include <llvm/ADT/StringExtras.h>
 #include <llvm/ADT/StringRef.h>
 #include <llvm/Support/Casting.h>
 #include <llvm/Support/Error.h>
 #include <llvm/Support/ErrorHandling.h>
-#include <llvm/Support/FormatAdapters.h>
 #include <llvm/Support/FormatVariadic.h>
 #include <llvm/Support/raw_ostream.h>
 
 #include <cassert>
+#include <cstddef>
+#include <cstdint>
+#include <memory>
 #include <ranges>
 #include <string>
 #include <utility>
 
 using namespace clang;
 using namespace clang::tooling;
-using namespace clang::ast_matchers;
-using namespace clang::transformer;
 
 // TODO hoist nested struct defs into the same scope as the outermost one
 
@@ -91,7 +88,7 @@ public:
     llvm::SmallVector<std::string, 4> pre_stmts;
     std::string replacement_text;
     llvm::raw_string_ostream os(replacement_text);
-    QualType final_expr_type = expr->getType();
+    QualType const final_expr_type = expr->getType();
 
     if (auto *decl_ref_expr = dyn_cast<DeclRefExpr>(expr)) {
       os << Lexer::getSourceText(CharSourceRange::getTokenRange(decl_ref_expr->getSourceRange()),
@@ -257,7 +254,7 @@ public:
         if (member_expr->isArrow()) {
           // if this is the top-most isArrow, we CANNOT hoist to a temporary
           if (ctx.encountered_top_most_arrow_access) {
-            std::string tmp_var_name = GetTempVarName("ArrowAccess");
+            std::string const tmp_var_name = GetTempVarName("ArrowAccess");
             auto built_expr = BuildExpr(base_expr, {.depth = ctx.depth + 1, .encountered_top_most_arrow_access = true});
             pre_stmts.push_back(llvm::formatv("{0} = {1}->{2};", PrintType(final_expr_type, tmp_var_name),
                                               built_expr.final_expr, member_src)
@@ -281,7 +278,7 @@ public:
         if (member_expr->isArrow()) {
           // if this is the top-most isArrow, we can avoid hoisting a temporary
           if (ctx.encountered_top_most_arrow_access) {
-            std::string tmp_var_name = GetTempVarName("ArrowAccess");
+            std::string const tmp_var_name = GetTempVarName("ArrowAccess");
             auto built_expr = BuildExpr(base_expr, {.depth = ctx.depth + 1, .encountered_top_most_arrow_access = true});
             pre_stmts.push_back(llvm::formatv("{0} = {1}->{2};", PrintType(final_expr_type, tmp_var_name),
                                               built_expr.final_expr, member_src)
@@ -402,7 +399,7 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
 namespace pancake::pass_lower_bitfield_ops {
 namespace {
 // This helper code facilitates non-volatile bitfield operations.
-const char *NON_VOLATILE_BITFIELD_HELPERS =
+const char *non_volatile_bitfield_helpers =
     R"(/* c2pancake generated code start: helpers for non-volatile bitfield operations */
 #include <stdint.h>
 
@@ -529,10 +526,12 @@ public:
   auto IsRead(const MemberExpr *member_expr) -> bool {
     const Stmt *stmt = member_expr;
     while (true) {
-      auto parents = data.Ctx.getParents(*stmt);
+      auto parents = data.Ctx.getParentMapContext().getParents(*stmt);
       if (parents.empty())
         return false;
 
+      // already did the check above...
+      // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
       const auto *implicit_cast = parents[0].get<ImplicitCastExpr>();
       if (implicit_cast == nullptr)
         return false;
@@ -546,9 +545,9 @@ public:
       A CK_NoOp cast (qualification adjustment e.g., adding/dropping const/volatile on an lvalue, or a no-op cast to
       an equivalent type) can sit between the MemberExpr and the LValueToRValue cast.
 
-      However, when a loaded value undergoes further conversion (integer promotion, usual arithmetic conversion, pointer
-      decay of the result, etc.), those additional ImplicitCastExpr nodes wrap around the LValueToRValue cast so it's
-      not a problem in this case.
+      However, when a loaded value undergoes further conversion (integer promotion, usual arithmetic conversion,
+      pointer decay of the result, etc.), those additional ImplicitCastExpr nodes wrap around the LValueToRValue cast
+      so it's not a problem in this case.
       */
       case CK_NoOp: {
         stmt = implicit_cast;
@@ -583,7 +582,7 @@ public:
     const CodeGen::CGBitFieldInfo &info =
         data.code_gen_module.getTypes().getCGRecordLayout(fd->getParent()).getBitFieldInfo(fd);
 
-    QualType ft = member_expr->getType();
+    QualType const ft = member_expr->getType();
 
     // Build the base object subexpression (e.g. "s" for s.field, or the pointer expression for p->field)
     BuiltExpr base_built_expr = BuildExpr(member_expr->getBase(), {.depth = ctx.depth + 1});
@@ -623,7 +622,7 @@ public:
         extracted_temp = lshr_temp;
       }
       if (static_cast<unsigned>(offset) + info.Size < storage_size) {
-        llvm::APInt low_mask = llvm::APInt::getLowBitsSet(storage_size, info.Size);
+        llvm::APInt const low_mask = llvm::APInt::getLowBitsSet(storage_size, info.Size);
         std::string mask_temp = GetTempVarName("bf_mask");
         pre_stmts.push_back(llvm::formatv("{0} {1} = {2} & {3};", storage_type_name, mask_temp, extracted_temp,
                                           FormatAPIntHex(low_mask)));
@@ -632,7 +631,7 @@ public:
       current_temp = extracted_temp;
 
       // Sign-extend: sign = 1ULL << (Size - 1); (T)((value ^ sign) - sign)
-      llvm::APInt sign_bit_mask = llvm::APInt::getOneBitSet(storage_size, info.Size - 1);
+      llvm::APInt const sign_bit_mask = llvm::APInt::getOneBitSet(storage_size, info.Size - 1);
       std::string sign_temp = GetTempVarName("bf_sign");
       pre_stmts.push_back(llvm::formatv("{0} {1} = {2};", storage_type_name, sign_temp, FormatAPIntHex(sign_bit_mask)));
 
@@ -649,7 +648,7 @@ public:
       }
       // Val = Builder.CreateAnd(Val, getLowBitsSet(StorageSize, Size), "bf.clear");
       if (static_cast<unsigned>(offset) + info.Size < storage_size) {
-        llvm::APInt mask = llvm::APInt::getLowBitsSet(storage_size, info.Size);
+        llvm::APInt const mask = llvm::APInt::getLowBitsSet(storage_size, info.Size);
         std::string clear_temp = GetTempVarName("bf_clear");
         pre_stmts.push_back(
             llvm::formatv("{0} {1} = {2} & {3};", storage_type_name, clear_temp, current_temp, FormatAPIntHex(mask)));
@@ -676,7 +675,7 @@ public:
     const CodeGen::CGBitFieldInfo &info =
         data.code_gen_module.getTypes().getCGRecordLayout(fd->getParent()).getBitFieldInfo(fd);
 
-    QualType ft = member_expr->getType();
+    QualType const ft = member_expr->getType();
 
     // Build the base object subexpression (e.g. "s" for s.field, or the pointer expression for p->field)
     BuiltExpr base_built_expr = BuildExpr(member_expr->getBase(), {.depth = ctx.depth + 1});
@@ -684,9 +683,6 @@ public:
     llvm::SmallVector<std::string, 4> pre_stmts;
     std::string base_addr =
         member_expr->isArrow() ? base_built_expr.final_expr : llvm::formatv("(&{0})", base_built_expr.final_expr);
-
-    llvm::outs() << "processing bitfield store: "
-                 << member_expr->getSourceRange().printToString(data.Ctx.getSourceManager()) << "\n";
 
     const auto is_volatile = ft.isVolatileQualified();
     const auto use_volatile =
@@ -719,7 +715,7 @@ public:
 
       // Mask the source value as needed, unless the destination has a boolean representation.
       if (!ft->hasBooleanRepresentation()) {
-        llvm::APInt low_mask = llvm::APInt::getLowBitsSet(storage_size, info.Size);
+        llvm::APInt const low_mask = llvm::APInt::getLowBitsSet(storage_size, info.Size);
         std::string value_temp = GetTempVarName("bf_value");
         pre_stmts.push_back(
             llvm::formatv("{0} {1} = {2} & {3};", storage_type_name, value_temp, src_temp, FormatAPIntHex(low_mask)));
@@ -735,7 +731,7 @@ public:
       }
 
       // Val = Builder.CreateAnd(Val, ~getBitsSet(StorageSize, Offset, Offset + Size), "bf.clear");
-      llvm::APInt clear_mask = ~llvm::APInt::getBitsSet(storage_size, offset, offset + info.Size);
+      llvm::APInt const clear_mask = ~llvm::APInt::getBitsSet(storage_size, offset, offset + info.Size);
       std::string clear_temp = GetTempVarName("bf_clear");
       pre_stmts.push_back(
           llvm::formatv("{0} {1} = {2} & {3};", storage_type_name, clear_temp, load_temp, FormatAPIntHex(clear_mask)));
@@ -767,13 +763,13 @@ public:
     // explicit sign extend the value
     if (info.IsSigned) {
       assert(info.Size <= storage_size);
-      unsigned high_bits = storage_size - info.Size;
+      unsigned const high_bits = storage_size - info.Size;
 
       if (high_bits != 0U) {
         std::string signed_type_name = GetIntTypeName(storage_size, true);
 
         // sign = 1ULL << (Size - 1)
-        llvm::APInt sign_bit_mask = llvm::APInt::getOneBitSet(storage_size, info.Size - 1);
+        llvm::APInt const sign_bit_mask = llvm::APInt::getOneBitSet(storage_size, info.Size - 1);
         std::string sign_temp = GetTempVarName("bf_result_sign");
         pre_stmts.push_back(
             llvm::formatv("{0} {1} = {2};", storage_type_name, sign_temp, FormatAPIntHex(sign_bit_mask)));
@@ -790,7 +786,7 @@ public:
     std::string result_type_name = ft.getAsString();
     std::string result_cast_temp = GetTempVarName("bf_result_cast");
     pre_stmts.push_back(llvm::formatv("{0} {1} = ({0}){2};", result_type_name, result_cast_temp, result_val_temp));
-    std::string result_expr = result_cast_temp;
+    std::string const result_expr = result_cast_temp;
 
     auto final_pre_stmts = pre_stmts | std::views::reverse | std::ranges::to<llvm::SmallVector<std::string, 4>>();
     final_pre_stmts.insert(final_pre_stmts.end(), src_built_expr.pre_stmts.begin(), src_built_expr.pre_stmts.end());
@@ -805,7 +801,7 @@ public:
     llvm::SmallVector<std::string, 4> pre_stmts;
     std::string replacement_text;
     llvm::raw_string_ostream os(replacement_text);
-    QualType final_expr_type = expr->getType();
+    QualType const final_expr_type = expr->getType();
 
     if (auto *decl_ref_expr = dyn_cast<DeclRefExpr>(expr)) {
       os << Lexer::getSourceText(CharSourceRange::getTokenRange(decl_ref_expr->getSourceRange()),
@@ -835,13 +831,13 @@ public:
               const CodeGen::CGBitFieldInfo &info = data.code_gen_module.getTypes()
                                                         .getCGRecordLayout(field_decl->getParent())
                                                         .getBitFieldInfo(field_decl);
-              QualType ft = member_expr->getType();
+              QualType const ft = member_expr->getType();
               const auto use_volatile =
                   ft.isVolatileQualified() && IsAAPCS(data.code_gen_module.getTypes().getTarget());
               // stupid AAPCS ABI requires volatile bitfields to be loaded/stored along with their whole container...
               // note that the FIRST volatile bitfield will always have info.VolatileStorageSize == 0 so we omit the
-              // check here however, in BuildStoreThroughBitFieldLValue, we check for info.VolatileStorageSize != 0 to
-              // determine if we should use the volatile path
+              // check here however, in BuildStoreThroughBitFieldLValue, we check for info.VolatileStorageSize != 0
+              // to determine if we should use the volatile path
               if (use_volatile) {
                 auto built_expr = BuildStoreThroughBitFieldLValue(member_expr, rhs, {.depth = ctx.depth + 1});
                 os << built_expr.final_expr;
@@ -853,7 +849,7 @@ public:
                 llvm::SmallVector<std::string, 4> pre_stmts;
                 std::string base_addr = member_expr->isArrow() ? base_built_expr.final_expr
                                                                : llvm::formatv("(&{0})", base_built_expr.final_expr);
-                uint64_t start_bit = ((uint64_t)(info.StorageOffset.getQuantity()) * 8) + info.Offset;
+                uint64_t start_bit = (static_cast<uint64_t>(info.StorageOffset.getQuantity()) * 8) + info.Offset;
                 uint64_t end_bit = start_bit + info.Size; // info.Size = bitfield width in bits
 
                 os << llvm::formatv("__c2pnk_set_bitfield_{0}(({1}){2}, (uint8_t *){3}, {4}, {5})",
@@ -863,6 +859,7 @@ public:
                 pre_stmts.insert(pre_stmts.end(), base_built_expr.pre_stmts.begin(), base_built_expr.pre_stmts.end());
               }
 
+              // NOLINTNEXTLINE(cppcoreguidelines-avoid-goto)
               goto build_expr_end;
             }
           }
@@ -1001,7 +998,7 @@ public:
           if (field_decl->isBitField()) {
             const CodeGen::CGBitFieldInfo &info =
                 data.code_gen_module.getTypes().getCGRecordLayout(field_decl->getParent()).getBitFieldInfo(field_decl);
-            QualType ft = member_expr->getType();
+            QualType const ft = member_expr->getType();
             const auto use_volatile = ft.isVolatileQualified() && IsAAPCS(data.code_gen_module.getTypes().getTarget());
             // stupid AAPCS ABI requires volatile bitfields to be loaded/stored along with their whole container...
             // note that the FIRST volatile bitfield will always have info.VolatileStorageSize == 0 so we omit the
@@ -1020,24 +1017,28 @@ public:
               llvm::SmallVector<std::string, 4> pre_stmts;
               std::string base_addr = member_expr->isArrow() ? base_built_expr.final_expr
                                                              : llvm::formatv("(&{0})", base_built_expr.final_expr);
-              uint64_t start_bit = ((uint64_t)(info.StorageOffset.getQuantity()) * 8) + info.Offset;
+              uint64_t start_bit = (static_cast<uint64_t>(info.StorageOffset.getQuantity()) * 8) + info.Offset;
               uint64_t end_bit = start_bit + info.Size; // info.Size = bitfield width in bits
               os << llvm::formatv("__c2pnk_get_bitfield_{0}((const uint8_t *){1}, {2}, {3})",
                                   info.IsSigned ? "i64" : "u64", base_addr, start_bit, end_bit);
               pre_stmts.insert(pre_stmts.end(), base_built_expr.pre_stmts.begin(), base_built_expr.pre_stmts.end());
             }
 
+            // NOLINTNEXTLINE(cppcoreguidelines-avoid-goto)
             goto build_expr_end;
           }
         }
       }
+      // NOLINTNEXTLINE(cppcoreguidelines-avoid-goto)
       goto build_expr_else;
     } else {
+    // NOLINTNEXTLINE(cppcoreguidelines-avoid-goto)
     build_expr_else:
       os << Lexer::getSourceText(CharSourceRange::getTokenRange(expr->getSourceRange()), data.Ctx.getSourceManager(),
                                  data.Ctx.getLangOpts());
     }
 
+  // NOLINTNEXTLINE(cppcoreguidelines-avoid-goto)
   build_expr_end:
     os.flush();
     return {.pre_stmts = std::move(pre_stmts),
@@ -1113,7 +1114,7 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
   // but the headers can just be downloaded and included anyway
   // all the compiled object code is available already...
   // this means these headers are incredibly brittle :skull:
-  CodeGenOptions code_gen_options;
+  CodeGenOptions const code_gen_options;
   llvm::LLVMContext llvm_ctx;
   auto layout_probe = std::make_unique<llvm::Module>("layout_probe", llvm_ctx);
   CodeGen::CodeGenModule code_gen_module(Ctx, ci.getVirtualFileSystemPtr(), ci.getHeaderSearchOpts(),
@@ -1123,7 +1124,7 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
   llvm::SmallVector<Replacement, 64> replacements;
   replacements.emplace_back(Ctx.getSourceManager(),
                             Ctx.getSourceManager().getLocForStartOfFile(Ctx.getSourceManager().getMainFileID()), 0,
-                            NON_VOLATILE_BITFIELD_HELPERS);
+                            non_volatile_bitfield_helpers);
   WorkerData data{.Ctx = Ctx, .code_gen_module = code_gen_module, .pa_ctx = pa_ctx, .replacements = replacements};
   Worker w(data);
   w.TraverseDecl(Ctx.getTranslationUnitDecl());

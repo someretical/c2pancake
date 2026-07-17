@@ -1,10 +1,16 @@
 #include "Pipeline.h"
+#include "Utils.h"
 
 #include <clang/Tooling/Core/Replacement.h>
+#include <clang/Tooling/Tooling.h>
 #include <llvm/Support/ErrorHandling.h>
+#include <llvm/Support/FormatVariadic.h>
 #include <llvm/Support/raw_ostream.h>
 
+#include <cstddef>
 #include <string>
+#include <utility>
+#include <vector>
 
 using namespace pancake;
 
@@ -21,9 +27,9 @@ auto Pipeline::Run() -> int {
       auto &factory = factories.at(j);
       for (size_t k = 0; k < 10; ++k) {
         std::string next_suffix = llvm::formatv(".{0}-{1}-c2pnk.c", j, k);
-        StagedCompilationDatabase db(options_parser.getCompilations(), current_suffix);
-        std::string current_file = llvm::formatv("{0}{1}", initial_file, current_suffix);
-        std::string next_file = llvm::formatv("{0}{1}", initial_file, next_suffix);
+        StagedCompilationDatabase const db(options_parser.getCompilations(), current_suffix);
+        std::string const current_file = llvm::formatv("{0}{1}", initial_file, current_suffix);
+        std::string const next_file = llvm::formatv("{0}{1}", initial_file, next_suffix);
         clang::tooling::ClangTool tool(db, std::vector{current_file});
 
         clang::tooling::Replacements replacements;

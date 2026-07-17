@@ -7,9 +7,9 @@ import requests
 
 OWNER = "llvm"
 REPO = "llvm-project"
-REF = "llvmorg-22.1.7"
-START_PATH = "clang/lib/CodeGen"
-OUTPUT_DIR = Path("include/third_party")
+REF = "llvmorg-22.1.8"
+START_PATHS = ["clang/lib/CodeGen", "clang-tools-extra/clangd"]
+OUTPUT_DIR = Path("include")
 
 API = f"https://api.github.com/repos/{OWNER}/{REPO}/contents"
 
@@ -32,14 +32,10 @@ def download_headers(path: str, ref: str):
 
     cur = 0
     for item in r.json():
-        if item["type"] == "dir":
-            download_headers(item["path"], ref)
-
-        elif item["type"] == "file" and item["name"].endswith(".h"):
+        if item["type"] == "file" and item["name"].endswith(".h"):
             cur += 1
 
-            rel_path = Path(item["path"]).relative_to(START_PATH)
-            out_file = OUTPUT_DIR / rel_path
+            out_file = OUTPUT_DIR / path / item["name"]
             out_file.parent.mkdir(parents=True, exist_ok=True)
 
             logger.info(f"[{cur:>{len(str(total))}}/{total}] Downloading {item['path']}")
@@ -51,21 +47,22 @@ def download_headers(path: str, ref: str):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Fetch Clang CodeGen headers from GitHub")
+    parser = argparse.ArgumentParser(description="Fetch Clang internal headers from GitHub")
     parser.add_argument(
         "-v",
         "--version",
         action="store",
         default=REF,
-        help="Clang CodeGen version to fetch (default: %(default)s)",
+        help="Clang internal headers version to fetch (default: %(default)s)",
     )
 
     args = parser.parse_args()
 
-    logger.info(f"Fetching Clang CodeGen headers from {OWNER}/{REPO} at ref {args.version}")
+    logger.info(f"Fetching Clang internal headers from {OWNER}/{REPO} at ref {args.version}")
 
     OUTPUT_DIR.mkdir(exist_ok=True)
-    download_headers(START_PATH, args.version)
+    for start_path in START_PATHS:
+        download_headers(start_path, args.version)
     logger.info("Done")
 
 

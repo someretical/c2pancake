@@ -1,25 +1,29 @@
 #include "Utils.h"
 
-#include <clang/AST/ASTContext.h>
-#include <clang/AST/ASTTypeTraits.h>
-#include <clang/AST/Expr.h>
-#include <clang/AST/ParentMapContext.h>
-#include <clang/AST/Stmt.h>
 #include <clang/Basic/LLVM.h>
-#include <clang/Basic/LangOptions.h>
-#include <clang/Basic/SourceLocation.h>
-#include <clang/Basic/SourceManager.h>
-#include <clang/Lex/Lexer.h>
+#include <clang/Tooling/CompilationDatabase.h>
+#include <llvm/Support/FormatVariadic.h>
 
 #include <string>
+#include <utility>
+#include <vector>
 
 using namespace pancake;
 
-std::string pancake::LogBegin(const PipelineActionCtx &ctx) {
+auto pancake::LogBegin(const PipelineActionCtx &ctx) -> std::string {
   auto action_type = ctx.action_type.value_or(PipelineActionType::None);
-  const char *action_type_str = action_type == PipelineActionType::Rewriter   ? "Rewriter"
-                                : action_type == PipelineActionType::Analyser ? "Analyser"
-                                                                              : "UnknownActionType";
+  const char *action_type_str{};
+  switch (action_type) {
+  case PipelineActionType::Rewriter:
+    action_type_str = "Rewriter";
+    break;
+  case PipelineActionType::Analyser:
+    action_type_str = "Analyser";
+    break;
+  default:
+    action_type_str = "UnknownActionType";
+    break;
+  }
   return llvm::formatv("[c2pancake] {0} -> {1}: {2}(i={4:02}) {3}:", ctx.current_file, ctx.next_file, action_type_str,
                        ctx.action_name.value_or("UnknownAction"), ctx.major_pass_number);
 }

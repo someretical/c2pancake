@@ -1,4 +1,5 @@
 #include "Pass_TransformLogicalExpressions.h"
+#include "Utils.h"
 
 #include <clang/AST/ASTConsumer.h>
 #include <clang/AST/ASTContext.h>
@@ -6,37 +7,29 @@
 #include <clang/AST/OperationKinds.h>
 #include <clang/AST/RecursiveASTVisitor.h>
 #include <clang/AST/Stmt.h>
-#include <clang/ASTMatchers/ASTMatchFinder.h>
-#include <clang/ASTMatchers/ASTMatchers.h>
+#include <clang/AST/TypeBase.h>
 #include <clang/Basic/LLVM.h>
 #include <clang/Basic/SourceLocation.h>
 #include <clang/Frontend/CompilerInstance.h>
 #include <clang/Lex/Lexer.h>
 #include <clang/Rewrite/Core/Rewriter.h>
 #include <clang/Tooling/Core/Replacement.h>
-#include <clang/Tooling/Transformer/RangeSelector.h>
-#include <clang/Tooling/Transformer/RewriteRule.h>
-#include <clang/Tooling/Transformer/SourceCode.h>
-#include <clang/Tooling/Transformer/Stencil.h>
-#include <clang/Tooling/Transformer/Transformer.h>
 #include <llvm/ADT/SmallVector.h>
+#include <llvm/ADT/StringExtras.h>
 #include <llvm/ADT/StringRef.h>
-#include <llvm/Support/Casting.h>
 #include <llvm/Support/Error.h>
 #include <llvm/Support/ErrorHandling.h>
-#include <llvm/Support/FormatAdapters.h>
 #include <llvm/Support/FormatVariadic.h>
 #include <llvm/Support/raw_ostream.h>
 
 #include <cassert>
+#include <cstddef>
 #include <ranges>
 #include <string>
 #include <utility>
 
 using namespace clang;
 using namespace clang::tooling;
-using namespace clang::ast_matchers;
-using namespace clang::transformer;
 
 // reduce all logical expressions and expressions with side effects to temporary variables
 namespace pancake::pass_hoist_condition_expressions {
@@ -55,7 +48,7 @@ public:
   explicit Worker(struct WorkerData &data) : data(data) {}
 
   // process all OUTER statements first
-  auto shouldTraversePostOrder() const -> bool { return false; }
+  static auto shouldTraversePostOrder() -> bool { return false; }
 
   auto GetTempVarName(std::string hint) -> auto {
     return llvm::formatv("__c2pnk_{0}_{1}_{2}_{3}", hint, data.pa_ctx.major_pass_number, data.pa_ctx.minor_pass_number,
@@ -209,7 +202,7 @@ public:
     llvm::SmallVector<std::string, 4> pre_stmts;
     std::string replacement_text;
     llvm::raw_string_ostream os(replacement_text);
-    QualType final_expr_type = expr->getType();
+    QualType const final_expr_type = expr->getType();
 
     if (auto *decl_ref_expr = dyn_cast<DeclRefExpr>(expr)) {
       os << Lexer::getSourceText(CharSourceRange::getTokenRange(decl_ref_expr->getSourceRange()),
@@ -262,7 +255,7 @@ public:
 
       std::string tmp_var_name = GetTempVarName("TernaryResult");
       std::string tmp_cond_name = GetTempVarName("TernaryCond");
-      std::string if_cond = llvm::formatv(
+      std::string const if_cond = llvm::formatv(
           /*
           0 = var for result of ?:
           1 = condition bool pre stmts
@@ -302,7 +295,7 @@ if ({2}) {
         auto lhs_res = BuildExpr(lhs, depth + 1);
         auto rhs_res = BuildExpr(rhs, depth + 1);
         std::string tmp_var_name = GetTempVarName("LAnd");
-        std::string if_cond = llvm::formatv(
+        std::string const if_cond = llvm::formatv(
             /*
             0 = lhs pre stmts
             1 = tmp var for result of &&
@@ -334,7 +327,7 @@ if (!({2})) {
         auto lhs_res = BuildExpr(lhs, depth + 1);
         auto rhs_res = BuildExpr(rhs, depth + 1);
         std::string tmp_var_name = GetTempVarName("LOr");
-        std::string if_cond = llvm::formatv(
+        std::string const if_cond = llvm::formatv(
             /*
             0 = lhs pre stmts
             1 = tmp var for result of ||
@@ -452,7 +445,7 @@ if ({2}) {
         if (depth == 0) {
           os << llvm::formatv("{0} = {0} {1} 1", res.final_expr, unary_operator->getOpcode() == UO_PostInc ? "+" : "-");
         } else {
-          std::string tmp_var_name =
+          std::string const tmp_var_name =
               GetTempVarName(llvm::formatv("{0}", unary_operator->getOpcode() == UO_PostInc ? "PostInc" : "PostDec"));
           // push in REVERSE order!
           pre_stmts.push_back(
@@ -470,7 +463,7 @@ if ({2}) {
         if (depth == 0) {
           os << llvm::formatv("{0} = {0} {1} 1", res.final_expr, unary_operator->getOpcode() == UO_PreInc ? "+" : "-");
         } else {
-          std::string tmp_var_name =
+          std::string const tmp_var_name =
               GetTempVarName(llvm::formatv("{0}", unary_operator->getOpcode() == UO_PreInc ? "PreInc" : "PreDec"));
           pre_stmts.push_back(
               llvm::formatv("{0} = ({1});", PrintType(res.final_expr_type, tmp_var_name), res.final_expr));
@@ -555,7 +548,23 @@ if ({2}) {
     llvm::raw_string_ostream os(replacement_text);
 
     for (auto *decl : declStmt->decls()) {
-      if (auto *var_decl = dyn_cast<VarDecl>(decl)) {
+      if (auto *record_decl = dyn_cast<RecordDecl>(decl)) {
+        // check if definition is in the same place
+        /*
+        Turn instances of
+          struct S { int x; } s;
+        into
+          struct S { int x; };
+          struct S a;
+        */
+        if (record_decl->isThisDeclarationADefinition()) {
+          const auto record_definition_text =
+              Lexer::getSourceText(CharSourceRange::getTokenRange(record_decl->getSourceRange()),
+                                   data.Ctx.getSourceManager(), data.Ctx.getLangOpts())
+                  .str();
+          os << record_definition_text << ";\n";
+        }
+      } else if (auto *var_decl = dyn_cast<VarDecl>(decl)) {
         auto *init_expr = var_decl->getInit();
         if (init_expr == nullptr) {
           continue;

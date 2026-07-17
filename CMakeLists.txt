@@ -119,23 +119,4 @@ target_compile_definitions(c2pancake
 target_include_directories(
   c2pancake SYSTEM PRIVATE ${GCC_BASE_INCLUDE_PATH} ${GCC_ARCH_INCLUDE_PATH}
                            ${LLVM_INCLUDE_DIRS} ${CLANG_INCLUDE_DIRS})
-target_link_libraries(
-  c2pancake
-  PRIVATE clangTooling
-          clangToolingCore
-          clangTransformer
-          clangASTMatchers
-          clangAST
-          clangCodeGen
-          clangRewrite
-          clangFrontend
-          clangFormat
-          clangSerialization
-          clangDriver
-          clangParse
-          clangSema
-          clangAnalysis
-          clangEdit
-          clangLex
-          clangBasic
-          LLVMSupport)
+target_link_libraries(c2pancake PRIVATE clangDaemon)

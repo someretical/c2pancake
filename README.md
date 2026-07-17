@@ -75,7 +75,7 @@ The insertion of `#include <stdint.h>` at the top of a file may fail if there ar
 The instructions below are for Ubuntu 24.x.
 
 At a high level
-- LLVM 22.1.7 (use later versions at risk of breaking compatibility...)
+- LLVM 22.1.8 (use later versions at risk of breaking compatibility...)
 - GCC 16 and libstdc++16 (clang's libc++ doesn't support enough modern C++(26) features)
 - Python 3.12.3 (for fetching clang internal headers from GitHub)
 
@@ -87,7 +87,7 @@ sudo apt update
 sudo apt install libedit-dev zlib1g-dev libzstd-dev libcurl4-openssl-dev -y
 ```
 
-Install LLVM development libraries, current supported version is 22.1.7
+Install LLVM development libraries, current supported version is 22.1.8. N.B. it is not possible to specify the minor and patch versions.
 ```
 wget https://apt.llvm.org/llvm.sh
 chmod +x llvm.sh
@@ -107,11 +107,11 @@ Install other build tools
 sudo apt install build-essential ninja-build cmake cmake-format python3 python3-venv -y
 ```
 
-The clang internal CodeGen headers for LLVM 22.1.7 are already included. If targeting a newer release (even if it is a minor release), run the helper python script to fetch the newer headers.
+The clang internal headers for LLVM 22.1.8 are already included. If targeting a newer release (even if it is a minor release), run the helper python script to fetch the newer headers.
 ```
 /usr/bin/python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
-.venv/bin/python fetch_codegen_headers.py --version llvmorg-22.1.7
+.venv/bin/python fetch_codegen_headers.py --version llvmorg-22.1.8
 ```
 
 ### Installing pancake compiler

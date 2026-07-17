@@ -1,4 +1,3 @@
-#include "Pass_HoistArraysAndAddresses.h"
 #include "Pass_LoopsToWhile.h"
 #include "Pass_LowerBitfieldOps.h"
 #include "Pass_NormaliseIfStatements.h"
@@ -11,6 +10,7 @@
 #include <clang/Tooling/CommonOptionsParser.h>
 #include <llvm/ADT/StringRef.h>
 #include <llvm/Support/CommandLine.h>
+#include <llvm/Support/FormatAdapters.h>
 #include <llvm/Support/FormatVariadic.h>
 #include <llvm/Support/raw_ostream.h>
 
@@ -52,6 +52,8 @@ auto main(int argc, const char **argv) -> int {
   };
   */
   Pipeline pipeline(*expected_parser);
+  pipeline.AddPass<pass_name_anon_records::Action>();
+  pipeline.AddPass<pass_rename_to_be_promoted_records::Action>();
   pipeline.AddPass<pass_normalise_while_loops::Action>();
   pipeline.AddPass<pass_process_continue_in_for_loops::Action>();
   pipeline.AddPass<pass_for_to_while::Action>();
@@ -65,7 +67,8 @@ auto main(int argc, const char **argv) -> int {
   pipeline.AddPass<pass_lower_nested_expressions::Action>();
   pipeline.AddPass<pass_lower_arrow_accesses::Action>();
   pipeline.AddPass<pass_lower_bitfield_ops::Action>();
-  // pipeline.AddPass<pass_promote_records::Action>();
+  pipeline.AddPass<pass_promote_records::Action>();
+
   // pipeline.AddPass<pass_hoist_arrays_and_addresses::Action>();
   return pipeline.Run();
 

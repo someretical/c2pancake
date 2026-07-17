@@ -1,371 +1,343 @@
 #include "Pass_PromoteRecords.h"
 
+#include "Utils.h"
+#include "clang-tools-extra/clangd/FindTarget.h"
+
 #include <clang/AST/ASTConsumer.h>
 #include <clang/AST/ASTContext.h>
-#include <clang/AST/Decl.h>
-#include <clang/AST/DeclBase.h>
-#include <clang/AST/PrettyPrinter.h>
+#include <clang/AST/Expr.h>
+#include <clang/AST/RecordLayout.h>
 #include <clang/AST/RecursiveASTVisitor.h>
-#include <clang/AST/TypeBase.h>
-#include <clang/AST/TypeLoc.h>
+#include <clang/AST/Stmt.h>
+#include <clang/ASTMatchers/ASTMatchFinder.h>
+#include <clang/ASTMatchers/ASTMatchers.h>
 #include <clang/Basic/LLVM.h>
 #include <clang/Basic/SourceLocation.h>
-#include <clang/Basic/TokenKinds.h>
 #include <clang/Frontend/CompilerInstance.h>
+#include <clang/Index/USRGeneration.h>
 #include <clang/Lex/Lexer.h>
+#include <clang/Rewrite/Core/Rewriter.h>
 #include <clang/Tooling/Core/Replacement.h>
+#include <clang/Tooling/Refactoring/AtomicChange.h>
+#include <clang/Tooling/Refactoring/Rename/USRFindingAction.h>
+#include <clang/Tooling/Transformer/RangeSelector.h>
+#include <clang/Tooling/Transformer/RewriteRule.h>
+#include <clang/Tooling/Transformer/Stencil.h>
+#include <clang/Tooling/Transformer/Transformer.h>
+#include <llvm/ADT/DenseMap.h>
+#include <llvm/ADT/SmallVector.h>
 #include <llvm/ADT/StringRef.h>
-#include <llvm/Support/Casting.h>
 #include <llvm/Support/Error.h>
-#include <llvm/Support/FileSystem.h>
-#include <llvm/Support/FormatAdapters.h>
+#include <llvm/Support/ErrorHandling.h>
 #include <llvm/Support/FormatVariadic.h>
-#include <llvm/Support/MemoryBufferRef.h>
 #include <llvm/Support/raw_ostream.h>
 
-#include <cstddef>
-#include <cstdint>
-#include <memory>
+#include <cassert>
 #include <string>
-#include <system_error>
 #include <utility>
+#include <vector>
 
-using namespace pancake::pass_promote_records;
+using namespace clang;
+using namespace clang::ast_matchers;
+using namespace clang::clangd;
+using namespace clang::transformer;
+using namespace clang::tooling;
 
+namespace pancake::pass_name_anon_records {
 namespace {
-auto RecordDeclPrefix(bool make_shared, size_t counter, const std::string &func, const std::string &var)
-    -> std::string {
-  return llvm::formatv("__c2pnk_{0}_record_decl_{1}_{2}_{3}", make_shared ? "shared" : "local", func, var, counter);
-}
+auto MakeRule() -> RewriteRule {
+  return makeRule(recordDecl(isDefinition(), unless(isExpansionInSystemHeader())).bind("record"),
+                  [](const MatchFinder::MatchResult &result) -> Expected<SmallVector<Edit, 1>> {
+                    const auto *rd = result.Nodes.getNodeAs<RecordDecl>("record");
 
-const bool is32_bit = sizeof(void *) == 4;
+                    /*
+                    Cases
 
-auto ComputePromotion(const clang::FieldDecl *F, const clang::ASTContext &Ctx, FieldPromotion &out) -> bool {
-  clang::QualType const qt = F->getType();
-  const clang::Type *t = qt.getTypePtr();
+                    DO name
+                    struct { int x; } a;
 
-  // Skip arrays and pointers
-  if (t->isArrayType() || t->isPointerType() || t->isReferenceType())
-    return false;
+                    DO name
+                    typedef struct { int x; } T;
 
-  // Skip nested record/union/enum/function/
-  if (t->isRecordType())
-    return false;
+                    DON'T name since x is injected as an IndirectFieldDecl into Outer
+                    struct Outer {
+                        struct {
+                            int x;
+                        };
+                    };
 
-  // Only promote integers and floating-point scalars
-  if (!t->isIntegralOrEnumerationType() && !t->isFloatingType())
-    return false;
+                    DON'T name since x is injected as an IndirectFieldDecl into U
+                    union U {
+                        struct {
+                            int x;
+                            int y;
+                        };
+                        int z;
+                    };
+                    */
+                    if (!rd->getIdentifier() && !rd->isAnonymousStructOrUnion()) {
+                      FullSourceLoc const loc(rd->getBeginLoc(), *result.SourceManager);
+                      auto identifier = llvm::formatv("__c2pnk_anon_record_L{0}C{1}", loc.getSpellingLineNumber(),
+                                                      loc.getSpellingColumnNumber());
+                      std::string replacement_text;
+                      llvm::raw_string_ostream os(replacement_text);
+                      os << llvm::formatv("{0} {1} ", rd->isUnion() ? "union" : "struct", identifier);
 
-  bool const is_signed = !t->isUnsignedIntegerType();
+                      SourceLocation const l_brace = rd->getBraceRange().getBegin();
+                      SourceLocation const r_brace = rd->getBraceRange().getEnd();
+                      os << Lexer::getSourceText(CharSourceRange::getTokenRange(l_brace, r_brace),
+                                                 *result.SourceManager, result.Context->getLangOpts());
+                      os.flush();
 
-  auto width = is32_bit ? 32 : 64;
-  out.newTypeName = is_signed ? llvm::formatv("int{0}_t", width) : llvm::formatv("uint{0}_t", width);
+                      return edit(changeTo(node("record"), cat(replacement_text)))(result);
+                    }
 
-  if (F->isBitField()) {
-    out.isBitField = true;
-    out.bitFieldWidth = F->getBitWidthValue();
-  }
-
-  uint64_t const orig_bits = Ctx.getTypeSize(qt);
-  uint64_t const prom_bits = is32_bit ? 32U : 64U;
-  out.origBytes = static_cast<unsigned>(orig_bits / 8);
-  if (orig_bits > prom_bits)
-    out.sizeDecreased = true;
-
-  return true;
-}
-
-auto PrintRecordDecl(const clang::RecordDecl *RD, clang::ASTContext &Ctx, const std::string &overrideName,
-                     unsigned indent) -> std::string;
-
-auto PrintFieldDecl(const clang::FieldDecl *F, clang::ASTContext &Ctx, unsigned indent) -> std::string {
-  std::string pad(indent, ' ');
-  clang::QualType const qt = F->getType();
-
-  // Strip arrays to get at the element type while preserving the array
-  // dimensions
-  clang::QualType base = qt;
-  std::string array_suffix;
-  llvm::raw_string_ostream array_suffix_os(array_suffix);
-  while (const clang::ArrayType *at = Ctx.getAsArrayType(base)) {
-    std::string dim;
-    {
-      llvm::raw_string_ostream dim_os(dim);
-      if (const auto *cat = clang::dyn_cast<clang::ConstantArrayType>(at)) {
-        dim_os << llvm::formatv("[{0}]", cat->getSize());
-        // NOLINTNEXTLINE(bugprone-branch-clone)
-      } else if (clang::isa<clang::IncompleteArrayType>(at)) {
-        dim_os << "[]";
-      } else {
-        // Variable-length array???? not sure how to handle this...
-        dim_os << "[]";
-      }
-      array_suffix_os << dim_os.str() << array_suffix_os.str();
-    }
-    base = at->getElementType();
-  }
-
-  if (const auto *rt = base->getAs<clang::RecordType>()) {
-    const clang::RecordDecl *nested = rt->getDecl();
-    // handle anonymous nested record
-    if (nested->isAnonymousStructOrUnion() || nested->getDeclName().isEmpty()) {
-      std::string body = PrintRecordDecl(nested, Ctx, /*overrideName=*/"", indent);
-      // body ends with "};" so strip the ";" since we need to append the field
-      // name
-      if (!body.empty() && body.back() == ';')
-        body.pop_back();
-
-      std::string line;
-      llvm::raw_string_ostream os(line);
-      os << body;
-      if (!F->getName().empty())
-        os << " " << F->getNameAsString();
-      os << array_suffix << ";";
-      return line;
-    }
-    // for named nested record, don't do anything specific
-  }
-
-  FieldPromotion promo;
-  if (ComputePromotion(F, Ctx, promo)) {
-    std::string line;
-    llvm::raw_string_ostream os(line);
-    os << llvm::formatv("{0}{1} {2};", pad, promo.newTypeName, F->getNameAsString());
-    if (promo.isBitField)
-      os << llvm::formatv("  /* WARNING: promoted from bit-field (was {0} bits) */", promo.bitFieldWidth);
-    if (promo.sizeDecreased)
-      os << llvm::formatv("  /* WARNING: size decreased (original field was {0} bytes) */", promo.origBytes);
-    return line;
-  }
-
-  // PrintingPolicy::printDecl() gives us   "type name[dims]"  correctly,
-  // including multi-dimensional arrays, qualifiers, and typedef names
-  clang::PrintingPolicy pp(Ctx.getLangOpts());
-  pp.SuppressTagKeyword = false;
-  pp.SuppressScope = false;
-  pp.AnonymousTagLocations = false;
-
-  std::string result = pad;
-  llvm::raw_string_ostream os(result);
-  // printDeclaration-style: pass the variable name so arrays print as T a[N].
-  qt.print(os, pp, F->getNameAsString());
-  os << ";";
-  return os.str();
-}
-
-auto PrintRecordDecl(const clang::RecordDecl *RD, clang::ASTContext &Ctx, const std::string &overrideName,
-                     unsigned indent) -> std::string {
-  std::string const pad(indent, ' ');
-  std::string const keyword = RD->isUnion() ? "union" : "struct";
-  std::string const name = overrideName.empty() ? RD->getNameAsString() : overrideName;
-
-  std::string out;
-  llvm::raw_string_ostream os(out);
-  os << pad << keyword;
-  if (!name.empty())
-    os << " " << name;
-  os << " {\n";
-
-  unsigned const field_indent = indent + 4;
-  for (const clang::FieldDecl *f : RD->fields()) {
-    os << PrintFieldDecl(f, Ctx, field_indent) << "\n";
-  }
-
-  os << pad << "}";
-  return os.str();
+                    return noEdits()(result);
+                  });
 }
 } // namespace
 
-auto PassFind::VisitRecordDecl(clang::RecordDecl *RD) -> bool {
-  if (RD->isCompleteDefinition()) {
-    bool inside_func = true;
-    // only consider records inside functions
-    for (const clang::DeclContext *dc = RD->getDeclContext(); dc != nullptr; dc = dc->getParent()) {
+auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
+  std::vector<AtomicChange> changes;
+  auto t = Transformer(MakeRule(), [&changes](llvm::Expected<llvm::MutableArrayRef<AtomicChange>> c) -> void {
+    if (c)
+      changes.insert(changes.end(), c->begin(), c->end());
+    else
+      llvm::consumeError(c.takeError());
+  });
 
-      if (const auto *fd = llvm::dyn_cast<clang::FunctionDecl>(dc)) {
-        InitialisedStructs.insert({RD, fd});
-        inside_func = true;
-        break;
+  MatchFinder finder;
+  t.registerMatchers(&finder);
+  finder.matchAST(Ctx);
+
+  bool add_error_occurred = false;
+  for (const auto &change : changes) {
+    for (const auto &r : change.getReplacements()) {
+      if (auto err = pa_ctx.replacements.add(r)) {
+        llvm::consumeError(std::move(err));
+        llvm::errs() << llvm::formatv("{0} Add replacement conflict, retrying next pass...\n", LogBegin(pa_ctx));
+        add_error_occurred = true;
       }
     }
-
-    if (!inside_func)
-      InitialisedStructs.insert({RD, nullptr});
   }
 
-  return true;
-}
-
-void Consumer::HandleTranslationUnit(clang::ASTContext &Ctx) {
-  const auto &sm = Ctx.getSourceManager();
-  PassFind sc;
-  sc.TraverseDecl(Ctx.getTranslationUnitDecl());
-
-  // copy source text to new file
-  const llvm::MemoryBufferRef buf = sm.getBufferOrFake(sm.getMainFileID(), clang::SourceLocation{});
-  std::string const source_text(buf.getBuffer());
-
-  if (sc.InitialisedStructs.empty()) {
-    return;
-  }
-
-  // Find offset just after the last top of file #include, and whether
-  // <stdint.h> is already included anywhere in the file
-  llvm::StringRef const main_file = sm.getFileEntryRefForID(sm.getMainFileID())->getName();
-  unsigned insert_offset = 0;
-  bool has_stdint = false;
-  {
-    llvm::StringRef const text(source_text);
-    size_t pos = 0;
-    while (pos < text.size()) {
-      size_t const line_end = text.find('\n', pos);
-      llvm::StringRef const line =
-          (line_end == llvm::StringRef::npos) ? text.substr(pos) : text.substr(pos, line_end - pos);
-      llvm::StringRef const trimmed = line.trim();
-
-      if (trimmed.contains("stdint.h"))
-        has_stdint = true;
-
-      if (trimmed.starts_with("#include")) {
-        // Extend insertOffset to just past this line (including newline).
-        insert_offset = (line_end == llvm::StringRef::npos) ? static_cast<unsigned>(source_text.size())
-                                                            : static_cast<unsigned>(line_end + 1);
-      } else if (trimmed.empty() || trimmed.starts_with("//") || trimmed.starts_with("/*")) {
-        // Skip blank lines / comments at the top without stopping the scan
-      } else {
-        // First non-include, non-blank, non-comment line: stop scanning
-        break;
-      }
-
-      if (line_end == llvm::StringRef::npos)
-        break;
-      pos = line_end + 1;
-    }
-  }
-
-  std::string preamble;
-  {
-    llvm::raw_string_ostream os(preamble);
-    os << "/* c2pancake: promoted struct definitions */\n";
-    if (!has_stdint) {
-      os << "#include <stdint.h>\n\n";
-    }
-  }
-
-  for (const auto &[RD, FD] : sc.InitialisedStructs) {
-    if (RD == nullptr)
-      continue;
-    clang::SourceLocation const def_loc = RD->getBeginLoc();
-    if (def_loc.isInvalid() || sm.isInSystemHeader(def_loc))
-      continue;
-
-    std::string orig_name = RD->getNameAsString();
-    if (orig_name.empty())
-      continue; // anonymous top-level struct
-
-    bool const is_global = clang::isa<clang::TranslationUnitDecl>(RD->getDeclContext());
-    bool const needs_lift = !is_global;
-
-    std::string new_name =
-        needs_lift ? RecordDeclPrefix(true, sc.hoist_record_decl_counter++, FD->getNameAsString(), orig_name)
-                   : orig_name;
-
-    std::string new_body;
-    {
-      llvm::raw_string_ostream os(new_body);
-      os << PrintRecordDecl(RD, Ctx, new_name, 0) << ";";
-    }
-
-    if (needs_lift) {
-      std::string const comment = llvm::formatv("/* struct {0} hoisted to global scope as {1} */", orig_name, new_name);
-      AddReplacement(Ctx, RD->getSourceRange(), comment, true);
-
-      {
-        llvm::raw_string_ostream os(preamble);
-        os << new_body << "\n\n";
-      }
-
-      RewriteTypeUses(RD, new_name, Ctx);
-    } else {
-      // rewrite in place
-      AddReplacement(Ctx, RD->getSourceRange(), new_body, true);
-    }
-  }
-
-  {
-    llvm::raw_string_ostream os(preamble);
-    os << "/* c2pancake: end of promoted struct definitions */\n\n";
-  }
-
-  InsertAtOffset(main_file, insert_offset, preamble);
-}
-
-void Consumer::AddReplacement(clang::ASTContext &Ctx, clang::SourceRange SR, const std::string &newText,
-                              bool includeTerminatingSemicolon) {
-  const auto &sm = Ctx.getSourceManager();
-  const auto &lang_opts = Ctx.getLangOpts();
-
-  if (includeTerminatingSemicolon) {
-    auto end = SR.getEnd();
-    auto next = clang::Lexer::findNextToken(end, sm, lang_opts);
-    if (next && next->is(clang::tok::semi)) {
-      SR.setEnd(next->getLocation());
-    }
-  }
-
-  auto char_range = clang::CharSourceRange::getTokenRange(SR);
-  clang::tooling::Replacement const repl(Ctx.getSourceManager(), char_range, newText);
-  if (auto err = pa_ctx.replacements.add(repl)) {
-    llvm::errs() << llvm::formatv("Replacement conflict: {0}\n", llvm::fmt_consume(std::move(err)));
+  pa_ctx.failure_mode = FailureMode::RepeatPass;
+  if (!add_error_occurred && changes.empty()) {
+    // All edits successfully added; no need to repeat this pass
+    pa_ctx.failure_mode = FailureMode::Success;
   }
 }
+}; // namespace pancake::pass_name_anon_records
 
-void Consumer::InsertAtOffset(llvm::StringRef file, unsigned offset, const std::string &text) {
-  clang::tooling::Replacement const r(file, offset, 0, text);
-  if (auto err = pa_ctx.replacements.add(r))
-    llvm::errs() << llvm::formatv("Insert conflict: {0}\n", llvm::fmt_consume(std::move(err)));
-}
-
+namespace pancake::pass_rename_to_be_promoted_records {
 namespace {
-struct Renamer : clang::RecursiveASTVisitor<Renamer> {
-  const clang::RecordDecl *Target;
-  const std::string &NewName;
-  Consumer &Parent;
-  clang::ASTContext &Ctx;
+auto MakeRule() -> RewriteRule {
+  return makeRule(recordDecl(isDefinition(), unless(isExpansionInSystemHeader()),
+                             unless(hasDeclContext(translationUnitDecl())), unless(hasAncestor(recordDecl())))
+                      .bind("record"),
+                  [](const MatchFinder::MatchResult &result) -> Expected<SmallVector<Edit, 1>> {
+                    const auto *rd = result.Nodes.getNodeAs<RecordDecl>("record");
 
-  Renamer(const clang::RecordDecl *T, const std::string &N, Consumer &P, clang::ASTContext &C)
-      : Target(T), NewName(N), Parent(P), Ctx(C) {}
+                    auto name = rd->getName();
+                    assert(!name.empty() && "RecordDecl should have a name at this point");
+                    const char *prefix = "__c2pnk_promoted_record";
+                    if (name.starts_with(prefix))
+                      return noEdits()(result);
 
-  auto VisitTypeLoc(clang::TypeLoc TL) -> bool {
-    const auto &sm = Ctx.getSourceManager();
-    if (auto rtl = TL.getAs<clang::RecordTypeLoc>()) {
-      const clang::RecordDecl *rd = rtl.getDecl();
-      if (rd == nullptr)
-        return true;
-      // Match the definition or any forward declaration of the same record.
-      if (rd->getDefinition() != Target && rd != Target)
-        return true;
+                    FullSourceLoc const loc(rd->getBeginLoc(), *result.SourceManager);
+                    auto new_identifier = llvm::formatv("{0}_{1}_L{2}C{3}", prefix, name, loc.getSpellingLineNumber(),
+                                                        loc.getSpellingColumnNumber())
+                                              .str();
 
-      clang::SourceRange const sr = rtl.getSourceRange();
-      if (sr.isInvalid())
-        return true;
+                    // // The problem with the below approach is that getOccurrencesOfUSRs only works reliably for
+                    // // the global scope...
+                    // auto usrs = getUSRsForDeclaration(rd, *result.Context);
+                    // auto occurences = getOccurrencesOfUSRs(usrs, name, result.Context->getTranslationUnitDecl());
+                    // const auto total = std::accumulate(
+                    //     occurences.begin(), occurences.end(), size_t{0},
+                    //     [](const auto &total, const SymbolOccurrence &b) -> auto { return total +
+                    //     b.getNameRanges().size(); });
 
-      clang::SourceLocation const b = sm.getSpellingLoc(sr.getBegin());
-      if (sm.isInSystemHeader(b))
-        return true;
+                    // llvm::outs() << llvm::formatv("Renaming record {0} to {1}, {2} occurences\n", name,
+                    // new_identifier, total);
 
-      std::string replacement;
-      llvm::raw_string_ostream os(replacement);
-      os << "struct " << NewName;
-      Parent.AddReplacement(Ctx, sr, replacement, false);
+                    // llvm::SmallVector<Edit, 1> edits;
+                    // edits.reserve(total);
+                    // for (const auto &occ : occurences) {
+                    //   llvm::outs() << "Occurrences: " << occ.getNameRanges().size() << "\n";
+                    //   for (const auto &range : occ.getNameRanges()) {
+                    //     llvm::outs() << llvm::formatv("  Occurrence at {0}\n",
+                    //                                   range.getBegin().printToString(*result.SourceManager));
+                    //     edits.push_back(Edit{.Kind = EditKind::Range,
+                    //                          .Range = CharSourceRange::getTokenRange(range),
+                    //                          .Replacement = new_identifier,
+                    //                          .Note = "Promoting record to top-level"});
+                    //   }
+                    // }
+
+                    // Instead we use an arguably even more fucked approach.
+                    // We use clangd's internal functions for renaming symbols which works but is really brittle
+                    // across updates...
+                    llvm::SmallVector<Edit, 16> edits;
+                    const auto *canonical_target = rd->getCanonicalDecl();
+
+                    findExplicitReferences(
+                        *result.Context,
+                        [&](const ReferenceLoc &ref) -> void {
+                          for (const auto *target : ref.Targets) {
+                            if (const auto *target_rd = dyn_cast<RecordDecl>(target)) {
+                              if (target_rd->getCanonicalDecl() == canonical_target) {
+                                edits.push_back(Edit{.Kind = EditKind::Range,
+                                                     .Range = CharSourceRange::getTokenRange(ref.NameLoc),
+                                                     .Replacement = new_identifier,
+                                                     .Note = "Promoting record to top-level"});
+                              }
+                            }
+                          }
+                        },
+                        nullptr);
+
+                    return edits;
+                  });
+}
+} // namespace
+
+auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
+  std::vector<AtomicChange> changes;
+  auto t = Transformer(MakeRule(), [&changes](llvm::Expected<llvm::MutableArrayRef<AtomicChange>> c) -> void {
+    if (c)
+      changes.insert(changes.end(), c->begin(), c->end());
+    else
+      llvm::consumeError(c.takeError());
+  });
+
+  MatchFinder finder;
+  t.registerMatchers(&finder);
+  finder.matchAST(Ctx);
+
+  bool add_error_occurred = false;
+  for (const auto &change : changes) {
+    for (const auto &r : change.getReplacements()) {
+      if (auto err = pa_ctx.replacements.add(r)) {
+        llvm::consumeError(std::move(err));
+        llvm::errs() << llvm::formatv("{0} Add replacement conflict, retrying next pass...\n", LogBegin(pa_ctx));
+        add_error_occurred = true;
+      }
+    }
+  }
+
+  pa_ctx.failure_mode = FailureMode::RepeatPass;
+  if (!add_error_occurred && changes.empty()) {
+    // All edits successfully added; no need to repeat this pass
+    pa_ctx.failure_mode = FailureMode::Success;
+  }
+}
+} // namespace pancake::pass_rename_to_be_promoted_records
+
+namespace pancake::pass_promote_records {
+namespace {
+struct WorkerData {
+  ASTContext &Ctx;
+  PipelineActionCtx &pa_ctx;
+  llvm::SmallVector<Replacement, 64> &replacements;
+  FunctionDecl *current_function_decl = nullptr;
+  RecordDecl *current_record_decl = nullptr;
+  llvm::DenseMap<FunctionDecl *, llvm::SmallVector<RecordDecl *, 16>> function_to_record_decls;
+};
+
+class Worker : public RecursiveASTVisitor<Worker> {
+  struct WorkerData &data;
+
+public:
+  explicit Worker(struct WorkerData &data) : data(data) {}
+
+  // process all outer record decls first
+  static auto shouldTraversePostOrder() -> bool { return false; }
+
+  auto TraverseFunctionDecl(FunctionDecl *func_decl) -> bool {
+    auto *tmp = data.current_function_decl;
+    data.current_function_decl = func_decl;
+    auto res = RecursiveASTVisitor::TraverseFunctionDecl(func_decl);
+
+    auto it = data.function_to_record_decls.find(func_decl);
+    if (it != data.function_to_record_decls.end()) {
+      std::string replacement_text;
+      llvm::raw_string_ostream os(replacement_text);
+      os << "\n/* c2pancake: promoted record declarations for function " << func_decl->getName() << " BEGIN */\n";
+      for (const auto *record_decl : it->second) {
+        os << Lexer::getSourceText(CharSourceRange::getTokenRange(record_decl->getSourceRange()),
+                                   data.Ctx.getSourceManager(), data.Ctx.getLangOpts())
+                  .str()
+           << ";\n";
+      }
+      os << "/* c2pancake: promoted record declarations for function " << func_decl->getName() << " END */\n";
+      os.flush();
+      // insert before start of function...
+      data.replacements.emplace_back(data.Ctx.getSourceManager(), func_decl->getBeginLoc(), 0, replacement_text);
     }
 
-    return true;
+    data.current_function_decl = tmp;
+    return res;
+  }
+
+  auto TraverseRecordDecl(RecordDecl *record_decl) -> bool {
+    auto *tmp = data.current_record_decl;
+    data.current_record_decl = record_decl;
+    auto res = RecursiveASTVisitor::TraverseRecordDecl(record_decl);
+    data.current_record_decl = tmp;
+    return res;
+  }
+
+  auto TraverseDeclStmt(DeclStmt *declStmt) -> bool {
+    auto &sm = data.Ctx.getSourceManager();
+    if (declStmt == nullptr || sm.isInSystemHeader(sm.getSpellingLoc(declStmt->getBeginLoc())) ||
+        data.current_function_decl == nullptr || data.current_record_decl != nullptr) {
+      return true;
+    }
+
+    assert(declStmt->isSingleDecl() && "DeclStmt should only have a single decl at this point");
+    if (auto *record_decl = dyn_cast<RecordDecl>(declStmt->getSingleDecl())) {
+      if (record_decl->isThisDeclarationADefinition()) {
+        auto name = record_decl->getName();
+        assert(name.starts_with("__c2pnk_promoted_record") && "RecordDecl should have a promoted name at this point");
+
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
+        data.function_to_record_decls[data.current_function_decl].push_back(record_decl);
+        data.replacements.emplace_back(data.Ctx.getSourceManager(),
+                                       CharSourceRange::getTokenRange(declStmt->getSourceRange()), "",
+                                       data.Ctx.getLangOpts());
+      }
+    }
+
+    return RecursiveASTVisitor::TraverseDeclStmt(declStmt);
   }
 };
 } // namespace
 
-void Consumer::RewriteTypeUses(const clang::RecordDecl *RD, const std::string &newName, clang::ASTContext &Ctx) {
-  Renamer r(RD, newName, *this, Ctx);
-  r.TraverseDecl(Ctx.getTranslationUnitDecl());
+auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
+  llvm::SmallVector<Replacement, 64> replacements;
+  WorkerData data{.Ctx = Ctx,
+                  .pa_ctx = pa_ctx,
+                  .replacements = replacements,
+                  .current_function_decl = nullptr,
+                  .current_record_decl = nullptr,
+                  .function_to_record_decls = llvm::DenseMap<FunctionDecl *, llvm::SmallVector<RecordDecl *, 16>>()};
+  Worker w(data);
+  w.TraverseDecl(Ctx.getTranslationUnitDecl());
+
+  bool add_error_occurred = false;
+  for (const auto &r : replacements) {
+    if (auto err = pa_ctx.replacements.add(r)) {
+      llvm::consumeError(std::move(err));
+      llvm::errs() << llvm::formatv("{0} Add replacement conflict, retrying next pass...\n", LogBegin(pa_ctx));
+      add_error_occurred = true;
+    }
+  }
+
+  pa_ctx.failure_mode = FailureMode::Success;
+  if (!add_error_occurred && replacements.empty()) {
+    // All edits successfully added; no need to repeat this pass
+    pa_ctx.failure_mode = FailureMode::Success;
+  }
 }
+} // namespace pancake::pass_promote_records

@@ -1,41 +1,32 @@
 #include "Pass_NormaliseIfStatements.h"
+#include "Utils.h"
 
 #include <clang/AST/ASTConsumer.h>
 #include <clang/AST/ASTContext.h>
+#include <clang/AST/ASTTypeTraits.h>
 #include <clang/AST/Expr.h>
-#include <clang/AST/OperationKinds.h>
+#include <clang/AST/ParentMapContext.h>
 #include <clang/AST/RecursiveASTVisitor.h>
 #include <clang/AST/Stmt.h>
-#include <clang/ASTMatchers/ASTMatchFinder.h>
-#include <clang/ASTMatchers/ASTMatchers.h>
 #include <clang/Basic/LLVM.h>
 #include <clang/Basic/SourceLocation.h>
 #include <clang/Frontend/CompilerInstance.h>
 #include <clang/Lex/Lexer.h>
 #include <clang/Rewrite/Core/Rewriter.h>
 #include <clang/Tooling/Core/Replacement.h>
-#include <clang/Tooling/Transformer/RangeSelector.h>
-#include <clang/Tooling/Transformer/RewriteRule.h>
-#include <clang/Tooling/Transformer/SourceCode.h>
-#include <clang/Tooling/Transformer/Stencil.h>
-#include <clang/Tooling/Transformer/Transformer.h>
-#include <llvm-22/llvm/ADT/SmallVector.h>
-#include <llvm/ADT/StringRef.h>
+#include <llvm/ADT/SmallVector.h>
 #include <llvm/Support/Casting.h>
 #include <llvm/Support/Error.h>
-#include <llvm/Support/ErrorHandling.h>
-#include <llvm/Support/FormatAdapters.h>
 #include <llvm/Support/FormatVariadic.h>
 #include <llvm/Support/raw_ostream.h>
 
 #include <cassert>
+#include <cstddef>
 #include <string>
 #include <utility>
 
 using namespace clang;
 using namespace clang::tooling;
-using namespace clang::ast_matchers;
-using namespace clang::transformer;
 
 namespace pancake::pass_normalise_if_statements {
 namespace {
@@ -53,7 +44,7 @@ public:
   explicit Worker(struct WorkerData &data) : data(data) {}
 
   // process all inner if statements first, then the outermost one
-  auto shouldTraversePostOrder() const -> bool { return true; }
+  static auto shouldTraversePostOrder() -> bool { return true; }
 
   auto GetIfCondTempVarName() -> auto {
     return llvm::formatv("__c2pnk_if_cond_tmp_var_{0}_{1}_{2}", data.pa_ctx.major_pass_number,
@@ -61,10 +52,10 @@ public:
   }
 
   auto IsPartOfElseIfChain(const IfStmt *if_stmt) -> bool {
-    const auto &parents = data.Ctx.getParents(*if_stmt);
+    auto parents = data.Ctx.getParentMapContext().getParents(*if_stmt);
     if (parents.empty())
       return false;
-
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
     if (const auto *parent_if = parents[0].get<clang::IfStmt>()) {
       if (parent_if->getElse() == if_stmt) {
         return true;

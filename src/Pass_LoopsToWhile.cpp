@@ -1,23 +1,24 @@
 #include "Pass_LoopsToWhile.h"
+#include "Utils.h"
 
 #include <clang/AST/ASTContext.h>
 #include <clang/AST/Expr.h>
-#include <clang/AST/OperationKinds.h>
 #include <clang/AST/Stmt.h>
 #include <clang/ASTMatchers/ASTMatchFinder.h>
 #include <clang/ASTMatchers/ASTMatchers.h>
 #include <clang/Basic/LLVM.h>
-#include <clang/Basic/SourceLocation.h>
+#include <clang/Tooling/Refactoring/AtomicChange.h>
 #include <clang/Tooling/Transformer/RangeSelector.h>
 #include <clang/Tooling/Transformer/RewriteRule.h>
-#include <clang/Tooling/Transformer/SourceCode.h>
 #include <clang/Tooling/Transformer/Stencil.h>
 #include <clang/Tooling/Transformer/Transformer.h>
+#include <llvm/Support/Casting.h>
 #include <llvm/Support/Error.h>
 #include <llvm/Support/ErrorHandling.h>
 #include <llvm/Support/FormatAdapters.h>
+#include <llvm/Support/FormatVariadic.h>
+#include <llvm/Support/raw_ostream.h>
 
-#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -98,12 +99,13 @@ namespace {
 auto IsContinueDirectlyInsideFor(const ContinueStmt *CS, const ForStmt *FS, ASTContext &Ctx) {
   const Stmt *cur = CS;
   while (true) {
-    auto parents = Ctx.getParents(*cur);
+    auto parents = Ctx.getParentMapContext().getParents(*cur);
     if (parents.empty())
       return false;
 
     // Hitting a non-Stmt parent (e.g. FunctionDecl) before finding FS means
     // FS is not actually an ancestor of CS. This should theoretically never happen
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
     const auto *par = parents[0].get<Stmt>();
     if (par == nullptr)
       return false;
@@ -130,12 +132,11 @@ auto MakeRule() -> RewriteRule {
       [replacement = std::move(replacement)](const MatchFinder::MatchResult &result) -> Expected<SmallVector<Edit, 1>> {
         const auto *fs = result.Nodes.getNodeAs<ForStmt>("for_loop");
         const auto *cs = result.Nodes.getNodeAs<ContinueStmt>("cont_stmt");
-        auto empty = llvm::SmallVector<Edit, 1>{};
         if (!fs || !cs)
-          return empty;
+          return noEdits()(result);
 
         if (!IsContinueDirectlyInsideFor(cs, fs, *result.Context))
-          return empty;
+          return noEdits()(result);
 
         return replacement(result);
       });
@@ -179,8 +180,10 @@ const std::string body_bind = "for_body";
 
 inline auto OptInit() -> Stencil { return ifBound(init_bind, cat(node(init_bind), "\n"), cat("")); }
 
-inline auto WhileCond() -> Stencil {
-  return ifBound(cond_bind, cat("while (", node(cond_bind), ")"), cat("while (1)"));
+inline auto WhileCond() -> Stencil { return cat("while (1)"); }
+
+inline auto BreakCond() -> Stencil {
+  return ifBound(cond_bind, cat("if (!(", node(cond_bind), ")) { break; }"), cat(""));
 }
 
 inline auto OptInc() -> Stencil { return ifBound(inc_bind, cat("\n", node(inc_bind), ";"), cat("")); }
@@ -194,7 +197,10 @@ auto MakeRule() -> RewriteRule {
   into
   {
     OptInit
-    while (OptCond) {
+    while (1) {
+      if (!OptCond) {
+        break;
+      }
       Body
       OptInc
     }
@@ -212,8 +218,8 @@ auto MakeRule() -> RewriteRule {
                                     anything())
                                     .bind(body_bind)))
                     .bind(for_bind),
-                changeTo(node(for_bind),
-                         cat("{\n", OptInit(), WhileCond(), " {", statements(body_bind), OptInc(), "\n}", "\n}"))),
+                changeTo(node(for_bind), cat("{\n", OptInit(), WhileCond(), " {", BreakCond(), statements(body_bind),
+                                             OptInc(), "\n}", "\n}"))),
        makeRule(forStmt(anyOf(hasLoopInit(stmt().bind(init_bind)), anything()),
                         anyOf(hasCondition(expr().bind(cond_bind)), anything()),
                         anyOf(hasIncrement(stmt().bind(inc_bind)), anything()),
@@ -221,8 +227,8 @@ auto MakeRule() -> RewriteRule {
                             // Exclude compoundStmt so Case A takes priority in applyFirst.
                             stmt(unless(compoundStmt())).bind(body_bind)))
                     .bind(for_bind),
-                changeTo(node(for_bind),
-                         cat("{\n", OptInit(), WhileCond(), " {\n", node(body_bind), ";", OptInc(), "\n}", "\n}")))}
+                changeTo(node(for_bind), cat("{\n", OptInit(), WhileCond(), " {\n", BreakCond(), statements(body_bind),
+                                             ";", OptInc(), "\n}", "\n}")))}
 
   );
 }
@@ -284,12 +290,13 @@ namespace {
 auto IsContinueDirectlyInsideDoWhile(const ContinueStmt *CS, const DoStmt *DS, ASTContext &Ctx) {
   const Stmt *cur = CS;
   while (true) {
-    auto parents = Ctx.getParents(*cur);
+    auto parents = Ctx.getParentMapContext().getParents(*cur);
     if (parents.empty())
       return false;
 
     // Hitting a non-Stmt parent (e.g. FunctionDecl) before finding DS means
     // DS is not actually an ancestor of CS. This should theoretically never happen
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
     const auto *par = parents[0].get<Stmt>();
     if (par == nullptr)
       return false;
@@ -316,12 +323,11 @@ auto MakeRule() -> RewriteRule {
       [replacement = std::move(replacement)](const MatchFinder::MatchResult &result) -> Expected<SmallVector<Edit, 1>> {
         const auto *ds = result.Nodes.getNodeAs<DoStmt>("do_loop");
         const auto *cs = result.Nodes.getNodeAs<ContinueStmt>("cont_stmt");
-        auto empty = llvm::SmallVector<Edit, 1>{};
         if (!ds || !cs)
-          return empty;
+          return noEdits()(result);
 
         if (!IsContinueDirectlyInsideDoWhile(cs, ds, *result.Context))
-          return empty;
+          return noEdits()(result);
 
         return replacement(result);
       });

@@ -1,4 +1,5 @@
 #include "Pass_HoistArraysAndAddresses.h"
+#include "Utils.h"
 
 #include <clang/AST/ASTConsumer.h>
 #include <clang/AST/ASTContext.h>
@@ -11,24 +12,17 @@
 #include <clang/Basic/SourceLocation.h>
 #include <clang/Basic/Specifiers.h>
 #include <clang/Frontend/CompilerInstance.h>
-#include <clang/Frontend/FrontendAction.h>
 #include <clang/Rewrite/Core/Rewriter.h>
 #include <clang/Tooling/Core/Replacement.h>
-#include <clang/Tooling/Tooling.h>
 #include <llvm/ADT/StringRef.h>
 #include <llvm/Support/Casting.h>
-#include <llvm/Support/Error.h>
-#include <llvm/Support/FileSystem.h>
 #include <llvm/Support/FormatAdapters.h>
 #include <llvm/Support/FormatVariadic.h>
-#include <llvm/Support/MemoryBufferRef.h>
 #include <llvm/Support/raw_ostream.h>
 
 #include <cstddef>
-#include <memory>
 #include <set>
 #include <string>
-#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -99,6 +93,7 @@ void EmitNestedInits(const clang::Expr *expr, const clang::Type *type, llvm::Str
       fields.push_back(fd);
 
     for (unsigned i = 0; i < to_walk->getNumInits() && i < fields.size(); ++i) {
+      // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
       const clang::FieldDecl *fd = fields[i];
       llvm::SmallString<64> path;
       llvm::raw_svector_ostream(path) << accessPath << "." << fd->getName();

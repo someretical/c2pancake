@@ -24,13 +24,11 @@
 using namespace pancake;
 
 IRBuilder::IRBuilder(const clang::Rewriter &R, clang::ASTContext &Ctx)
-    : Rewriter(R), Ctx(Ctx), LO(Ctx.getLangOpts()), SM(Ctx.getSourceManager()) {
-}
+    : Rewriter(R), Ctx(Ctx), LO(Ctx.getLangOpts()), SM(Ctx.getSourceManager()) {}
 
 auto IRBuilder::TraverseFunctionDecl(clang::FunctionDecl *FD) -> bool {
   CurrentFunction = FD;
-  auto guard =
-      llvm::scope_exit([this] -> void { this->CurrentFunction = nullptr; });
+  auto guard = llvm::scope_exit([this] -> void { this->CurrentFunction = nullptr; });
 
   if (!RecursiveASTVisitor::TraverseFunctionDecl(FD))
     return false;
@@ -44,12 +42,9 @@ auto IRBuilder::TraverseFunctionDecl(clang::FunctionDecl *FD) -> bool {
   auto parm_var_decls = FD->parameters();
 
   std::vector<Param> args;
-  std::ranges::transform(parm_var_decls, std::back_inserter(args),
-                         [](clang::ParmVarDecl *PVD) -> Param {
-                           return Param{.name = PVD->getName().str(),
-                                        .shape =
-                                            1}; // TODO: support other shapes
-                         });
+  std::ranges::transform(parm_var_decls, std::back_inserter(args), [](clang::ParmVarDecl *PVD) -> Param {
+    return Param{.name = PVD->getName().str(), .shape = 1}; // TODO: support other shapes
+  });
   auto base_body_vec = IR_BuiltStmts.at(FD->getBody());
   assert(base_body_vec.size() == 1);
   // assert body is a BlockStmt and extract the inner block since function
@@ -58,8 +53,7 @@ auto IRBuilder::TraverseFunctionDecl(clang::FunctionDecl *FD) -> bool {
   assert(base_body->kind == StmtKind::Block);
   auto body = std::dynamic_pointer_cast<BlockStmt>(base_body)->block;
 
-  auto return_type =
-      FD->getReturnType().getAsString(); // TODO handle complicated return types
+  auto return_type = FD->getReturnType().getAsString(); // TODO handle complicated return types
 
   IR_FunctionMap.try_emplace(key, location, name, args, return_type, body);
   FunctionOrdering.emplace_back(IR_FunctionMap.at(key));
@@ -80,8 +74,7 @@ auto IRBuilder::TraverseCompoundStmt(clang::CompoundStmt *CS) -> bool {
     stmts.insert(stmts.end(), stmt_vec.begin(), stmt_vec.end());
   }
 
-  auto block_stmt = std::make_shared<BlockStmt>(
-      location, std::make_shared<Block>(location, std::move(stmts)));
+  auto block_stmt = std::make_shared<BlockStmt>(location, std::make_shared<Block>(location, std::move(stmts)));
   IR_BuiltStmts.try_emplace(key, std::vector<StmtPtr>{block_stmt});
 
   return true;
@@ -100,14 +93,12 @@ auto IRBuilder::TraverseDeclStmt(clang::DeclStmt *D) -> bool {
       // TODO support array shapes
 
       auto init_expr = IR_BuiltExprs.at(var_decl->getInit()->IgnoreImpCasts());
-      auto var_decl_stmt = std::make_shared<VarDeclStmt>(
-          location, name, init_expr.finalExpr, shape);
+      auto var_decl_stmt = std::make_shared<VarDeclStmt>(location, name, init_expr.finalExpr, shape);
+      // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
       auto &stmt_vec = IR_BuiltStmts[D];
-      stmt_vec.insert(stmt_vec.end(), init_expr.preStmts.rbegin(),
-                      init_expr.preStmts.rend());
+      stmt_vec.insert(stmt_vec.end(), init_expr.preStmts.rbegin(), init_expr.preStmts.rend());
       stmt_vec.push_back(var_decl_stmt);
-      stmt_vec.insert(stmt_vec.end(), init_expr.postStmts.begin(),
-                      init_expr.postStmts.end());
+      stmt_vec.insert(stmt_vec.end(), init_expr.postStmts.begin(), init_expr.postStmts.end());
     } else {
       llvm_unreachable("Only VarDecl is supported under DeclStmt");
     }
@@ -124,16 +115,13 @@ auto IRBuilder::TraverseReturnStmt(clang::ReturnStmt *RS) -> bool {
   std::vector<StmtPtr> stmts;
   if (RS->getRetValue() != nullptr) {
     auto ret_built_expr = IR_BuiltExprs.at(RS->getRetValue()->IgnoreImpCasts());
-    stmts.insert(stmts.end(), ret_built_expr.preStmts.rbegin(),
-                 ret_built_expr.preStmts.rend());
-    stmts.push_back(
-        std::make_shared<ReturnStmt>(location, ret_built_expr.finalExpr));
+    stmts.insert(stmts.end(), ret_built_expr.preStmts.rbegin(), ret_built_expr.preStmts.rend());
+    stmts.push_back(std::make_shared<ReturnStmt>(location, ret_built_expr.finalExpr));
     // stmts.insert(stmts.end(), ret_built_expr.postStmts.begin(),
     //              ret_built_expr.postStmts.end());
   } else {
     // return without value, treat it as returning 0
-    stmts.push_back(std::make_shared<ExprStmt>(
-        location, std::make_shared<IntLitExpr>(location, 0)));
+    stmts.push_back(std::make_shared<ExprStmt>(location, std::make_shared<IntLitExpr>(location, 0)));
   }
 
   IR_BuiltStmts.try_emplace(RS, stmts);
@@ -149,9 +137,7 @@ auto IRBuilder::TraverseDeclRefExpr(clang::DeclRefExpr *DRE) -> bool {
   auto name = DRE->getNameInfo().getAsString();
 
   auto decl_ref_expr = std::make_shared<DeclRefExpr>(location, name);
-  IR_BuiltExprs.try_emplace(DRE, BuiltExpression{.finalExpr = decl_ref_expr,
-                                                 .preStmts = {},
-                                                 .postStmts = {}});
+  IR_BuiltExprs.try_emplace(DRE, BuiltExpression{.finalExpr = decl_ref_expr, .preStmts = {}, .postStmts = {}});
 
   return true;
 }
@@ -164,9 +150,7 @@ auto IRBuilder::TraverseIntegerLiteral(clang::IntegerLiteral *IL) -> bool {
   auto value = IL->getValue().getSExtValue();
 
   auto int_lit_expr = std::make_shared<IntLitExpr>(location, value);
-  IR_BuiltExprs.try_emplace(IL, BuiltExpression{.finalExpr = int_lit_expr,
-                                                .preStmts = {},
-                                                .postStmts = {}});
+  IR_BuiltExprs.try_emplace(IL, BuiltExpression{.finalExpr = int_lit_expr, .preStmts = {}, .postStmts = {}});
 
   return true;
 }

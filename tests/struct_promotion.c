@@ -1,6 +1,32 @@
 #include <stddef.h>
 #include <stdint.h>
 
+// DO name
+struct {
+  int x;
+} a;
+
+// DO name
+typedef struct {
+  int x;
+} T;
+
+// DON'T name since x is injected as an IndirectFieldDecl into Outer
+struct Outer {
+  struct {
+    int x;
+  };
+};
+
+// DON'T name since x is injected as an IndirectFieldDecl into U
+union U {
+  struct {
+    int x;
+    int y;
+  };
+  int z;
+};
+
 /* Global struct (promoted in-place) */
 struct GlobalPoint {
   int x;
@@ -75,8 +101,7 @@ void use_local_rect(void) {
   struct LocalRect {
     short width;
     short height;
-  };
-  struct LocalRect r = {100, 200};
+  } r = {100, 200};
   (void)r;
 
   struct MixedStruct2 {

@@ -10,9 +10,9 @@
             "name": "Debug c2pancake",
             "program": "${command:cmake.launchTargetPath}",
             "args": [
-                "tests/double_side_effect.c",
+                "tests/struct.c",
                 "--",
-                "--target=aarch64-linux-gnu",
+                // "--target=aarch64-linux-gnu",
                 "-std=c23",
             ],
             "cwd": "${workspaceFolder}",
