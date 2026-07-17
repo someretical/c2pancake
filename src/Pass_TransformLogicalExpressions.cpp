@@ -128,10 +128,10 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
     }
   }
 
-  pa_ctx.failure_mode = FailureMode::RepeatPass;
+  pa_ctx.run_result = RunResult::RepeatPass;
   if (!add_error_occurred && replacements.empty()) {
     // All edits successfully added; no need to repeat this pass
-    pa_ctx.failure_mode = FailureMode::Success;
+    pa_ctx.run_result = RunResult::Success;
   }
 }
 } // namespace pancake::pass_hoist_condition_expressions
@@ -219,6 +219,40 @@ public:
     } else if (auto *string_literal = dyn_cast<StringLiteral>(expr)) {
       os << Lexer::getSourceText(CharSourceRange::getTokenRange(string_literal->getSourceRange()),
                                  data.Ctx.getSourceManager(), data.Ctx.getLangOpts());
+    } else if (auto *statement_expr = dyn_cast<StmtExpr>(expr)) {
+      // StmtExpr is a GNU extension that allows a block of statements to be used as an expression
+      // The value of the expression is the value of the last statement in the block
+      auto *compound_stmt = statement_expr->getSubStmt();
+      auto *last = compound_stmt->body_back();
+      auto *last_stmt_as_expr = dyn_cast<Expr>(last);
+      assert(last_stmt_as_expr != nullptr && "Last statement in StmtExpr must be an expression");
+      last_stmt_as_expr = last_stmt_as_expr->IgnoreParenImpCasts();
+
+      std::string pre_block;
+      llvm::raw_string_ostream os2(pre_block);
+      std::string tmp_var_name = GetTempVarName("GNUStmtExprResult");
+      os2 << llvm::formatv("{0};\n", PrintType(last_stmt_as_expr->getType(), tmp_var_name));
+      os2 << "{\n";
+      for (auto *stmt : compound_stmt->body()) {
+        if (stmt == last) {
+          auto last_expr_built_expr = BuildExpr(last_stmt_as_expr, depth + 1);
+          os2 << llvm::join(last_expr_built_expr.pre_stmts | std::views::reverse, "\n");
+          // assign the result of the last expression to the temporary variable
+          os2 << llvm::formatv("\n{0} = {1};", tmp_var_name, last_expr_built_expr.final_expr);
+        } else {
+          os2 << Lexer::getSourceText(CharSourceRange::getTokenRange(stmt->getSourceRange()),
+                                      data.Ctx.getSourceManager(), data.Ctx.getLangOpts())
+                     .str()
+              << "\n";
+          // we need to rerun this pass to process the statements in the block
+          data.pa_ctx.run_result = RunResult::RepeatPass;
+        }
+      }
+
+      os2 << "}\n";
+      os2.flush();
+      pre_stmts.push_back(pre_block);
+      os << tmp_var_name;
     }
     // CompoundAssignOperator is a specialization of BinaryOperator
     else if (auto *compound_assign_operator = dyn_cast<CompoundAssignOperator>(expr)) {
@@ -566,16 +600,16 @@ if ({2}) {
         }
       } else if (auto *var_decl = dyn_cast<VarDecl>(decl)) {
         auto *init_expr = var_decl->getInit();
-        if (init_expr == nullptr) {
-          continue;
+        if (init_expr != nullptr) {
+          // depth is 1 because the decl stmt has depth 0
+          auto res = BuildExpr(init_expr->IgnoreParenImpCasts(), 1);
+          for (auto &&pre_stmt : res.pre_stmts | std::views::reverse) {
+            os << pre_stmt << "\n";
+          }
+          os << llvm::formatv("{0} = {1};", PrintType(var_decl->getType(), var_decl->getName()), res.final_expr);
+        } else {
+          os << PrintType(var_decl->getType(), var_decl->getName()) << ";";
         }
-
-        // depth is 1 because the decl stmt has depth 0
-        auto res = BuildExpr(init_expr->IgnoreParenImpCasts(), 1);
-        for (auto &&pre_stmt : res.pre_stmts | std::views::reverse) {
-          os << pre_stmt << "\n";
-        }
-        os << llvm::formatv("{0} = {1};", PrintType(var_decl->getType(), var_decl->getName()), res.final_expr);
       }
     }
 
@@ -635,10 +669,13 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
     }
   }
 
-  pa_ctx.failure_mode = FailureMode::Success;
-  if (!add_error_occurred && replacements.empty()) {
-    // All edits successfully added; no need to repeat this pass
-    pa_ctx.failure_mode = FailureMode::Success;
-  }
+  assert(!add_error_occurred && "Add replacement conflict should not occur in this pass");
+
+  // If a GNU statement expression was encountered, we need to rerun this pass
+  // The statment expr contains a block of statements which are not recursively traversed by the AST visitor in
+  // this pass. By running this pass again, we can ensure that any nested expressions within the statement expression
+  // are also transformed.
+  // RunResult is set to success by default, so we only need to set it to RepeatPass if we want to rerun this pass.
+  // The RepeatPass is set in the BuildExpr function when a StmtExpr is encountered, so we don't need to set it here.
 }
 } // namespace pancake::pass_lower_nested_expressions

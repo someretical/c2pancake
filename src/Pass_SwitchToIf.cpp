@@ -71,7 +71,7 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
   }
 
   // this pass should only be executed once!
-  pa_ctx.failure_mode = FailureMode::Success;
+  pa_ctx.run_result = RunResult::Success;
 }
 } // namespace pancake::pass_add_switch_fallthrough
 
@@ -484,10 +484,10 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
     }
   }
 
-  pa_ctx.failure_mode = FailureMode::RepeatPass;
+  pa_ctx.run_result = RunResult::RepeatPass;
   if (!add_error_occurred && replacements.empty()) {
     // All edits successfully added; no need to repeat this pass
-    pa_ctx.failure_mode = FailureMode::Success;
+    pa_ctx.run_result = RunResult::Success;
   }
 }
 } // namespace pancake::pass_normalise_switches
@@ -730,10 +730,10 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
     }
   }
 
-  pa_ctx.failure_mode = FailureMode::RepeatPass;
+  pa_ctx.run_result = RunResult::RepeatPass;
   if (!add_error_occurred && replacements.empty()) {
     // All edits successfully added; no need to repeat this pass
-    pa_ctx.failure_mode = FailureMode::Success;
+    pa_ctx.run_result = RunResult::Success;
   }
 }
 } // namespace pancake::pass_switch_to_if

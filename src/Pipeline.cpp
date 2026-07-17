@@ -63,37 +63,37 @@ auto Pipeline::Run() -> int {
 
         auto action_type = ctx.action_type.value();
         if (action_type == PipelineActionType::Rewriter) {
-          if (ctx.failure_mode == FailureMode::Success) {
+          if (ctx.run_result == RunResult::Success) {
             llvm::outs() << llvm::formatv("{0} Complete after {2} iteration(s)\n", LogBegin(ctx),
                                           ctx.action_name.value(), k + 1);
             current_suffix = next_suffix;
             break;
           }
 
-          if (ctx.failure_mode == FailureMode::Fail) {
+          if (ctx.run_result == RunResult::Fail) {
             llvm::errs() << llvm::formatv("{0} Failed after {2} iteration(s)\n", LogBegin(ctx), ctx.action_name.value(),
                                           k + 1);
             move_onto_next_file = true;
             break;
           }
 
-          if (ctx.failure_behaviour == FailureBehaviour::RepeatPass && ctx.failure_mode == FailureMode::RepeatPass) {
+          if (ctx.failure_behaviour == FailureBehaviour::RepeatPass && ctx.run_result == RunResult::RepeatPass) {
             current_suffix = next_suffix;
             // run pass again
           } else {
 
             llvm::outs() << llvm::formatv("{0} Unknown state, ctx.failure_behaviour: {1}, ctx.failure_mode: {2}\n",
                                           LogBegin(ctx), std::to_underlying(ctx.failure_behaviour.value()),
-                                          std::to_underlying(ctx.failure_mode));
+                                          std::to_underlying(ctx.run_result));
             llvm_unreachable("");
           }
         } else if (action_type == PipelineActionType::Analyser) {
-          if (ctx.failure_mode == FailureMode::Success) {
+          if (ctx.run_result == RunResult::Success) {
             llvm::outs() << llvm::formatv("{0} Analysis successful\n", LogBegin(ctx), ctx.action_name.value());
             break;
           }
 
-          if (ctx.failure_mode == FailureMode::Fail) {
+          if (ctx.run_result == RunResult::Fail) {
             llvm::errs() << llvm::formatv("{0} Analysis failed\n", LogBegin(ctx), ctx.action_name.value());
             move_onto_next_file = true;
             break;

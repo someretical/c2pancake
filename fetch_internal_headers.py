@@ -9,7 +9,7 @@ OWNER = "llvm"
 REPO = "llvm-project"
 REF = "llvmorg-22.1.8"
 START_PATHS = ["clang/lib/CodeGen", "clang-tools-extra/clangd"]
-OUTPUT_DIR = Path("include")
+OUTPUT_DIR = Path("include") / REPO
 
 API = f"https://api.github.com/repos/{OWNER}/{REPO}/contents"
 

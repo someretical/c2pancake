@@ -174,10 +174,10 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
     }
   }
 
-  pa_ctx.failure_mode = FailureMode::RepeatPass;
+  pa_ctx.run_result = RunResult::RepeatPass;
   if (!add_error_occurred && replacements.empty()) {
     // All edits successfully added; no need to repeat this pass
-    pa_ctx.failure_mode = FailureMode::Success;
+    pa_ctx.run_result = RunResult::Success;
   }
 }
 } // namespace pancake::pass_normalise_if_statements

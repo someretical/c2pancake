@@ -1,12 +1,6 @@
 #include "Pass_LowerBitfieldOps.h"
 #include "Utils.h"
 
-#include "clang/lib/CodeGen/Address.h"
-#include "clang/lib/CodeGen/CGRecordLayout.h"
-#include "clang/lib/CodeGen/CodeGenFunction.h"
-#include "clang/lib/CodeGen/CodeGenModule.h"
-#include "clang/lib/CodeGen/CodeGenTypes.h"
-
 #include <clang/AST/ASTConsumer.h>
 #include <clang/AST/ASTContext.h>
 #include <clang/AST/Decl.h>
@@ -22,6 +16,11 @@
 #include <clang/Lex/Lexer.h>
 #include <clang/Rewrite/Core/Rewriter.h>
 #include <clang/Tooling/Core/Replacement.h>
+#include <clang/lib/CodeGen/Address.h>
+#include <clang/lib/CodeGen/CGRecordLayout.h>
+#include <clang/lib/CodeGen/CodeGenFunction.h>
+#include <clang/lib/CodeGen/CodeGenModule.h>
+#include <clang/lib/CodeGen/CodeGenTypes.h>
 #include <llvm/ADT/SmallVector.h>
 #include <llvm/ADT/StringExtras.h>
 #include <llvm/ADT/StringRef.h>
@@ -322,14 +321,12 @@ public:
     for (auto *decl : declStmt->decls()) {
       if (auto *var_decl = dyn_cast<VarDecl>(decl)) {
         auto *init_expr = var_decl->getInit();
-        if (init_expr == nullptr) {
-          continue;
+        if (init_expr != nullptr) {
+          auto res =
+              BuildExpr(init_expr->IgnoreParenImpCasts(), {.depth = 0, .encountered_top_most_arrow_access = false});
+          os << llvm::join(res.pre_stmts | std::views::reverse, "\n");
+          os << llvm::formatv("{0} = {1};", PrintType(var_decl->getType(), var_decl->getName()), res.final_expr);
         }
-
-        auto res =
-            BuildExpr(init_expr->IgnoreParenImpCasts(), {.depth = 0, .encountered_top_most_arrow_access = false});
-        os << llvm::join(res.pre_stmts | std::views::reverse, "\n");
-        os << llvm::formatv("{0} = {1};", PrintType(var_decl->getType(), var_decl->getName()), res.final_expr);
       }
     }
 
@@ -388,10 +385,10 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
     }
   }
 
-  pa_ctx.failure_mode = FailureMode::Success;
+  pa_ctx.run_result = RunResult::Success;
   if (!add_error_occurred && replacements.empty()) {
     // All edits successfully added; no need to repeat this pass
-    pa_ctx.failure_mode = FailureMode::Success;
+    pa_ctx.run_result = RunResult::Success;
   }
 }
 } // namespace pancake::pass_lower_arrow_accesses
@@ -490,6 +487,7 @@ struct WorkerData {
   PipelineActionCtx &pa_ctx;
   llvm::SmallVector<Replacement, 64> &replacements;
   size_t tmp_var_counter = 0;
+  bool need_non_volatile_bitfield_helpers = false;
 };
 
 class Worker : public RecursiveASTVisitor<Worker> {
@@ -857,6 +855,7 @@ public:
                                     rhs_built_expr.final_expr, base_addr, start_bit, end_bit);
                 pre_stmts.insert(pre_stmts.end(), rhs_built_expr.pre_stmts.begin(), rhs_built_expr.pre_stmts.end());
                 pre_stmts.insert(pre_stmts.end(), base_built_expr.pre_stmts.begin(), base_built_expr.pre_stmts.end());
+                data.need_non_volatile_bitfield_helpers = true;
               }
 
               // NOLINTNEXTLINE(cppcoreguidelines-avoid-goto)
@@ -1022,6 +1021,7 @@ public:
               os << llvm::formatv("__c2pnk_get_bitfield_{0}((const uint8_t *){1}, {2}, {3})",
                                   info.IsSigned ? "i64" : "u64", base_addr, start_bit, end_bit);
               pre_stmts.insert(pre_stmts.end(), base_built_expr.pre_stmts.begin(), base_built_expr.pre_stmts.end());
+              data.need_non_volatile_bitfield_helpers = true;
             }
 
             // NOLINTNEXTLINE(cppcoreguidelines-avoid-goto)
@@ -1058,13 +1058,11 @@ public:
     for (auto *decl : declStmt->decls()) {
       if (auto *var_decl = dyn_cast<VarDecl>(decl)) {
         auto *init_expr = var_decl->getInit();
-        if (init_expr == nullptr) {
-          continue;
+        if (init_expr != nullptr) {
+          auto res = BuildExpr(init_expr->IgnoreParenImpCasts(), {.depth = 0});
+          os << llvm::join(res.pre_stmts | std::views::reverse, "\n");
+          os << llvm::formatv("{0} = {1};", PrintType(var_decl->getType(), var_decl->getName()), res.final_expr);
         }
-
-        auto res = BuildExpr(init_expr->IgnoreParenImpCasts(), {.depth = 0});
-        os << llvm::join(res.pre_stmts | std::views::reverse, "\n");
-        os << llvm::formatv("{0} = {1};", PrintType(var_decl->getType(), var_decl->getName()), res.final_expr);
       }
     }
 
@@ -1122,12 +1120,19 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
                                          ci.getDiagnostics());
 
   llvm::SmallVector<Replacement, 64> replacements;
-  replacements.emplace_back(Ctx.getSourceManager(),
-                            Ctx.getSourceManager().getLocForStartOfFile(Ctx.getSourceManager().getMainFileID()), 0,
-                            non_volatile_bitfield_helpers);
-  WorkerData data{.Ctx = Ctx, .code_gen_module = code_gen_module, .pa_ctx = pa_ctx, .replacements = replacements};
+  WorkerData data{.Ctx = Ctx,
+                  .code_gen_module = code_gen_module,
+                  .pa_ctx = pa_ctx,
+                  .replacements = replacements,
+                  .need_non_volatile_bitfield_helpers = false};
   Worker w(data);
   w.TraverseDecl(Ctx.getTranslationUnitDecl());
+
+  if (data.need_non_volatile_bitfield_helpers) {
+    replacements.emplace_back(Ctx.getSourceManager(),
+                              Ctx.getSourceManager().getLocForStartOfFile(Ctx.getSourceManager().getMainFileID()), 0,
+                              non_volatile_bitfield_helpers);
+  }
 
   bool add_error_occurred = false;
   for (const auto &r : replacements) {
@@ -1138,10 +1143,10 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
     }
   }
 
-  pa_ctx.failure_mode = FailureMode::Success;
+  pa_ctx.run_result = RunResult::Success;
   if (!add_error_occurred && replacements.empty()) {
     // All edits successfully added; no need to repeat this pass
-    pa_ctx.failure_mode = FailureMode::Success;
+    pa_ctx.run_result = RunResult::Success;
   }
 }
 } // namespace pancake::pass_lower_bitfield_ops

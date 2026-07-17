@@ -43,7 +43,7 @@ So there's a 1-1 relationship between PipelineAction and C2PancakePass
 The Ctx is created inside of Pipeline::Run and passed by reference to each PipelineAction and then C2PancakePass
 */
 enum class FailureBehaviour : uint8_t { MoveToNextPass, RepeatPass, MoveToNextFile };
-enum class FailureMode : uint8_t { Success, RepeatPass, Fail };
+enum class RunResult : uint8_t { Success, RepeatPass, Fail };
 enum class PipelineActionType : uint8_t { None, Rewriter, Analyser };
 struct PipelineActionCtx {
   const size_t major_pass_number;    // provided by Pipeline::Run
@@ -57,7 +57,7 @@ struct PipelineActionCtx {
   std::optional<PipelineActionType> action_type;     // set by the PipelineAction constructor
   std::optional<FailureBehaviour> failure_behaviour; // set by the PipelineAction constructor
   clang::tooling::Replacements &replacements;        // provided by Pipeline::Run, the pass adds to it
-  FailureMode failure_mode = FailureMode::Success;   // set by the pass itself at the end of HandleTranslationUnit
+  RunResult run_result = RunResult::Success;         // set by the pass itself at the end of HandleTranslationUnit
 
   explicit PipelineActionCtx(const size_t pass_number, const size_t minor_pass_number,
                              clang::tooling::Replacements &replacements, const std::string &current_file,

@@ -1,0 +1,21 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "clang AST dump current file",
+            "type": "shell",
+            "command": "clang-22",
+            "args": [
+                "-fsyntax-only",
+                "-Xclang",
+                "-ast-dump-all",
+                "-std=c23",
+                "${file}",
+            ],
+            "presentation": {
+                "reveal": "always"
+            },
+            "problemMatcher": []
+        }
+    ]
+}

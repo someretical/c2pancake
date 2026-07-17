@@ -1,8 +1,8 @@
 #include "Pass_PromoteRecords.h"
 
 #include "Utils.h"
-#include "clang-tools-extra/clangd/FindTarget.h"
 
+#include <clang-tools-extra/clangd/FindTarget.h>
 #include <clang/AST/ASTConsumer.h>
 #include <clang/AST/ASTContext.h>
 #include <clang/AST/Expr.h>
@@ -121,10 +121,10 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
     }
   }
 
-  pa_ctx.failure_mode = FailureMode::RepeatPass;
+  pa_ctx.run_result = RunResult::RepeatPass;
   if (!add_error_occurred && changes.empty()) {
     // All edits successfully added; no need to repeat this pass
-    pa_ctx.failure_mode = FailureMode::Success;
+    pa_ctx.run_result = RunResult::Success;
   }
 }
 }; // namespace pancake::pass_name_anon_records
@@ -226,10 +226,10 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
     }
   }
 
-  pa_ctx.failure_mode = FailureMode::RepeatPass;
+  pa_ctx.run_result = RunResult::RepeatPass;
   if (!add_error_occurred && changes.empty()) {
     // All edits successfully added; no need to repeat this pass
-    pa_ctx.failure_mode = FailureMode::Success;
+    pa_ctx.run_result = RunResult::Success;
   }
 }
 } // namespace pancake::pass_rename_to_be_promoted_records
@@ -334,10 +334,10 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
     }
   }
 
-  pa_ctx.failure_mode = FailureMode::Success;
+  pa_ctx.run_result = RunResult::Success;
   if (!add_error_occurred && replacements.empty()) {
     // All edits successfully added; no need to repeat this pass
-    pa_ctx.failure_mode = FailureMode::Success;
+    pa_ctx.run_result = RunResult::Success;
   }
 }
 } // namespace pancake::pass_promote_records

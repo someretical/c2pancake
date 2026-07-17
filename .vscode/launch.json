@@ -7,10 +7,10 @@
         {
             "type": "lldb-dap",
             "request": "launch",
-            "name": "Debug c2pancake",
+            "name": "Debug c2pancake with current file",
             "program": "${command:cmake.launchTargetPath}",
             "args": [
-                "tests/struct.c",
+                "${file}",
                 "--",
                 // "--target=aarch64-linux-gnu",
                 "-std=c23",

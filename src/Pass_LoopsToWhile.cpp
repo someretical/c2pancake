@@ -86,10 +86,10 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
     }
   }
 
-  pa_ctx.failure_mode = FailureMode::RepeatPass;
+  pa_ctx.run_result = RunResult::RepeatPass;
   if (!add_error_occurred && changes.empty()) {
     // All edits successfully added; no need to repeat this pass
-    pa_ctx.failure_mode = FailureMode::Success;
+    pa_ctx.run_result = RunResult::Success;
   }
 }
 } // namespace pancake::pass_normalise_while_loops
@@ -166,7 +166,7 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
   }
 
   // this pass should only be executed once!
-  pa_ctx.failure_mode = FailureMode::Success;
+  pa_ctx.run_result = RunResult::Success;
 }
 } // namespace pancake::pass_process_continue_in_for_loops
 
@@ -258,10 +258,10 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
     }
   }
 
-  pa_ctx.failure_mode = FailureMode::RepeatPass;
+  pa_ctx.run_result = RunResult::RepeatPass;
   if (!add_error_occurred && changes.empty()) {
     // All edits successfully added; no need to repeat this pass
-    pa_ctx.failure_mode = FailureMode::Success;
+    pa_ctx.run_result = RunResult::Success;
   }
 }
 } // namespace pancake::pass_for_to_while
@@ -357,7 +357,7 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
   }
 
   // this pass should only be executed once!
-  pa_ctx.failure_mode = FailureMode::Success;
+  pa_ctx.run_result = RunResult::Success;
 }
 } // namespace pancake::pass_process_continue_in_do_while_loops
 
@@ -426,10 +426,10 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
     }
   }
 
-  pa_ctx.failure_mode = FailureMode::RepeatPass;
+  pa_ctx.run_result = RunResult::RepeatPass;
   if (!add_error_occurred && changes.empty()) {
     // All edits successfully added; no need to repeat this pass
-    pa_ctx.failure_mode = FailureMode::Success;
+    pa_ctx.run_result = RunResult::Success;
   }
 }
 }; // namespace pancake::pass_do_while_to_while

@@ -53,6 +53,7 @@ add_executable(
   src/main.cpp)
 
 target_include_directories(c2pancake PRIVATE include)
+target_include_directories(c2pancake SYSTEM PRIVATE include/llvm-project)
 
 # recommended security hardening flags
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
