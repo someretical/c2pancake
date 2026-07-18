@@ -42,7 +42,8 @@ auto MakeRule() -> RewriteRule {
   Moves while loop conditions into the body of the loop
   */
   return applyFirst(
-      {makeRule(whileStmt(anyOf(hasCondition(expr().bind(cond_bind)), anything()),
+      {makeRule(whileStmt(hasCondition(expr().bind(cond_bind)),
+                          unless(hasCondition(ignoringParenImpCasts(integerLiteral(equals(1))))),
                           hasBody(compoundStmt(
                                       // Bind the body as a compoundStmt so statements() can extract its interior.
                                       anything())
@@ -50,7 +51,8 @@ auto MakeRule() -> RewriteRule {
                     .bind(while_bind),
                 changeTo(node(while_bind),
                          cat("while (1) {\n", statements(body_bind), "\nif (!(", node(cond_bind), ")) break;", "\n}"))),
-       makeRule(whileStmt(anyOf(hasCondition(expr().bind(cond_bind)), anything()),
+       makeRule(whileStmt(hasCondition(expr().bind(cond_bind)),
+                          unless(hasCondition(ignoringParenImpCasts(integerLiteral(equals(1))))),
                           hasBody(
                               // Exclude compoundStmt so Case A takes priority in applyFirst.
                               stmt(unless(compoundStmt())).bind(body_bind)))
@@ -180,8 +182,6 @@ const std::string body_bind = "for_body";
 
 inline auto OptInit() -> Stencil { return ifBound(init_bind, cat(node(init_bind), "\n"), cat("")); }
 
-inline auto WhileCond() -> Stencil { return cat("while (1)"); }
-
 inline auto BreakCond() -> Stencil {
   return ifBound(cond_bind, cat("if (!(", node(cond_bind), ")) { break; }"), cat(""));
 }
@@ -218,7 +218,7 @@ auto MakeRule() -> RewriteRule {
                                     anything())
                                     .bind(body_bind)))
                     .bind(for_bind),
-                changeTo(node(for_bind), cat("{\n", OptInit(), WhileCond(), " {", BreakCond(), statements(body_bind),
+                changeTo(node(for_bind), cat("{\n", OptInit(), "while (1) {", BreakCond(), statements(body_bind),
                                              OptInc(), "\n}", "\n}"))),
        makeRule(forStmt(anyOf(hasLoopInit(stmt().bind(init_bind)), anything()),
                         anyOf(hasCondition(expr().bind(cond_bind)), anything()),
@@ -227,8 +227,8 @@ auto MakeRule() -> RewriteRule {
                             // Exclude compoundStmt so Case A takes priority in applyFirst.
                             stmt(unless(compoundStmt())).bind(body_bind)))
                     .bind(for_bind),
-                changeTo(node(for_bind), cat("{\n", OptInit(), WhileCond(), " {\n", BreakCond(), statements(body_bind),
-                                             ";", OptInc(), "\n}", "\n}")))}
+                changeTo(node(for_bind), cat("{\n", OptInit(), "while (1) {", BreakCond(), node(body_bind), ";",
+                                             OptInc(), "\n}", "\n}")))}
 
   );
 }
@@ -388,15 +388,15 @@ auto MakeRule() -> RewriteRule {
                                    anything())
                                    .bind(body_bind)))
                     .bind(do_bind),
-                changeTo(node(do_bind),
-                         cat("while (1) {\n", statements(body_bind), "\nif (!(", node(cond_bind), ")) break;", "\n}"))),
+                changeTo(node(do_bind), cat("while (1) {\n", statements(body_bind), "\nif (!(", node(cond_bind),
+                                            ")) { break; }", "\n}"))),
        makeRule(doStmt(anyOf(hasCondition(expr().bind(cond_bind)), anything()),
                        hasBody(
                            // Exclude compoundStmt so Case A takes priority in applyFirst.
                            stmt(unless(compoundStmt())).bind(body_bind)))
                     .bind(do_bind),
                 changeTo(node(do_bind),
-                         cat("while (1) {\n", node(body_bind), ";\nif (!(", node(cond_bind), ")) break;", "\n}")))}
+                         cat("while (1) {\n", node(body_bind), ";\nif (!(", node(cond_bind), ")) { break; }", "\n}")))}
 
   );
 }

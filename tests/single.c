@@ -11,7 +11,7 @@ struct Obj {
 int main(void) {
   int arr[10] = {};
   int i = 0;
-  struct Obj obj{};
+  struct Obj obj;
   arr[obj.arr[i++]]++;
   return 0;
 }

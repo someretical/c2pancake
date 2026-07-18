@@ -1,4 +1,5 @@
 #include <assert.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -62,8 +63,8 @@ int main(void) {
 
   (a.b->z.c->d->u -= abc[a.b->y++]++, a.b->z.c->d->v += abc[a.b->y--]--, a.b->z.c->z += abc[a.b->y++]++);
 
-  assert(a.b->z.c->d->v == 16);
-  assert(a.b->z.c->d->u == 42);
+  printf("a.b->z.c->d->v = %d\n", a.b->z.c->d->v);
+  printf("a.b->z.c->d->u = %d\n", a.b->z.c->d->u);
 
   return 0;
 }

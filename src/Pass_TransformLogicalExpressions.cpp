@@ -8,12 +8,19 @@
 #include <clang/AST/RecursiveASTVisitor.h>
 #include <clang/AST/Stmt.h>
 #include <clang/AST/TypeBase.h>
+#include <clang/ASTMatchers/ASTMatchFinder.h>
+#include <clang/ASTMatchers/ASTMatchers.h>
 #include <clang/Basic/LLVM.h>
 #include <clang/Basic/SourceLocation.h>
 #include <clang/Frontend/CompilerInstance.h>
 #include <clang/Lex/Lexer.h>
 #include <clang/Rewrite/Core/Rewriter.h>
 #include <clang/Tooling/Core/Replacement.h>
+#include <clang/Tooling/Refactoring/AtomicChange.h>
+#include <clang/Tooling/Transformer/RangeSelector.h>
+#include <clang/Tooling/Transformer/RewriteRule.h>
+#include <clang/Tooling/Transformer/Stencil.h>
+#include <clang/Tooling/Transformer/Transformer.h>
 #include <llvm/ADT/SmallVector.h>
 #include <llvm/ADT/StringExtras.h>
 #include <llvm/ADT/StringRef.h>
@@ -30,6 +37,8 @@
 
 using namespace clang;
 using namespace clang::tooling;
+using namespace clang::transformer;
+using namespace clang::ast_matchers;
 
 // reduce all logical expressions and expressions with side effects to temporary variables
 namespace pancake::pass_hoist_condition_expressions {
@@ -64,7 +73,7 @@ public:
     auto tmp_var_name = GetTempVarName("If");
     std::string replacement_text;
     llvm::raw_string_ostream os(replacement_text);
-    os << llvm::formatv("int {0} = ({1});\n", tmp_var_name,
+    os << llvm::formatv("int {0} = {1};\n", tmp_var_name,
                         Lexer::getSourceText(CharSourceRange::getTokenRange(cond->getSourceRange()),
                                              data.Ctx.getSourceManager(), data.Ctx.getLangOpts())
                             .str());
@@ -100,7 +109,7 @@ public:
                         Lexer::getSourceText(CharSourceRange::getTokenRange(cond->getSourceRange()),
                                              data.Ctx.getSourceManager(), data.Ctx.getLangOpts())
                             .str());
-    os << llvm::formatv("return {0};", tmp_var_name);
+    os << llvm::formatv("return {0}", tmp_var_name);
 
     // we want to replace the "return EXPR;" part
     os.flush();
@@ -135,6 +144,90 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
   }
 }
 } // namespace pancake::pass_hoist_condition_expressions
+
+namespace pancake::pass_rewrite_array_indexing {
+namespace {
+auto MakeRule() -> RewriteRule {
+  return makeRule(arraySubscriptExpr(hasBase(expr().bind("base")), hasIndex(expr().bind("index")),
+                                     unless(isExpansionInSystemHeader()))
+                      .bind("array_subscript"),
+                  changeTo(node("array_subscript"), cat("(*(", node("base"), " + (", node("index"), ")))")));
+}
+} // namespace
+
+auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
+  std::vector<AtomicChange> changes;
+  auto t = Transformer(MakeRule(), [&changes](llvm::Expected<llvm::MutableArrayRef<AtomicChange>> c) -> void {
+    if (c)
+      changes.insert(changes.end(), c->begin(), c->end());
+    else
+      llvm::consumeError(c.takeError());
+  });
+
+  MatchFinder finder;
+  t.registerMatchers(&finder);
+  finder.matchAST(Ctx);
+
+  bool add_error_occurred = false;
+  for (const auto &change : changes) {
+    for (const auto &r : change.getReplacements()) {
+      if (auto err = pa_ctx.replacements.add(r)) {
+        llvm::consumeError(std::move(err));
+        llvm::errs() << llvm::formatv("{0} Add replacement conflict, retrying next pass...\n", LogBegin(pa_ctx));
+        add_error_occurred = true;
+      }
+    }
+  }
+
+  pa_ctx.run_result = RunResult::RepeatPass;
+  if (!add_error_occurred && changes.empty()) {
+    // All edits successfully added; no need to repeat this pass
+    pa_ctx.run_result = RunResult::Success;
+  }
+}
+} // namespace pancake::pass_rewrite_array_indexing
+
+namespace pancake::pass_rewrite_struct_stabs {
+namespace {
+auto MakeRule() -> RewriteRule {
+  return makeRule(memberExpr(isArrow(), hasObjectExpression(expr().bind("base")), member(fieldDecl().bind("field")),
+                             unless(isExpansionInSystemHeader()))
+                      .bind("member"),
+                  changeTo(node("member"), cat("(*", node("base"), ").", name("field"))));
+}
+} // namespace
+
+auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
+  std::vector<AtomicChange> changes;
+  auto t = Transformer(MakeRule(), [&changes](llvm::Expected<llvm::MutableArrayRef<AtomicChange>> c) -> void {
+    if (c)
+      changes.insert(changes.end(), c->begin(), c->end());
+    else
+      llvm::consumeError(c.takeError());
+  });
+
+  MatchFinder finder;
+  t.registerMatchers(&finder);
+  finder.matchAST(Ctx);
+
+  bool add_error_occurred = false;
+  for (const auto &change : changes) {
+    for (const auto &r : change.getReplacements()) {
+      if (auto err = pa_ctx.replacements.add(r)) {
+        llvm::consumeError(std::move(err));
+        llvm::errs() << llvm::formatv("{0} Add replacement conflict, retrying next pass...\n", LogBegin(pa_ctx));
+        add_error_occurred = true;
+      }
+    }
+  }
+
+  pa_ctx.run_result = RunResult::RepeatPass;
+  if (!add_error_occurred && changes.empty()) {
+    // All edits successfully added; no need to repeat this pass
+    pa_ctx.run_result = RunResult::Success;
+  }
+}
+} // namespace pancake::pass_rewrite_struct_stabs
 
 namespace pancake::pass_lower_nested_expressions {
 namespace {
@@ -190,19 +283,185 @@ public:
     }
   }
 
+  enum class TailAccess : uint8_t {
+    None,
+    Dot,
+    Arrow,
+    Deref,
+  };
   struct BuiltExpr {
-    llvm::SmallVector<std::string, 4> pre_stmts;
-    std::string final_expr;
+    llvm::SmallVector<std::string, 8> pre_stmts;
     QualType final_expr_type;
+    std::string final_expr;
+    TailAccess tail_access;
+    explicit BuiltExpr(llvm::SmallVector<std::string, 8> pre_stmts, std::string final_expr, QualType final_expr_type,
+                       TailAccess tail_access)
+        : pre_stmts(std::move(pre_stmts)), final_expr_type(final_expr_type), final_expr(std::move(final_expr)),
+          tail_access(tail_access) {}
   };
 
-  auto BuildExpr(Expr *expr, const size_t depth) -> BuiltExpr {
-    expr = expr->IgnoreParenImpCasts();
+  enum class Usage : uint8_t {
+    /**
+     * @brief Compute the expression's resulting value
+     *
+     * Used when: The caller needs the result
+     *
+     * Example: x = a + b, foo(expr), int y = (b = 3)
+     */
+    Value,
 
-    llvm::SmallVector<std::string, 4> pre_stmts;
-    std::string replacement_text;
-    llvm::raw_string_ostream os(replacement_text);
-    QualType const final_expr_type = expr->getType();
+    /**
+     * @brief Compute the reusable description of the storage location of the expression. Note this is very specifically
+     * not supposed to return a pointer!
+     *
+     * Used when: The caller needs to read/write memory at that location
+     *
+     * Example: x = 3 (lhs), *p = v, ++a->b
+     */
+    Place,
+
+    /**
+     * @brief Execute the expression only for its side effects; ignore its value
+     *
+     * Used when: The result is thrown away
+     *
+     * Example: a = 3;, foo(expr);, ++a;
+     */
+    Effect
+  };
+  struct BuildExprCtx {
+    Expr *expr;
+    Usage usage_kind;
+    bool deref_force_extract; // force the extraction of the next deref into a temp var
+    explicit BuildExprCtx(Expr *expr, Usage usage_kind, bool deref_force_extract)
+        : expr(expr), usage_kind(usage_kind), deref_force_extract(deref_force_extract) {}
+  };
+
+  auto GetUsage(const Expr *expr) -> Usage {
+    if (auto *decl_ref_expr = dyn_cast<DeclRefExpr>(expr)) {
+      return Usage::Place;
+    } else if (auto *integer_literal = dyn_cast<IntegerLiteral>(expr)) {
+      return Usage::Place;
+    } else if (auto *floating_literal = dyn_cast<FloatingLiteral>(expr)) {
+      return Usage::Place;
+    } else if (auto *character_literal = dyn_cast<CharacterLiteral>(expr)) {
+      return Usage::Place;
+    } else if (auto *string_literal = dyn_cast<StringLiteral>(expr)) {
+      return Usage::Place;
+    } else if (auto *statement_expr = dyn_cast<StmtExpr>(expr)) {
+      return Usage::Value;
+    }
+    // CompoundAssignOperator is a specialization of BinaryOperator
+    else if (auto *compound_assign_operator = dyn_cast<CompoundAssignOperator>(expr)) {
+      return Usage::Value;
+    } else if (auto *conditional_operator = dyn_cast<ConditionalOperator>(expr)) {
+      return Usage::Value;
+    } else if (auto *binary_operator = dyn_cast<BinaryOperator>(expr)) {
+      switch (binary_operator->getOpcode()) {
+      case BO_LAnd:
+        [[fallthrough]];
+      case BO_LOr:
+        [[fallthrough]];
+      case BO_Assign:
+        [[fallthrough]];
+      case BO_Comma:
+        [[fallthrough]];
+      case BO_Mul:
+        [[fallthrough]];
+      case BO_Div:
+        [[fallthrough]];
+      case BO_Rem:
+        [[fallthrough]];
+      case BO_Add:
+        [[fallthrough]];
+      case BO_Sub:
+        [[fallthrough]];
+      case BO_Shl:
+        [[fallthrough]];
+      case BO_Shr:
+        [[fallthrough]];
+      case BO_LT:
+        [[fallthrough]];
+      case BO_GT:
+        [[fallthrough]];
+      case BO_LE:
+        [[fallthrough]];
+      case BO_GE:
+        [[fallthrough]];
+      case BO_EQ:
+        [[fallthrough]];
+      case BO_NE:
+        [[fallthrough]];
+      case BO_And:
+        [[fallthrough]];
+      case BO_Xor:
+        [[fallthrough]];
+      case BO_Or: {
+        return Usage::Value;
+      }
+
+      default: {
+        llvm_unreachable("Unhandled binary operator");
+        break;
+      }
+      }
+    } else if (auto *unary_operator = dyn_cast<UnaryOperator>(expr)) {
+
+      switch (unary_operator->getOpcode()) {
+      case UO_PostInc:
+        [[fallthrough]];
+      case UO_PostDec: {
+        return Usage::Value;
+      }
+
+      case UO_PreInc:
+        [[fallthrough]];
+      case UO_PreDec: {
+        return Usage::Value;
+      }
+
+      case UO_Deref: {
+        return Usage::Place;
+      }
+
+      case UO_AddrOf:
+        [[fallthrough]];
+      case UO_Plus:
+        [[fallthrough]];
+      case UO_Minus:
+        [[fallthrough]];
+      case UO_Not:
+        [[fallthrough]];
+      case UO_LNot:
+        [[fallthrough]];
+      case UO_Real:
+        [[fallthrough]];
+      case UO_Imag:
+        [[fallthrough]];
+      case UO_Extension: {
+        return Usage::Place;
+      }
+
+      default: {
+        llvm_unreachable("Unhandled unary operator");
+        break;
+      }
+      }
+    } else if (auto *call_expr = dyn_cast<CallExpr>(expr)) {
+      return Usage::Value;
+    } else {
+      return Usage::Place;
+    }
+  }
+
+  auto BuildExpr(const BuildExprCtx &ctx) -> BuiltExpr {
+    auto *expr = ctx.expr->IgnoreParenImpCasts();
+
+    llvm::SmallVector<std::string, 8> pre_stmts;
+    std::string final_expr;
+    llvm::raw_string_ostream os(final_expr);
+    const QualType final_expr_type = expr->getType();
+    TailAccess tail_access = TailAccess::None;
 
     if (auto *decl_ref_expr = dyn_cast<DeclRefExpr>(expr)) {
       os << Lexer::getSourceText(CharSourceRange::getTokenRange(decl_ref_expr->getSourceRange()),
@@ -228,18 +487,15 @@ public:
       assert(last_stmt_as_expr != nullptr && "Last statement in StmtExpr must be an expression");
       last_stmt_as_expr = last_stmt_as_expr->IgnoreParenImpCasts();
 
+      assert(ctx.usage_kind != Usage::Place && "StmtExpr cannot be used as a place expression");
+
       std::string pre_block;
       llvm::raw_string_ostream os2(pre_block);
-      std::string tmp_var_name = GetTempVarName("GNUStmtExprResult");
-      os2 << llvm::formatv("{0};\n", PrintType(last_stmt_as_expr->getType(), tmp_var_name));
-      os2 << "{\n";
-      for (auto *stmt : compound_stmt->body()) {
-        if (stmt == last) {
-          auto last_expr_built_expr = BuildExpr(last_stmt_as_expr, depth + 1);
-          os2 << llvm::join(last_expr_built_expr.pre_stmts | std::views::reverse, "\n");
-          // assign the result of the last expression to the temporary variable
-          os2 << llvm::formatv("\n{0} = {1};", tmp_var_name, last_expr_built_expr.final_expr);
-        } else {
+
+      // if the usage kind is effect, we don't need a tmp var at all
+      if (ctx.usage_kind == Usage::Effect) {
+        os2 << "{\n";
+        for (auto *stmt : compound_stmt->body()) {
           os2 << Lexer::getSourceText(CharSourceRange::getTokenRange(stmt->getSourceRange()),
                                       data.Ctx.getSourceManager(), data.Ctx.getLangOpts())
                      .str()
@@ -247,34 +503,74 @@ public:
           // we need to rerun this pass to process the statements in the block
           data.pa_ctx.run_result = RunResult::RepeatPass;
         }
+        os2 << "}\n";
+        // don't add anything to os
+      } else {
+        std::string tmp_var_name = GetTempVarName("GNUStmtExprResult");
+        os2 << llvm::formatv("{0};\n", PrintType(last_stmt_as_expr->getType(), tmp_var_name));
+        os2 << "{\n";
+        for (auto *stmt : compound_stmt->body()) {
+          if (stmt == last) {
+            auto last_expr_built_expr =
+                BuildExpr(BuildExprCtx(last_stmt_as_expr, GetUsage(last_stmt_as_expr), ctx.deref_force_extract));
+            os2 << llvm::join(last_expr_built_expr.pre_stmts | std::views::reverse, "\n");
+
+            // assign the result of the last expression to the temporary variable
+            os2 << llvm::formatv("\n{0} = {1};", tmp_var_name, last_expr_built_expr.final_expr);
+          } else {
+            os2 << Lexer::getSourceText(CharSourceRange::getTokenRange(stmt->getSourceRange()),
+                                        data.Ctx.getSourceManager(), data.Ctx.getLangOpts())
+                       .str()
+                << "\n";
+            // we need to rerun this pass to process the statements in the block
+            data.pa_ctx.run_result = RunResult::RepeatPass;
+          }
+        }
+        os2 << "}\n";
+        os << tmp_var_name;
       }
 
-      os2 << "}\n";
       os2.flush();
       pre_stmts.push_back(pre_block);
-      os << tmp_var_name;
     }
     // CompoundAssignOperator is a specialization of BinaryOperator
     else if (auto *compound_assign_operator = dyn_cast<CompoundAssignOperator>(expr)) {
       auto *lhs = compound_assign_operator->getLHS()->IgnoreParenImpCasts();
       auto *rhs = compound_assign_operator->getRHS()->IgnoreParenImpCasts();
 
-      auto rhs_res = BuildExpr(rhs, depth + 1);
-      auto lhs_res = BuildExpr(lhs, depth + 1);
+      // technically we need to compute both the place and value of the LHS, but syntactically at least,
+      // every valid place is also a valid value (not the other way around though!)
+      // note this is only true since we are working with a "description" of the place, not a pointer!
+      auto rhs_res = BuildExpr(BuildExprCtx(rhs, GetUsage(rhs), ctx.deref_force_extract));
+      auto lhs_res = BuildExpr(BuildExprCtx(lhs, Usage::Place, ctx.deref_force_extract));
 
-      if (depth == 0) {
-        // semi-colon is added by the caller
-        os << llvm::formatv("{0} = {0} {1} {2}", lhs_res.final_expr,
-                            BinaryOperator::getOpcodeStr(CompoundAssignOpToOp(compound_assign_operator->getOpcode())),
-                            rhs_res.final_expr);
-      } else {
-        // we need to hoist this before
+      assert(ctx.usage_kind != Usage::Place && "Compound assignment operator cannot be used as a place expression");
+
+      // don't care about temp var
+      if (ctx.usage_kind == Usage::Effect) {
         pre_stmts.push_back(
             llvm::formatv("{0} = {0} {1} {2};\n", lhs_res.final_expr,
                           BinaryOperator::getOpcodeStr(CompoundAssignOpToOp(compound_assign_operator->getOpcode())),
                           rhs_res.final_expr)
                 .str());
-        os << lhs_res.final_expr;
+      } else {
+        std::string tmp_var_name = GetTempVarName("CompoundAssignResult");
+        pre_stmts.push_back(
+            llvm::formatv(
+                /*
+                0 = temp var for result of compound assignment
+                1 = lhs final expr
+                2 = binary operator string for compound assignment
+                3 = rhs final expr
+                4 = tmp var name (without type!)
+                */
+                R"({0} = {1} {2} {3};
+{1} = {4};)",
+                PrintType(compound_assign_operator->getType(), tmp_var_name), lhs_res.final_expr,
+                BinaryOperator::getOpcodeStr(CompoundAssignOpToOp(compound_assign_operator->getOpcode())),
+                rhs_res.final_expr, tmp_var_name)
+                .str());
+        os << tmp_var_name;
       }
       pre_stmts.insert(pre_stmts.end(), rhs_res.pre_stmts.begin(), rhs_res.pre_stmts.end());
       pre_stmts.insert(pre_stmts.end(), lhs_res.pre_stmts.begin(), lhs_res.pre_stmts.end());
@@ -283,13 +579,13 @@ public:
       auto *lhs = conditional_operator->getTrueExpr()->IgnoreParenImpCasts();
       auto *rhs = conditional_operator->getFalseExpr()->IgnoreParenImpCasts();
 
-      auto cond_res = BuildExpr(cond, depth + 1);
-      auto lhs_res = BuildExpr(lhs, depth + 1);
-      auto rhs_res = BuildExpr(rhs, depth + 1);
+      auto cond_res = BuildExpr(BuildExprCtx(cond, GetUsage(cond), ctx.deref_force_extract));
+      auto lhs_res = BuildExpr(BuildExprCtx(lhs, GetUsage(lhs), ctx.deref_force_extract));
+      auto rhs_res = BuildExpr(BuildExprCtx(rhs, GetUsage(rhs), ctx.deref_force_extract));
 
       std::string tmp_var_name = GetTempVarName("TernaryResult");
       std::string tmp_cond_name = GetTempVarName("TernaryCond");
-      std::string const if_cond = llvm::formatv(
+      const std::string if_cond = llvm::formatv(
           /*
           0 = var for result of ?:
           1 = condition bool pre stmts
@@ -326,8 +622,8 @@ if ({2}) {
       switch (binary_operator->getOpcode()) {
         // LAnd and LOr are handled specially because they short circuit
       case BO_LAnd: {
-        auto lhs_res = BuildExpr(lhs, depth + 1);
-        auto rhs_res = BuildExpr(rhs, depth + 1);
+        auto lhs_res = BuildExpr(BuildExprCtx(lhs, GetUsage(lhs), ctx.deref_force_extract));
+        auto rhs_res = BuildExpr(BuildExprCtx(rhs, GetUsage(rhs), ctx.deref_force_extract));
         std::string tmp_var_name = GetTempVarName("LAnd");
         std::string const if_cond = llvm::formatv(
             /*
@@ -358,10 +654,10 @@ if (!({2})) {
         break;
       }
       case BO_LOr: {
-        auto lhs_res = BuildExpr(lhs, depth + 1);
-        auto rhs_res = BuildExpr(rhs, depth + 1);
+        auto lhs_res = BuildExpr(BuildExprCtx(lhs, GetUsage(lhs), ctx.deref_force_extract));
+        auto rhs_res = BuildExpr(BuildExprCtx(rhs, GetUsage(rhs), ctx.deref_force_extract));
         std::string tmp_var_name = GetTempVarName("LOr");
-        std::string const if_cond = llvm::formatv(
+        const std::string if_cond = llvm::formatv(
             /*
             0 = lhs pre stmts
             1 = tmp var for result of ||
@@ -390,30 +686,28 @@ if ({2}) {
       }
 
       case BO_Assign: {
-        auto rhs_res = BuildExpr(rhs, depth + 1);
-        auto lhs_res = BuildExpr(lhs, depth + 1);
+        auto rhs_res = BuildExpr(BuildExprCtx(rhs, GetUsage(rhs), ctx.deref_force_extract));
+        auto lhs_res = BuildExpr(BuildExprCtx(lhs, Usage::Place, ctx.deref_force_extract));
 
-        if (depth == 0) {
-          // semi-colon is added by the caller
-          os << llvm::formatv("{0} = {1}", lhs_res.final_expr, rhs_res.final_expr);
-        } else {
-          // we need to hoist this before
-          pre_stmts.push_back(llvm::formatv("{0} = {1};", lhs_res.final_expr, rhs_res.final_expr).str());
+        assert(ctx.usage_kind != Usage::Place && "Assignment operator cannot be used as a place expression");
+
+        pre_stmts.push_back(llvm::formatv("{0} = {1};", lhs_res.final_expr, rhs_res.final_expr).str());
+        if (ctx.usage_kind == Usage::Value) {
           os << lhs_res.final_expr;
         }
 
         pre_stmts.insert(pre_stmts.end(), rhs_res.pre_stmts.begin(), rhs_res.pre_stmts.end());
         pre_stmts.insert(pre_stmts.end(), lhs_res.pre_stmts.begin(), lhs_res.pre_stmts.end());
-
         break;
       }
 
       case BO_Comma: {
         // LHS is evaluated first, then RHS
-        // RHS is returned
+        // RHS is returned (only when ctx.usage_kind == Value)
 
-        auto rhs_res = BuildExpr(rhs, depth + 1);
-        auto lhs_res = BuildExpr(lhs, depth + 1);
+        auto rhs_res = BuildExpr(BuildExprCtx(rhs, ctx.usage_kind == Usage::Effect ? Usage::Effect : GetUsage(rhs),
+                                              ctx.deref_force_extract));
+        auto lhs_res = BuildExpr(BuildExprCtx(lhs, GetUsage(lhs), ctx.deref_force_extract));
         pre_stmts.insert(pre_stmts.end(), rhs_res.pre_stmts.begin(), rhs_res.pre_stmts.end());
         pre_stmts.insert(pre_stmts.end(), lhs_res.pre_stmts.begin(), lhs_res.pre_stmts.end());
 
@@ -452,14 +746,18 @@ if ({2}) {
       case BO_Xor:
         [[fallthrough]];
       case BO_Or: {
-        auto rhs_res = BuildExpr(rhs, depth + 1);
-        auto lhs_res = BuildExpr(lhs, depth + 1);
-        pre_stmts.insert(pre_stmts.end(), rhs_res.pre_stmts.begin(), rhs_res.pre_stmts.end());
-        pre_stmts.insert(pre_stmts.end(), lhs_res.pre_stmts.begin(), lhs_res.pre_stmts.end());
 
-        // recursion level doesn't matter
+        auto rhs_res = BuildExpr(BuildExprCtx(rhs, GetUsage(rhs), ctx.deref_force_extract));
+        auto lhs_res = BuildExpr(BuildExprCtx(lhs, GetUsage(lhs), ctx.deref_force_extract));
+
+        assert(ctx.usage_kind != Usage::Place && "Binary operator cannot be used as a place expression");
+
+        // don't return a pre stmt no matter what since these can be arbitrarily nested
         os << llvm::formatv("({0} {1} {2})", lhs_res.final_expr,
                             BinaryOperator::getOpcodeStr(binary_operator->getOpcode()), rhs_res.final_expr);
+
+        pre_stmts.insert(pre_stmts.end(), rhs_res.pre_stmts.begin(), rhs_res.pre_stmts.end());
+        pre_stmts.insert(pre_stmts.end(), lhs_res.pre_stmts.begin(), lhs_res.pre_stmts.end());
         break;
       }
 
@@ -470,47 +768,108 @@ if ({2}) {
       }
     } else if (auto *unary_operator = dyn_cast<UnaryOperator>(expr)) {
       auto *sub_expr = unary_operator->getSubExpr()->IgnoreParenImpCasts();
-      auto res = BuildExpr(sub_expr, depth + 1);
+      // auto res = BuildExpr(sub_expr, depth + 1);
 
       switch (unary_operator->getOpcode()) {
       case UO_PostInc:
         [[fallthrough]];
       case UO_PostDec: {
-        if (depth == 0) {
-          os << llvm::formatv("{0} = {0} {1} 1", res.final_expr, unary_operator->getOpcode() == UO_PostInc ? "+" : "-");
+        assert(ctx.usage_kind != Usage::Place &&
+               "Postfix increment/decrement operator cannot be used as a place expression");
+
+        auto res = BuildExpr(BuildExprCtx(sub_expr, Usage::Place, ctx.deref_force_extract));
+        if (ctx.usage_kind == Usage::Effect) {
+          pre_stmts.push_back(
+              llvm::formatv(
+                  /*
+                  0 = value of the sub expression
+                  1 = the operator (+ or -)
+                  */
+                  R"({0} = {0} {1} 1;)", res.final_expr, unary_operator->getOpcode() == UO_PostInc ? "+" : "-")
+                  .str());
         } else {
           std::string const tmp_var_name =
-              GetTempVarName(llvm::formatv("{0}", unary_operator->getOpcode() == UO_PostInc ? "PostInc" : "PostDec"));
-          // push in REVERSE order!
-          pre_stmts.push_back(
-              llvm::formatv("{0} = {0} {1} 1;", res.final_expr, unary_operator->getOpcode() == UO_PostInc ? "+" : "-"));
-          pre_stmts.push_back(
-              llvm::formatv("{0} = ({1});", PrintType(res.final_expr_type, tmp_var_name), res.final_expr));
+              GetTempVarName(unary_operator->getOpcode() == UO_PostInc ? "PostInc" : "PostDec");
+          pre_stmts.push_back(llvm::formatv(
+                                  /*
+                                  0 = tmp var for result of postfix inc/dec
+                                  1 = value of the sub expression
+                                  2 = the operator (+ or -)
+                                  */
+                                  R"({0} = {1};
+{1} = {1} {2} 1;)",
+                                  PrintType(res.final_expr_type, tmp_var_name), res.final_expr,
+                                  unary_operator->getOpcode() == UO_PostInc ? "+" : "-")
+                                  .str());
           os << tmp_var_name;
         }
+
+        pre_stmts.insert(pre_stmts.end(), res.pre_stmts.begin(), res.pre_stmts.end());
         break;
       }
 
       case UO_PreInc:
         [[fallthrough]];
       case UO_PreDec: {
-        if (depth == 0) {
-          os << llvm::formatv("{0} = {0} {1} 1", res.final_expr, unary_operator->getOpcode() == UO_PreInc ? "+" : "-");
+        assert(ctx.usage_kind != Usage::Place &&
+               "Prefix increment/decrement operator cannot be used as a place expression");
+
+        auto res = BuildExpr(BuildExprCtx(sub_expr, Usage::Place, ctx.deref_force_extract));
+        if (ctx.usage_kind == Usage::Effect) {
+          pre_stmts.push_back(
+              llvm::formatv(
+                  /*
+                  0 = value of the sub expression
+                  1 = the operator (+ or -)
+                  */
+                  R"({0} = {0} {1} 1;)", res.final_expr, unary_operator->getOpcode() == UO_PreInc ? "+" : "-")
+                  .str());
         } else {
           std::string const tmp_var_name =
-              GetTempVarName(llvm::formatv("{0}", unary_operator->getOpcode() == UO_PreInc ? "PreInc" : "PreDec"));
-          pre_stmts.push_back(
-              llvm::formatv("{0} = ({1});", PrintType(res.final_expr_type, tmp_var_name), res.final_expr));
-          pre_stmts.push_back(
-              llvm::formatv("{0} = {0} {1} 1;", res.final_expr, unary_operator->getOpcode() == UO_PreInc ? "+" : "-"));
+              GetTempVarName(unary_operator->getOpcode() == UO_PreInc ? "PreInc" : "PreDec");
+          pre_stmts.push_back(llvm::formatv(
+                                  /*
+                                  0 = tmp var for result of Prefix inc/dec
+                                  1 = value of the sub expression
+                                  2 = the operator (+ or -)
+                                  */
+                                  R"({1} = {1} {2} 1;
+                                  {0} = {1};)",
+                                  PrintType(res.final_expr_type, tmp_var_name), res.final_expr,
+                                  unary_operator->getOpcode() == UO_PreInc ? "+" : "-")
+                                  .str());
           os << tmp_var_name;
         }
+
+        pre_stmts.insert(pre_stmts.end(), res.pre_stmts.begin(), res.pre_stmts.end());
+        break;
+      }
+
+      case UO_Deref: {
+        auto usage_kind = ctx.deref_force_extract ? Usage::Value : ctx.usage_kind;
+        auto res = BuildExpr(BuildExprCtx(sub_expr, GetUsage(sub_expr), true));
+
+        if (usage_kind == Usage::Place) {
+          os << "*" << res.final_expr;
+        } else {
+          // extract into temp var
+          std::string const tmp_var_name = GetTempVarName("Deref");
+
+          auto decl_type = final_expr_type;
+          if (final_expr_type->isArrayType()) {
+            // Can't copy-initialize an array object. Declare a pointer to the array's element type instead
+            const auto *array_type = data.Ctx.getAsArrayType(final_expr_type);
+            decl_type = data.Ctx.getPointerType(array_type->getElementType());
+          }
+          pre_stmts.push_back(llvm::formatv("{0} = *{1};", PrintType(decl_type, tmp_var_name), res.final_expr).str());
+          os << tmp_var_name;
+        }
+
+        pre_stmts.insert(pre_stmts.end(), res.pre_stmts.begin(), res.pre_stmts.end());
         break;
       }
 
       case UO_AddrOf:
-        [[fallthrough]];
-      case UO_Deref:
         [[fallthrough]];
       case UO_Plus:
         [[fallthrough]];
@@ -525,7 +884,9 @@ if ({2}) {
       case UO_Imag:
         [[fallthrough]];
       case UO_Extension: {
-        os << llvm::formatv("{0}({1})", UnaryOperator::getOpcodeStr(unary_operator->getOpcode()).str(), res.final_expr);
+        auto res = BuildExpr(BuildExprCtx(sub_expr, GetUsage(sub_expr), ctx.deref_force_extract));
+        os << llvm::formatv("{0}{1}", UnaryOperator::getOpcodeStr(unary_operator->getOpcode()).str(), res.final_expr);
+        pre_stmts.insert(pre_stmts.end(), res.pre_stmts.begin(), res.pre_stmts.end());
         break;
       }
 
@@ -534,15 +895,15 @@ if ({2}) {
         break;
       }
       }
-
-      pre_stmts.insert(pre_stmts.end(), res.pre_stmts.begin(), res.pre_stmts.end());
     } else if (auto *call_expr = dyn_cast<CallExpr>(expr)) {
       llvm::SmallVector<BuiltExpr, 4> arg_built_exprs;
       for (auto *arg : call_expr->arguments()) {
-        arg_built_exprs.push_back(BuildExpr(arg, depth + 1));
+        arg_built_exprs.push_back(
+            BuildExpr(BuildExprCtx(arg->IgnoreParenImpCasts(), Usage::Value, ctx.deref_force_extract)));
       }
       // TODO
       // it's possible for getDirectCallee to return nullptr, but I don't know what to do in that case...
+      // TODO throw error on any function pointers
       os << llvm::formatv("{0}({1})", call_expr->getDirectCallee()->getName().str(),
                           llvm::join(arg_built_exprs | std::views::transform([](const BuiltExpr &e) -> std::string {
                                        return e.final_expr;
@@ -551,25 +912,19 @@ if ({2}) {
       for (auto &&built_expr : arg_built_exprs | std::views::reverse) {
         pre_stmts.insert(pre_stmts.end(), built_expr.pre_stmts.begin(), built_expr.pre_stmts.end());
       }
-    } else if (auto *array_subscript_expr = dyn_cast<ArraySubscriptExpr>(expr)) {
-      auto *idx = array_subscript_expr->getIdx();
-      auto *base = array_subscript_expr->getBase();
-
-      auto res = BuildExpr(idx, depth + 1);
+    } else if (auto *member_expr = dyn_cast<MemberExpr>(expr)) {
+      assert(!member_expr->isArrow() && "Only dot member access is allowed here");
+      auto res =
+          BuildExpr(BuildExprCtx(member_expr->getBase()->IgnoreParenImpCasts(), Usage::Place, ctx.deref_force_extract));
+      os << llvm::formatv("({0}).{1}", res.final_expr, member_expr->getMemberNameInfo().getAsString());
       pre_stmts.insert(pre_stmts.end(), res.pre_stmts.begin(), res.pre_stmts.end());
-      os << llvm::formatv("{0}[{1}]",
-                          Lexer::getSourceText(CharSourceRange::getTokenRange(base->getSourceRange()),
-                                               data.Ctx.getSourceManager(), data.Ctx.getLangOpts()),
-                          res.final_expr);
     } else {
       os << Lexer::getSourceText(CharSourceRange::getTokenRange(expr->getSourceRange()), data.Ctx.getSourceManager(),
                                  data.Ctx.getLangOpts());
     }
 
     os.flush();
-    return {.pre_stmts = std::move(pre_stmts),
-            .final_expr = std::move(replacement_text),
-            .final_expr_type = final_expr_type};
+    return BuiltExpr(pre_stmts, final_expr, final_expr_type, tail_access);
   }
 
   auto TraverseDeclStmt(DeclStmt *declStmt) -> bool {
@@ -596,13 +951,15 @@ if ({2}) {
               Lexer::getSourceText(CharSourceRange::getTokenRange(record_decl->getSourceRange()),
                                    data.Ctx.getSourceManager(), data.Ctx.getLangOpts())
                   .str();
-          os << record_definition_text << ";\n";
+          os << record_definition_text << ";";
         }
       } else if (auto *var_decl = dyn_cast<VarDecl>(decl)) {
         auto *init_expr = var_decl->getInit();
         if (init_expr != nullptr) {
-          // depth is 1 because the decl stmt has depth 0
-          auto res = BuildExpr(init_expr->IgnoreParenImpCasts(), 1);
+          // normally we would put Usage::Value here but since every Usage::Place is also a Usage::Value, we can just
+          // use Usage::Place to avoid an extra copy of the expression
+          init_expr = init_expr->IgnoreParenImpCasts();
+          auto res = BuildExpr(BuildExprCtx(init_expr, GetUsage(init_expr), false));
           for (auto &&pre_stmt : res.pre_stmts | std::views::reverse) {
             os << pre_stmt << "\n";
           }
@@ -635,16 +992,27 @@ if ({2}) {
 
       std::string replacement_text;
       llvm::raw_string_ostream os(replacement_text);
-      auto res = BuildExpr(expr, 0);
+      auto res = BuildExpr(BuildExprCtx(expr, Usage::Effect, false));
       os << llvm::join(res.pre_stmts | std::views::reverse, "\n");
-      // for some reason we don't need a ; after this...
-      os << llvm::formatv("{0}", res.final_expr);
+
+      if (!res.final_expr.empty()) {
+        os << llvm::formatv("{0}", res.final_expr);
+      }
       os.flush();
 
       if (!replacement_text.empty()) {
-        data.replacements.emplace_back(data.Ctx.getSourceManager(),
-                                       CharSourceRange::getTokenRange(stmt->getSourceRange()), replacement_text,
-                                       data.Ctx.getLangOpts());
+        CharSourceRange range = CharSourceRange::getTokenRange(stmt->getSourceRange());
+        if (res.final_expr.empty()) {
+          auto start = stmt->getBeginLoc();
+          auto end = stmt->getEndLoc();
+          auto end_inc_semicolon =
+              Lexer::findLocationAfterToken(end, tok::semi, data.Ctx.getSourceManager(), data.Ctx.getLangOpts(), false);
+          range = CharSourceRange::getCharRange(start, end_inc_semicolon);
+        } else {
+          range = CharSourceRange::getTokenRange(stmt->getSourceRange());
+        }
+
+        data.replacements.emplace_back(data.Ctx.getSourceManager(), range, replacement_text, data.Ctx.getLangOpts());
       }
       return true;
     }

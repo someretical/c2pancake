@@ -24,6 +24,40 @@ public:
 };
 } // namespace pancake::pass_hoist_condition_expressions
 
+namespace pancake::pass_rewrite_array_indexing {
+class Consumer : public C2PancakePass {
+public:
+  using C2PancakePass::C2PancakePass; // inherit constructor
+  void HandleTranslationUnit(clang::ASTContext &Ctx) override;
+};
+
+class Action : public PipelineAction<Consumer> {
+public:
+  explicit Action(PipelineActionCtx &ctx) : PipelineAction<Consumer>(ctx) {
+    ctx.action_name = "RewriteArrayIndexing";
+    ctx.failure_behaviour = FailureBehaviour::RepeatPass;
+    ctx.action_type = PipelineActionType::Rewriter;
+  }
+};
+} // namespace pancake::pass_rewrite_array_indexing
+
+namespace pancake::pass_rewrite_struct_stabs {
+class Consumer : public C2PancakePass {
+public:
+  using C2PancakePass::C2PancakePass; // inherit constructor
+  void HandleTranslationUnit(clang::ASTContext &Ctx) override;
+};
+
+class Action : public PipelineAction<Consumer> {
+public:
+  explicit Action(PipelineActionCtx &ctx) : PipelineAction<Consumer>(ctx) {
+    ctx.action_name = "RewriteStructStabs";
+    ctx.failure_behaviour = FailureBehaviour::RepeatPass;
+    ctx.action_type = PipelineActionType::Rewriter;
+  }
+};
+} // namespace pancake::pass_rewrite_struct_stabs
+
 /*
 Turn all nested expressions with side effects into temporary variables, so that all expressions are pure variable
 references
