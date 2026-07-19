@@ -42,7 +42,7 @@ using namespace clang::transformer;
 namespace pancake::pass_add_switch_fallthrough {
 namespace {
 auto MakeRule() -> RewriteRule {
-  auto matcher = caseStmt(hasParent(caseStmt())).bind("case_stmt");
+  auto matcher = caseStmt(isExpansionInMainFile(), hasParent(caseStmt())).bind("case_stmt");
   auto replacement = edit(insertBefore(node("case_stmt"), cat("[[fallthrough]];\n")));
   return makeRule(matcher, replacement);
 }
@@ -456,6 +456,11 @@ public:
   }
 
   auto VisitSwitchStmt(SwitchStmt *switchStmt) -> bool {
+    auto &sm = data.Ctx.getSourceManager();
+    if (switchStmt == nullptr || !sm.isInMainFile(sm.getSpellingLoc(switchStmt->getBeginLoc()))) {
+      return true;
+    }
+
     if (VerifySwitchStmt(switchStmt)) {
       return true; // continue traversing the AST if the switch statement is already valid
     }
@@ -585,7 +590,7 @@ public:
 
   auto ConvertSwitchStmt(SwitchStmt *switchStmt) -> void {
     auto &sm = data.Ctx.getSourceManager();
-    if (switchStmt == nullptr || sm.isInSystemHeader(sm.getSpellingLoc(switchStmt->getBeginLoc()))) {
+    if (switchStmt == nullptr || !sm.isInMainFile(sm.getSpellingLoc(switchStmt->getBeginLoc()))) {
       return;
     }
 

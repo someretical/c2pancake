@@ -42,7 +42,7 @@ auto MakeRule() -> RewriteRule {
   Moves while loop conditions into the body of the loop
   */
   return applyFirst(
-      {makeRule(whileStmt(hasCondition(expr().bind(cond_bind)),
+      {makeRule(whileStmt(isExpansionInMainFile(), hasCondition(expr().bind(cond_bind)),
                           unless(hasCondition(ignoringParenImpCasts(integerLiteral(equals(1))))),
                           hasBody(compoundStmt(
                                       // Bind the body as a compoundStmt so statements() can extract its interior.
@@ -50,15 +50,15 @@ auto MakeRule() -> RewriteRule {
                                       .bind(body_bind)))
                     .bind(while_bind),
                 changeTo(node(while_bind),
-                         cat("while (1) {\n", statements(body_bind), "\nif (!(", node(cond_bind), ")) break;", "\n}"))),
-       makeRule(whileStmt(hasCondition(expr().bind(cond_bind)),
+                         cat("while (1) {\nif (!(", node(cond_bind), ")) { break; }", statements(body_bind), "\n}"))),
+       makeRule(whileStmt(isExpansionInMainFile(), hasCondition(expr().bind(cond_bind)),
                           unless(hasCondition(ignoringParenImpCasts(integerLiteral(equals(1))))),
                           hasBody(
                               // Exclude compoundStmt so Case A takes priority in applyFirst.
                               stmt(unless(compoundStmt())).bind(body_bind)))
                     .bind(while_bind),
                 changeTo(node(while_bind),
-                         cat("while (1) {\n", node(body_bind), ";\nif (!(", node(cond_bind), ")) break;", "\n}")))}
+                         cat("while (1) {\nif (!(", node(cond_bind), ")) { break; }", node(body_bind), ";\n}")))}
 
   );
 }
@@ -124,8 +124,9 @@ auto IsContinueDirectlyInsideFor(const ContinueStmt *CS, const ForStmt *FS, ASTC
 
 auto MakeRule() -> RewriteRule {
   auto inner_continue = continueStmt(hasAncestor(forStmt())).bind("cont_stmt");
-  auto matcher =
-      forStmt(hasIncrement(stmt().bind("for_inc")), hasBody(stmt(hasDescendant(inner_continue)))).bind("for_loop");
+  auto matcher = forStmt(isExpansionInMainFile(), hasIncrement(stmt().bind("for_inc")),
+                         hasBody(stmt(hasDescendant(inner_continue))))
+                     .bind("for_loop");
 
   // reuse the same edit generator for all matches
   auto replacement = edit(changeTo(node("cont_stmt"), cat("{ ", node("for_inc"), "; continue; }")));
@@ -210,7 +211,7 @@ auto MakeRule() -> RewriteRule {
   The compound statement case prevents an extra set of {}s.
   */
   return applyFirst(
-      {makeRule(forStmt(anyOf(hasLoopInit(stmt().bind(init_bind)), anything()),
+      {makeRule(forStmt(isExpansionInMainFile(), anyOf(hasLoopInit(stmt().bind(init_bind)), anything()),
                         anyOf(hasCondition(expr().bind(cond_bind)), anything()),
                         anyOf(hasIncrement(stmt().bind(inc_bind)), anything()),
                         hasBody(compoundStmt(
@@ -220,7 +221,7 @@ auto MakeRule() -> RewriteRule {
                     .bind(for_bind),
                 changeTo(node(for_bind), cat("{\n", OptInit(), "while (1) {", BreakCond(), statements(body_bind),
                                              OptInc(), "\n}", "\n}"))),
-       makeRule(forStmt(anyOf(hasLoopInit(stmt().bind(init_bind)), anything()),
+       makeRule(forStmt(isExpansionInMainFile(), anyOf(hasLoopInit(stmt().bind(init_bind)), anything()),
                         anyOf(hasCondition(expr().bind(cond_bind)), anything()),
                         anyOf(hasIncrement(stmt().bind(inc_bind)), anything()),
                         hasBody(
@@ -313,8 +314,9 @@ auto IsContinueDirectlyInsideDoWhile(const ContinueStmt *CS, const DoStmt *DS, A
 
 auto MakeRule() -> RewriteRule {
   auto inner_continue = continueStmt(hasAncestor(doStmt())).bind("cont_stmt");
-  auto matcher =
-      doStmt(hasCondition(expr().bind("do_cond")), hasBody(stmt(hasDescendant(inner_continue)))).bind("do_loop");
+  auto matcher = doStmt(isExpansionInMainFile(), hasCondition(expr().bind("do_cond")),
+                        hasBody(stmt(hasDescendant(inner_continue))))
+                     .bind("do_loop");
 
   // reuse the same edit generator for all matches
   auto replacement = edit(changeTo(node("cont_stmt"), cat("if (", node("do_cond"), ") { continue; }")));
@@ -382,7 +384,7 @@ auto MakeRule() -> RewriteRule {
   }
   */
   return applyFirst(
-      {makeRule(doStmt(anyOf(hasCondition(expr().bind(cond_bind)), anything()),
+      {makeRule(doStmt(isExpansionInMainFile(), anyOf(hasCondition(expr().bind(cond_bind)), anything()),
                        hasBody(compoundStmt(
                                    // Bind the body as a compoundStmt so statements() can extract its interior.
                                    anything())
@@ -390,7 +392,7 @@ auto MakeRule() -> RewriteRule {
                     .bind(do_bind),
                 changeTo(node(do_bind), cat("while (1) {\n", statements(body_bind), "\nif (!(", node(cond_bind),
                                             ")) { break; }", "\n}"))),
-       makeRule(doStmt(anyOf(hasCondition(expr().bind(cond_bind)), anything()),
+       makeRule(doStmt(isExpansionInMainFile(), anyOf(hasCondition(expr().bind(cond_bind)), anything()),
                        hasBody(
                            // Exclude compoundStmt so Case A takes priority in applyFirst.
                            stmt(unless(compoundStmt())).bind(body_bind)))

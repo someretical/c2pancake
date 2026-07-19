@@ -46,7 +46,7 @@ using namespace clang::tooling;
 namespace pancake::pass_name_anon_records {
 namespace {
 auto MakeRule() -> RewriteRule {
-  return makeRule(recordDecl(isDefinition(), unless(isExpansionInSystemHeader())).bind("record"),
+  return makeRule(recordDecl(isDefinition(), isExpansionInMainFile()).bind("record"),
                   [](const MatchFinder::MatchResult &result) -> Expected<SmallVector<Edit, 1>> {
                     const auto *rd = result.Nodes.getNodeAs<RecordDecl>("record");
 
@@ -75,7 +75,8 @@ auto MakeRule() -> RewriteRule {
                         int z;
                     };
                     */
-                    if (!rd->getIdentifier() && !rd->isAnonymousStructOrUnion()) {
+                    if (!rd->getIdentifier() && !rd->isAnonymousStructOrUnion() &&
+                        result.Context->getSourceManager().isInMainFile(rd->getBeginLoc())) {
                       FullSourceLoc const loc(rd->getBeginLoc(), *result.SourceManager);
                       auto identifier = llvm::formatv("__c2pnk_anon_record_L{0}C{1}", loc.getSpellingLineNumber(),
                                                       loc.getSpellingColumnNumber());
@@ -132,8 +133,8 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
 namespace pancake::pass_rename_to_be_promoted_records {
 namespace {
 auto MakeRule() -> RewriteRule {
-  return makeRule(recordDecl(isDefinition(), unless(isExpansionInSystemHeader()),
-                             unless(hasDeclContext(translationUnitDecl())), unless(hasAncestor(recordDecl())))
+  return makeRule(recordDecl(isDefinition(), isExpansionInMainFile(), unless(hasDeclContext(translationUnitDecl())),
+                             unless(hasAncestor(recordDecl())))
                       .bind("record"),
                   [](const MatchFinder::MatchResult &result) -> Expected<SmallVector<Edit, 1>> {
                     const auto *rd = result.Nodes.getNodeAs<RecordDecl>("record");
@@ -290,7 +291,7 @@ public:
 
   auto TraverseDeclStmt(DeclStmt *declStmt) -> bool {
     auto &sm = data.Ctx.getSourceManager();
-    if (declStmt == nullptr || sm.isInSystemHeader(sm.getSpellingLoc(declStmt->getBeginLoc())) ||
+    if (declStmt == nullptr || !sm.isInMainFile(sm.getSpellingLoc(declStmt->getBeginLoc())) ||
         data.current_function_decl == nullptr || data.current_record_decl != nullptr) {
       return true;
     }

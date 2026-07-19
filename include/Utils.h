@@ -72,6 +72,37 @@ auto LogBegin(const PipelineActionCtx &ctx) -> std::string;
 inline auto LogBeginShort(const std::string &in_file) { return llvm::formatv("[c2pancake] {0}:", in_file); }
 
 inline auto LogBeginShort(const llvm::StringRef in_file) { return llvm::formatv("[c2pancake] {0}:", in_file); }
+
+auto PrintSourceText(llvm::raw_string_ostream &os, const clang::Expr *expr, const clang::ASTContext &ctx) -> void;
+
+inline auto GetSourceText(const clang::Expr *expr, const clang::ASTContext &ctx) -> std::string {
+  std::string s;
+  llvm::raw_string_ostream os(s);
+  PrintSourceText(os, expr, ctx);
+  os.flush();
+  return s;
+}
+
+auto PrintSourceText(llvm::raw_string_ostream &os, const clang::Stmt *stmt, const clang::ASTContext &ctx) -> void;
+
+inline auto GetSourceText(const clang::Stmt *stmt, const clang::ASTContext &ctx) -> std::string {
+  std::string s;
+  llvm::raw_string_ostream os(s);
+  PrintSourceText(os, stmt, ctx);
+  os.flush();
+  return s;
+}
+
+auto PrintSourceText(llvm::raw_string_ostream &os, const clang::TagDecl *tag_decl, const clang::ASTContext &ctx)
+    -> void;
+
+inline auto GetSourceText(const clang::TagDecl *tag_decl, const clang::ASTContext &ctx) -> std::string {
+  std::string s;
+  llvm::raw_string_ostream os(s);
+  PrintSourceText(os, tag_decl, ctx);
+  os.flush();
+  return s;
+}
 } // namespace pancake
 
 #endif // C2PANCAKE_UTILS_H

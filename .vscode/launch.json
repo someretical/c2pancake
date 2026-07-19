@@ -17,6 +17,30 @@
             ],
             "cwd": "${workspaceFolder}",
             "console": "integratedTerminal"
+        },
+        {
+            "type": "lldb-dap",
+            "request": "launch",
+            "name": "Debug c2pancake with uart.c",
+            "program": "${command:cmake.launchTargetPath}",
+            "args": [
+                "/home/one/sddf/drivers/serial/imx/uart.c",
+                "--",
+                "-ffreestanding",
+                "--target=aarch64-linux-gnu",
+                "-mstrict-align",
+                "-mcpu=cortex-a53",
+                "-mtune=cortex-a53",
+                "-I/home/one/microkit_tutorial/microkit-sdk-2.2.0/board/maaxboard/debug/include",
+                "-I/home/one/sddf/examples/serial/include",
+                "-I/home/one/sddf/include",
+                "-I/home/one/sddf/include/microkit",
+                "-I/home/one/sddf/include/sddf/util/custom_libc",
+                "-I/home/one/sddf/drivers/serial/imx/include",
+                "-I/usr/lib/gcc-cross/aarch64-linux-gnu/13/include",
+            ],
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal"
         }
     ]
 }

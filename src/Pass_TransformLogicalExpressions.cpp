@@ -12,6 +12,7 @@
 #include <clang/ASTMatchers/ASTMatchers.h>
 #include <clang/Basic/LLVM.h>
 #include <clang/Basic/SourceLocation.h>
+#include <clang/Basic/TokenKinds.h>
 #include <clang/Frontend/CompilerInstance.h>
 #include <clang/Lex/Lexer.h>
 #include <clang/Rewrite/Core/Rewriter.h>
@@ -31,9 +32,13 @@
 
 #include <cassert>
 #include <cstddef>
+#include <cstdint>
+#include <functional>
+#include <optional>
 #include <ranges>
 #include <string>
 #include <utility>
+#include <vector>
 
 using namespace clang;
 using namespace clang::tooling;
@@ -64,8 +69,13 @@ public:
                          data.tmp_var_counter++);
   }
 
-  auto VisitIfStmt(IfStmt *ifStmt) -> bool {
-    const auto *cond = ifStmt->getCond()->IgnoreParenImpCasts();
+  auto VisitIfStmt(IfStmt *if_stmt) -> bool {
+    auto &sm = data.Ctx.getSourceManager();
+    if (if_stmt == nullptr || !sm.isInMainFile(sm.getSpellingLoc(if_stmt->getBeginLoc()))) {
+      return true;
+    }
+
+    const auto *cond = if_stmt->getCond()->IgnoreParenImpCasts();
     if (!cond->HasSideEffects(data.Ctx)) {
       return true;
     }
@@ -73,10 +83,7 @@ public:
     auto tmp_var_name = GetTempVarName("If");
     std::string replacement_text;
     llvm::raw_string_ostream os(replacement_text);
-    os << llvm::formatv("int {0} = {1};\n", tmp_var_name,
-                        Lexer::getSourceText(CharSourceRange::getTokenRange(cond->getSourceRange()),
-                                             data.Ctx.getSourceManager(), data.Ctx.getLangOpts())
-                            .str());
+    os << llvm::formatv("int {0} = {1};\n", tmp_var_name, GetSourceText(cond, data.Ctx));
     os << llvm::formatv("if ({0}) ", tmp_var_name);
 
     // we just want to replace the "if (COND)" part
@@ -84,15 +91,20 @@ public:
     data.replacements.emplace_back(
         data.Ctx.getSourceManager(),
         CharSourceRange::getTokenRange(SourceRange(
-            ifStmt->getIfLoc(),
+            if_stmt->getIfLoc(),
             Lexer::getLocForEndOfToken(cond->getEndLoc(), 0, data.Ctx.getSourceManager(), data.Ctx.getLangOpts()))),
         replacement_text, data.Ctx.getLangOpts());
 
     return true;
   }
 
-  auto VisitReturnStmt(ReturnStmt *returnStmt) -> bool {
-    const auto *ret_expr = returnStmt->getRetValue();
+  auto VisitReturnStmt(ReturnStmt *return_stmt) -> bool {
+    auto &sm = data.Ctx.getSourceManager();
+    if (return_stmt == nullptr || !sm.isInMainFile(sm.getSpellingLoc(return_stmt->getBeginLoc()))) {
+      return true;
+    }
+
+    const auto *ret_expr = return_stmt->getRetValue();
     if (ret_expr == nullptr) {
       return true;
     }
@@ -105,16 +117,13 @@ public:
     auto tmp_var_name = GetTempVarName("Return");
     std::string replacement_text;
     llvm::raw_string_ostream os(replacement_text);
-    os << llvm::formatv("int {0} = ({1});\n", tmp_var_name,
-                        Lexer::getSourceText(CharSourceRange::getTokenRange(cond->getSourceRange()),
-                                             data.Ctx.getSourceManager(), data.Ctx.getLangOpts())
-                            .str());
+    os << llvm::formatv("int {0} = ({1});\n", tmp_var_name, GetSourceText(cond, data.Ctx));
     os << llvm::formatv("return {0}", tmp_var_name);
 
     // we want to replace the "return EXPR;" part
     os.flush();
     data.replacements.emplace_back(data.Ctx.getSourceManager(),
-                                   CharSourceRange::getTokenRange(returnStmt->getSourceRange()), replacement_text,
+                                   CharSourceRange::getTokenRange(return_stmt->getSourceRange()), replacement_text,
                                    data.Ctx.getLangOpts());
 
     return true;
@@ -148,10 +157,10 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
 namespace pancake::pass_rewrite_array_indexing {
 namespace {
 auto MakeRule() -> RewriteRule {
-  return makeRule(arraySubscriptExpr(hasBase(expr().bind("base")), hasIndex(expr().bind("index")),
-                                     unless(isExpansionInSystemHeader()))
-                      .bind("array_subscript"),
-                  changeTo(node("array_subscript"), cat("(*(", node("base"), " + (", node("index"), ")))")));
+  return makeRule(
+      arraySubscriptExpr(isExpansionInMainFile(), hasBase(expr().bind("base")), hasIndex(expr().bind("index")))
+          .bind("array_subscript"),
+      changeTo(node("array_subscript"), cat("(*(", node("base"), " + (", node("index"), ")))")));
 }
 } // namespace
 
@@ -190,8 +199,8 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
 namespace pancake::pass_rewrite_struct_stabs {
 namespace {
 auto MakeRule() -> RewriteRule {
-  return makeRule(memberExpr(isArrow(), hasObjectExpression(expr().bind("base")), member(fieldDecl().bind("field")),
-                             unless(isExpansionInSystemHeader()))
+  return makeRule(memberExpr(isExpansionInMainFile(), isArrow(), hasObjectExpression(expr().bind("base")),
+                             member(fieldDecl().bind("field")))
                       .bind("member"),
                   changeTo(node("member"), cat("(*", node("base"), ").", name("field"))));
 }
@@ -333,30 +342,41 @@ public:
     Expr *expr;
     Usage usage_kind;
     bool deref_force_extract; // force the extraction of the next deref into a temp var
-    explicit BuildExprCtx(Expr *expr, Usage usage_kind, bool deref_force_extract)
-        : expr(expr), usage_kind(usage_kind), deref_force_extract(deref_force_extract) {}
+    using AssignedToPair = std::pair<std::reference_wrapper<const std::string>, std::reference_wrapper<const QualType>>;
+    std::optional<AssignedToPair>
+        assigned_to; // if this expression is being assigned to a variable, this is the name and type of that variable.
+                     // This is only relevant for init list expressions
+    explicit BuildExprCtx(Expr *expr, Usage usage_kind, bool deref_force_extract,
+                          std::optional<AssignedToPair> assigned_to)
+        : expr(expr), usage_kind(usage_kind), deref_force_extract(deref_force_extract),
+          assigned_to(std::move(assigned_to)) {}
   };
 
-  auto GetUsage(const Expr *expr) -> Usage {
-    if (auto *decl_ref_expr = dyn_cast<DeclRefExpr>(expr)) {
+  static auto GetUsage(const Expr *expr) -> Usage {
+    if (const auto *_ = dyn_cast<DeclRefExpr>(expr)) {
       return Usage::Place;
-    } else if (auto *integer_literal = dyn_cast<IntegerLiteral>(expr)) {
+    }
+    if (const auto *_ = dyn_cast<IntegerLiteral>(expr)) {
       return Usage::Place;
-    } else if (auto *floating_literal = dyn_cast<FloatingLiteral>(expr)) {
+    } else if (const auto *_ = dyn_cast<FloatingLiteral>(expr)) {
       return Usage::Place;
-    } else if (auto *character_literal = dyn_cast<CharacterLiteral>(expr)) {
+    } else if (const auto *_ = dyn_cast<CharacterLiteral>(expr)) {
       return Usage::Place;
-    } else if (auto *string_literal = dyn_cast<StringLiteral>(expr)) {
+    } else if (const auto *_ = dyn_cast<StringLiteral>(expr)) {
       return Usage::Place;
-    } else if (auto *statement_expr = dyn_cast<StmtExpr>(expr)) {
+    } else if (const auto *_ = dyn_cast<CompoundLiteralExpr>(expr)) {
+      return Usage::Value;
+    } else if (const auto *_ = dyn_cast<InitListExpr>(expr)) {
+      return Usage::Value;
+    } else if (const auto *_ = dyn_cast<StmtExpr>(expr)) {
       return Usage::Value;
     }
     // CompoundAssignOperator is a specialization of BinaryOperator
-    else if (auto *compound_assign_operator = dyn_cast<CompoundAssignOperator>(expr)) {
+    else if (const auto *_ = dyn_cast<CompoundAssignOperator>(expr)) {
       return Usage::Value;
-    } else if (auto *conditional_operator = dyn_cast<ConditionalOperator>(expr)) {
+    } else if (const auto *_ = dyn_cast<ConditionalOperator>(expr)) {
       return Usage::Value;
-    } else if (auto *binary_operator = dyn_cast<BinaryOperator>(expr)) {
+    } else if (const auto *binary_operator = dyn_cast<BinaryOperator>(expr)) {
       switch (binary_operator->getOpcode()) {
       case BO_LAnd:
         [[fallthrough]];
@@ -405,7 +425,7 @@ public:
         break;
       }
       }
-    } else if (auto *unary_operator = dyn_cast<UnaryOperator>(expr)) {
+    } else if (const auto *unary_operator = dyn_cast<UnaryOperator>(expr)) {
 
       switch (unary_operator->getOpcode()) {
       case UO_PostInc:
@@ -447,7 +467,7 @@ public:
         break;
       }
       }
-    } else if (auto *call_expr = dyn_cast<CallExpr>(expr)) {
+    } else if (const auto *_ = dyn_cast<CallExpr>(expr)) {
       return Usage::Value;
     } else {
       return Usage::Place;
@@ -461,23 +481,193 @@ public:
     std::string final_expr;
     llvm::raw_string_ostream os(final_expr);
     const QualType final_expr_type = expr->getType();
-    TailAccess tail_access = TailAccess::None;
+    TailAccess const tail_access = TailAccess::None;
 
     if (auto *decl_ref_expr = dyn_cast<DeclRefExpr>(expr)) {
-      os << Lexer::getSourceText(CharSourceRange::getTokenRange(decl_ref_expr->getSourceRange()),
-                                 data.Ctx.getSourceManager(), data.Ctx.getLangOpts());
+      PrintSourceText(os, decl_ref_expr, data.Ctx);
     } else if (auto *integer_literal = dyn_cast<IntegerLiteral>(expr)) {
-      os << Lexer::getSourceText(CharSourceRange::getTokenRange(integer_literal->getSourceRange()),
-                                 data.Ctx.getSourceManager(), data.Ctx.getLangOpts());
+      PrintSourceText(os, integer_literal, data.Ctx);
     } else if (auto *floating_literal = dyn_cast<FloatingLiteral>(expr)) {
-      os << Lexer::getSourceText(CharSourceRange::getTokenRange(floating_literal->getSourceRange()),
-                                 data.Ctx.getSourceManager(), data.Ctx.getLangOpts());
+      PrintSourceText(os, floating_literal, data.Ctx);
     } else if (auto *character_literal = dyn_cast<CharacterLiteral>(expr)) {
-      os << Lexer::getSourceText(CharSourceRange::getTokenRange(character_literal->getSourceRange()),
-                                 data.Ctx.getSourceManager(), data.Ctx.getLangOpts());
+      PrintSourceText(os, character_literal, data.Ctx);
     } else if (auto *string_literal = dyn_cast<StringLiteral>(expr)) {
-      os << Lexer::getSourceText(CharSourceRange::getTokenRange(string_literal->getSourceRange()),
-                                 data.Ctx.getSourceManager(), data.Ctx.getLangOpts());
+      PrintSourceText(os, string_literal, data.Ctx);
+    } else if (auto *_ = dyn_cast<ImplicitValueInitExpr>(expr)) {
+      llvm_unreachable("ImplicitValueInitExpr should not be present at this stage!");
+    } else if (auto *init_list_expr = dyn_cast<InitListExpr>(expr)) {
+      assert(ctx.usage_kind != Usage::Place && "InitListExpr cannot be used as a place expression");
+      assert(ctx.usage_kind != Usage::Effect && "InitListExpr cannot be used as an effect expression");
+
+      assert(ctx.assigned_to.has_value() && "InitListExpr must have an assigned_to value");
+
+      // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
+      const auto &[_var_name, _var_type] = ctx.assigned_to.value();
+      auto var_name = _var_name.get();
+      auto var_type = _var_type.get();
+
+      if (var_type->isArrayType()) {
+        // TODO warn about VLAs!
+        assert(var_type->isConstantArrayType() && "InitListExpr must be assigned to a constant array type");
+        // e.g int arr[3][4][5] = {{1, 2, 3}, {4, 5, 6}, {7, 8, 9}};
+        auto element_type = data.Ctx.getAsConstantArrayType(var_type)->getElementType();
+
+        llvm::SmallVector<std::string, 16> tmp_stmts; // this is in real order. it will need to be reversed later
+        if (ctx.deref_force_extract) {
+          auto tmp_var_type = data.Ctx.getPointerType(
+              element_type); // we want to assign to a pointer to the element type, not the element type itself
+
+          // must extract var to tmp var first, then assign to array
+          std::string const tmp_var_name = GetTempVarName("InitList");
+          tmp_stmts.emplace_back(llvm::formatv("{0} = {1};", PrintType(tmp_var_type, tmp_var_name), var_name));
+          var_name = tmp_var_name;
+        }
+
+        for (unsigned i = 0; i < init_list_expr->getNumInits(); ++i) {
+          auto *init_expr = init_list_expr->getInit(i);
+
+          if (auto *_ = dyn_cast<ImplicitValueInitExpr>(init_expr)) {
+            continue;
+          }
+
+          std::string element_var_name = llvm::formatv("*({0} + {1})", var_name, i);
+          auto res = BuildExpr(
+              BuildExprCtx(init_expr, GetUsage(init_expr), true, std::make_pair(element_var_name, element_type)));
+
+          // insert in REAL order
+          tmp_stmts.insert(tmp_stmts.end(), res.pre_stmts.rbegin(), res.pre_stmts.rend());
+
+          // if there are nested init expr lists for arrays, then final_expr will be empty!
+          if (!res.final_expr.empty()) {
+            tmp_stmts.emplace_back(llvm::formatv("{0} = {1};", element_var_name, res.final_expr));
+          }
+        }
+
+        pre_stmts.assign(tmp_stmts.rbegin(), tmp_stmts.rend()); // reverse the order of the statements
+      } else if (var_type->isUnionType()) {
+        auto *field_decl = init_list_expr->getInitializedFieldInUnion();
+        if (field_decl != nullptr) {
+          assert(init_list_expr->getNumInits() == 1 && "InitListExpr for union must have exactly one initializer");
+          auto *init_expr = init_list_expr->getInit(0);
+
+          if (auto *_ = dyn_cast<ImplicitValueInitExpr>(init_expr)) {
+            goto build_expr_end; // nothing to preserve
+          }
+
+          if (field_decl->isAnonymousStructOrUnion()) {
+            auto *sub_init_expr_list = dyn_cast<InitListExpr>(init_expr);
+            assert(sub_init_expr_list != nullptr &&
+                   "InitListExpr for anonymous struct or union must have an InitListExpr as its initializer");
+          } else {
+            var_name = llvm::formatv("({0}).{1}", var_name, field_decl->getNameAsString());
+          }
+
+          auto res = BuildExpr(BuildExprCtx(init_expr, GetUsage(init_expr), ctx.deref_force_extract,
+                                            std::make_pair(var_name, field_decl->getType())));
+
+          if (!res.final_expr.empty()) {
+            pre_stmts.emplace_back(llvm::formatv("{0} = {1};", var_name, res.final_expr));
+          }
+
+          pre_stmts.insert(pre_stmts.end(), res.pre_stmts.begin(), res.pre_stmts.end());
+        } else {
+          // C23 §6.7.11p11
+          // if it is a union, the first named member is initialized (recursively) according to these rules, and any
+          // padding is initialized to zero bits.
+          // note CRITICALLY that padding != subsequent members!!!!!!!!
+          // but historically the compiler implementations have just memset the whole thing to 0
+          // init_list_stmts.emplace_back(
+          //     llvm::formatv("memset(&{0}, 0, sizeof({1}));", var_name, PrintType(var_type, "")));
+        }
+      } else if (var_type->isStructureType()) {
+        auto *record_decl = var_type->getAsRecordDecl();
+        llvm::SmallVector<std::string, 16> tmp_stmts; // this is in real order. it will need to be reversed later
+
+        auto field_decl_iter = record_decl->field_begin();
+        init_list_expr->dump();
+        for (unsigned i = 0; i < init_list_expr->getNumInits(); ++field_decl_iter) {
+          auto *field_decl = *field_decl_iter;
+
+          if (field_decl->isUnnamedBitField()) {
+            // very nasty potential bug here: don't increment i!
+            continue; // skip unnamed bitfields
+          }
+
+          auto *init_expr = init_list_expr->getInit(i);
+
+          if (auto *_ = dyn_cast<ImplicitValueInitExpr>(init_expr)) {
+            /*
+  struct A {
+    int x;
+    int y;
+    struct B {
+      int z;
+      int w;
+    };
+  };
+
+  struct A a = {.y = 2};
+
+  will produce
+
+   |-DeclStmt 0x5c835e0af9a8 <line:25:3, col:24>
+    | `-VarDecl 0x5c835e0af7d8 <col:3, col:23> col:12 a 'struct A' cinit
+    |   `-InitListExpr 0x5c835e0af948 <col:16, col:23> 'struct A'
+    |     |-ImplicitValueInitExpr 0x5c835e0af998 <<invalid sloc>> 'int'
+    |     `-IntegerLiteral 0x5c835e0af840 <col:22> 'int' 2
+
+  Notice how since A.x is declared first but not specified with a designated initializer, it has been replaced with an
+  ImplicitValueInitExpr. That's why we continue here instead of break.
+            */
+            ++i;
+            continue;
+          }
+
+          auto i_var_name = var_name;
+          if (field_decl->isAnonymousStructOrUnion()) {
+            auto *sub_init_expr_list = dyn_cast<InitListExpr>(init_expr);
+            assert(sub_init_expr_list != nullptr &&
+                   "InitListExpr for anonymous struct or union must have an InitListExpr as its initializer");
+          } else {
+            i_var_name = llvm::formatv("({0}).{1}", i_var_name, field_decl->getNameAsString());
+          }
+
+          auto res = BuildExpr(BuildExprCtx(init_expr, GetUsage(init_expr), ctx.deref_force_extract,
+                                            std::make_pair(i_var_name, field_decl->getType())));
+
+          // insert in REAL order
+          tmp_stmts.insert(tmp_stmts.end(), res.pre_stmts.rbegin(), res.pre_stmts.rend());
+
+          // if there are nested init expr lists for arrays, then final_expr will be empty!
+          if (!res.final_expr.empty()) {
+            tmp_stmts.emplace_back(llvm::formatv("{0} = {1};", i_var_name, res.final_expr));
+          }
+
+          i++;
+        }
+
+        pre_stmts.assign(tmp_stmts.rbegin(), tmp_stmts.rend()); // reverse the order of the statements
+      } else {
+        llvm_unreachable("InitListExpr must be assigned to an array, union, or struct type");
+      }
+
+      // don't write anything to os
+    } else if (auto *compound_literal = dyn_cast<CompoundLiteralExpr>(expr)) {
+      // must extract to temp var
+      std::string tmp_var_name = GetTempVarName("CompoundLiteral");
+      pre_stmts.push_back(llvm::formatv(
+          /*
+          0 = tmp var for compound literal
+          1 = tmp var name (no type!)
+          2 = compound literal initializer expression (always exists for a compound literal)
+          */
+          R"({0};
+{1} = {2};)",
+          PrintType(compound_literal->getType(), tmp_var_name), tmp_var_name,
+          GetSourceText(compound_literal->getInitializer()->IgnoreParenImpCasts(), data.Ctx)));
+      os << tmp_var_name;
+      // we need to rerun this pass to process the compound literal initializer expression
+      data.pa_ctx.run_result = RunResult::RepeatPass;
     } else if (auto *statement_expr = dyn_cast<StmtExpr>(expr)) {
       // StmtExpr is a GNU extension that allows a block of statements to be used as an expression
       // The value of the expression is the value of the last statement in the block
@@ -496,10 +686,8 @@ public:
       if (ctx.usage_kind == Usage::Effect) {
         os2 << "{\n";
         for (auto *stmt : compound_stmt->body()) {
-          os2 << Lexer::getSourceText(CharSourceRange::getTokenRange(stmt->getSourceRange()),
-                                      data.Ctx.getSourceManager(), data.Ctx.getLangOpts())
-                     .str()
-              << "\n";
+          PrintSourceText(os2, stmt, data.Ctx);
+          os2 << "\n";
           // we need to rerun this pass to process the statements in the block
           data.pa_ctx.run_result = RunResult::RepeatPass;
         }
@@ -511,17 +699,15 @@ public:
         os2 << "{\n";
         for (auto *stmt : compound_stmt->body()) {
           if (stmt == last) {
-            auto last_expr_built_expr =
-                BuildExpr(BuildExprCtx(last_stmt_as_expr, GetUsage(last_stmt_as_expr), ctx.deref_force_extract));
+            auto last_expr_built_expr = BuildExpr(
+                BuildExprCtx(last_stmt_as_expr, GetUsage(last_stmt_as_expr), ctx.deref_force_extract, ctx.assigned_to));
             os2 << llvm::join(last_expr_built_expr.pre_stmts | std::views::reverse, "\n");
 
             // assign the result of the last expression to the temporary variable
             os2 << llvm::formatv("\n{0} = {1};", tmp_var_name, last_expr_built_expr.final_expr);
           } else {
-            os2 << Lexer::getSourceText(CharSourceRange::getTokenRange(stmt->getSourceRange()),
-                                        data.Ctx.getSourceManager(), data.Ctx.getLangOpts())
-                       .str()
-                << "\n";
+            PrintSourceText(os2, stmt, data.Ctx);
+            os2 << "\n";
             // we need to rerun this pass to process the statements in the block
             data.pa_ctx.run_result = RunResult::RepeatPass;
           }
@@ -541,8 +727,8 @@ public:
       // technically we need to compute both the place and value of the LHS, but syntactically at least,
       // every valid place is also a valid value (not the other way around though!)
       // note this is only true since we are working with a "description" of the place, not a pointer!
-      auto rhs_res = BuildExpr(BuildExprCtx(rhs, GetUsage(rhs), ctx.deref_force_extract));
-      auto lhs_res = BuildExpr(BuildExprCtx(lhs, Usage::Place, ctx.deref_force_extract));
+      auto rhs_res = BuildExpr(BuildExprCtx(rhs, GetUsage(rhs), ctx.deref_force_extract, ctx.assigned_to));
+      auto lhs_res = BuildExpr(BuildExprCtx(lhs, Usage::Place, ctx.deref_force_extract, ctx.assigned_to));
 
       assert(ctx.usage_kind != Usage::Place && "Compound assignment operator cannot be used as a place expression");
 
@@ -579,9 +765,9 @@ public:
       auto *lhs = conditional_operator->getTrueExpr()->IgnoreParenImpCasts();
       auto *rhs = conditional_operator->getFalseExpr()->IgnoreParenImpCasts();
 
-      auto cond_res = BuildExpr(BuildExprCtx(cond, GetUsage(cond), ctx.deref_force_extract));
-      auto lhs_res = BuildExpr(BuildExprCtx(lhs, GetUsage(lhs), ctx.deref_force_extract));
-      auto rhs_res = BuildExpr(BuildExprCtx(rhs, GetUsage(rhs), ctx.deref_force_extract));
+      auto cond_res = BuildExpr(BuildExprCtx(cond, GetUsage(cond), ctx.deref_force_extract, ctx.assigned_to));
+      auto lhs_res = BuildExpr(BuildExprCtx(lhs, GetUsage(lhs), ctx.deref_force_extract, ctx.assigned_to));
+      auto rhs_res = BuildExpr(BuildExprCtx(rhs, GetUsage(rhs), ctx.deref_force_extract, ctx.assigned_to));
 
       std::string tmp_var_name = GetTempVarName("TernaryResult");
       std::string tmp_cond_name = GetTempVarName("TernaryCond");
@@ -622,8 +808,8 @@ if ({2}) {
       switch (binary_operator->getOpcode()) {
         // LAnd and LOr are handled specially because they short circuit
       case BO_LAnd: {
-        auto lhs_res = BuildExpr(BuildExprCtx(lhs, GetUsage(lhs), ctx.deref_force_extract));
-        auto rhs_res = BuildExpr(BuildExprCtx(rhs, GetUsage(rhs), ctx.deref_force_extract));
+        auto lhs_res = BuildExpr(BuildExprCtx(lhs, GetUsage(lhs), ctx.deref_force_extract, ctx.assigned_to));
+        auto rhs_res = BuildExpr(BuildExprCtx(rhs, GetUsage(rhs), ctx.deref_force_extract, ctx.assigned_to));
         std::string tmp_var_name = GetTempVarName("LAnd");
         std::string const if_cond = llvm::formatv(
             /*
@@ -645,17 +831,15 @@ if (!({2})) {
 })",
             llvm::join(lhs_res.pre_stmts | std::views::reverse, "\n"), tmp_var_name, lhs_res.final_expr,
             llvm::join(rhs_res.pre_stmts | std::views::reverse, "\n"), rhs_res.final_expr,
-            Lexer::getSourceText(CharSourceRange::getTokenRange(expr->getSourceRange()), data.Ctx.getSourceManager(),
-                                 data.Ctx.getLangOpts())
-                .str());
+            GetSourceText(expr, data.Ctx));
 
         pre_stmts.push_back(if_cond);
         os << tmp_var_name;
         break;
       }
       case BO_LOr: {
-        auto lhs_res = BuildExpr(BuildExprCtx(lhs, GetUsage(lhs), ctx.deref_force_extract));
-        auto rhs_res = BuildExpr(BuildExprCtx(rhs, GetUsage(rhs), ctx.deref_force_extract));
+        auto lhs_res = BuildExpr(BuildExprCtx(lhs, GetUsage(lhs), ctx.deref_force_extract, ctx.assigned_to));
+        auto rhs_res = BuildExpr(BuildExprCtx(rhs, GetUsage(rhs), ctx.deref_force_extract, ctx.assigned_to));
         std::string tmp_var_name = GetTempVarName("LOr");
         const std::string if_cond = llvm::formatv(
             /*
@@ -677,17 +861,15 @@ if ({2}) {
 })",
             llvm::join(lhs_res.pre_stmts | std::views::reverse, "\n"), tmp_var_name, lhs_res.final_expr,
             llvm::join(rhs_res.pre_stmts | std::views::reverse, "\n"), rhs_res.final_expr,
-            Lexer::getSourceText(CharSourceRange::getTokenRange(expr->getSourceRange()), data.Ctx.getSourceManager(),
-                                 data.Ctx.getLangOpts())
-                .str());
+            GetSourceText(expr, data.Ctx));
         pre_stmts.push_back(if_cond);
         os << tmp_var_name;
         break;
       }
 
       case BO_Assign: {
-        auto rhs_res = BuildExpr(BuildExprCtx(rhs, GetUsage(rhs), ctx.deref_force_extract));
-        auto lhs_res = BuildExpr(BuildExprCtx(lhs, Usage::Place, ctx.deref_force_extract));
+        auto rhs_res = BuildExpr(BuildExprCtx(rhs, GetUsage(rhs), ctx.deref_force_extract, ctx.assigned_to));
+        auto lhs_res = BuildExpr(BuildExprCtx(lhs, Usage::Place, ctx.deref_force_extract, ctx.assigned_to));
 
         assert(ctx.usage_kind != Usage::Place && "Assignment operator cannot be used as a place expression");
 
@@ -706,8 +888,8 @@ if ({2}) {
         // RHS is returned (only when ctx.usage_kind == Value)
 
         auto rhs_res = BuildExpr(BuildExprCtx(rhs, ctx.usage_kind == Usage::Effect ? Usage::Effect : GetUsage(rhs),
-                                              ctx.deref_force_extract));
-        auto lhs_res = BuildExpr(BuildExprCtx(lhs, GetUsage(lhs), ctx.deref_force_extract));
+                                              ctx.deref_force_extract, ctx.assigned_to));
+        auto lhs_res = BuildExpr(BuildExprCtx(lhs, GetUsage(lhs), ctx.deref_force_extract, ctx.assigned_to));
         pre_stmts.insert(pre_stmts.end(), rhs_res.pre_stmts.begin(), rhs_res.pre_stmts.end());
         pre_stmts.insert(pre_stmts.end(), lhs_res.pre_stmts.begin(), lhs_res.pre_stmts.end());
 
@@ -747,8 +929,8 @@ if ({2}) {
         [[fallthrough]];
       case BO_Or: {
 
-        auto rhs_res = BuildExpr(BuildExprCtx(rhs, GetUsage(rhs), ctx.deref_force_extract));
-        auto lhs_res = BuildExpr(BuildExprCtx(lhs, GetUsage(lhs), ctx.deref_force_extract));
+        auto rhs_res = BuildExpr(BuildExprCtx(rhs, GetUsage(rhs), ctx.deref_force_extract, ctx.assigned_to));
+        auto lhs_res = BuildExpr(BuildExprCtx(lhs, GetUsage(lhs), ctx.deref_force_extract, ctx.assigned_to));
 
         assert(ctx.usage_kind != Usage::Place && "Binary operator cannot be used as a place expression");
 
@@ -777,7 +959,7 @@ if ({2}) {
         assert(ctx.usage_kind != Usage::Place &&
                "Postfix increment/decrement operator cannot be used as a place expression");
 
-        auto res = BuildExpr(BuildExprCtx(sub_expr, Usage::Place, ctx.deref_force_extract));
+        auto res = BuildExpr(BuildExprCtx(sub_expr, Usage::Place, ctx.deref_force_extract, ctx.assigned_to));
         if (ctx.usage_kind == Usage::Effect) {
           pre_stmts.push_back(
               llvm::formatv(
@@ -814,7 +996,7 @@ if ({2}) {
         assert(ctx.usage_kind != Usage::Place &&
                "Prefix increment/decrement operator cannot be used as a place expression");
 
-        auto res = BuildExpr(BuildExprCtx(sub_expr, Usage::Place, ctx.deref_force_extract));
+        auto res = BuildExpr(BuildExprCtx(sub_expr, Usage::Place, ctx.deref_force_extract, ctx.assigned_to));
         if (ctx.usage_kind == Usage::Effect) {
           pre_stmts.push_back(
               llvm::formatv(
@@ -847,7 +1029,7 @@ if ({2}) {
 
       case UO_Deref: {
         auto usage_kind = ctx.deref_force_extract ? Usage::Value : ctx.usage_kind;
-        auto res = BuildExpr(BuildExprCtx(sub_expr, GetUsage(sub_expr), true));
+        auto res = BuildExpr(BuildExprCtx(sub_expr, GetUsage(sub_expr), true, ctx.assigned_to));
 
         if (usage_kind == Usage::Place) {
           os << "*" << res.final_expr;
@@ -884,7 +1066,7 @@ if ({2}) {
       case UO_Imag:
         [[fallthrough]];
       case UO_Extension: {
-        auto res = BuildExpr(BuildExprCtx(sub_expr, GetUsage(sub_expr), ctx.deref_force_extract));
+        auto res = BuildExpr(BuildExprCtx(sub_expr, GetUsage(sub_expr), ctx.deref_force_extract, ctx.assigned_to));
         os << llvm::formatv("{0}{1}", UnaryOperator::getOpcodeStr(unary_operator->getOpcode()).str(), res.final_expr);
         pre_stmts.insert(pre_stmts.end(), res.pre_stmts.begin(), res.pre_stmts.end());
         break;
@@ -898,8 +1080,8 @@ if ({2}) {
     } else if (auto *call_expr = dyn_cast<CallExpr>(expr)) {
       llvm::SmallVector<BuiltExpr, 4> arg_built_exprs;
       for (auto *arg : call_expr->arguments()) {
-        arg_built_exprs.push_back(
-            BuildExpr(BuildExprCtx(arg->IgnoreParenImpCasts(), Usage::Value, ctx.deref_force_extract)));
+        arg_built_exprs.push_back(BuildExpr(
+            BuildExprCtx(arg->IgnoreParenImpCasts(), Usage::Value, ctx.deref_force_extract, ctx.assigned_to)));
       }
       // TODO
       // it's possible for getDirectCallee to return nullptr, but I don't know what to do in that case...
@@ -913,23 +1095,27 @@ if ({2}) {
         pre_stmts.insert(pre_stmts.end(), built_expr.pre_stmts.begin(), built_expr.pre_stmts.end());
       }
     } else if (auto *member_expr = dyn_cast<MemberExpr>(expr)) {
+      if (member_expr->isArrow()) {
+        llvm::outs() << "member expr location: "
+                     << member_expr->getBeginLoc().printToString(data.Ctx.getSourceManager()) << "\n";
+      }
       assert(!member_expr->isArrow() && "Only dot member access is allowed here");
-      auto res =
-          BuildExpr(BuildExprCtx(member_expr->getBase()->IgnoreParenImpCasts(), Usage::Place, ctx.deref_force_extract));
+      auto res = BuildExpr(BuildExprCtx(member_expr->getBase()->IgnoreParenImpCasts(), Usage::Place,
+                                        ctx.deref_force_extract, ctx.assigned_to));
       os << llvm::formatv("({0}).{1}", res.final_expr, member_expr->getMemberNameInfo().getAsString());
       pre_stmts.insert(pre_stmts.end(), res.pre_stmts.begin(), res.pre_stmts.end());
     } else {
-      os << Lexer::getSourceText(CharSourceRange::getTokenRange(expr->getSourceRange()), data.Ctx.getSourceManager(),
-                                 data.Ctx.getLangOpts());
+      PrintSourceText(os, expr, data.Ctx);
     }
 
+  build_expr_end:
     os.flush();
     return BuiltExpr(pre_stmts, final_expr, final_expr_type, tail_access);
   }
 
   auto TraverseDeclStmt(DeclStmt *declStmt) -> bool {
     auto &sm = data.Ctx.getSourceManager();
-    if (declStmt == nullptr || sm.isInSystemHeader(sm.getSpellingLoc(declStmt->getBeginLoc()))) {
+    if (declStmt == nullptr || !sm.isInMainFile(sm.getSpellingLoc(declStmt->getBeginLoc()))) {
       return true;
     }
 
@@ -947,11 +1133,8 @@ if ({2}) {
           struct S a;
         */
         if (record_decl->isThisDeclarationADefinition()) {
-          const auto record_definition_text =
-              Lexer::getSourceText(CharSourceRange::getTokenRange(record_decl->getSourceRange()),
-                                   data.Ctx.getSourceManager(), data.Ctx.getLangOpts())
-                  .str();
-          os << record_definition_text << ";";
+          PrintSourceText(os, record_decl, data.Ctx);
+          os << ";";
         }
       } else if (auto *var_decl = dyn_cast<VarDecl>(decl)) {
         auto *init_expr = var_decl->getInit();
@@ -959,11 +1142,21 @@ if ({2}) {
           // normally we would put Usage::Value here but since every Usage::Place is also a Usage::Value, we can just
           // use Usage::Place to avoid an extra copy of the expression
           init_expr = init_expr->IgnoreParenImpCasts();
-          auto res = BuildExpr(BuildExprCtx(init_expr, GetUsage(init_expr), false));
-          for (auto &&pre_stmt : res.pre_stmts | std::views::reverse) {
-            os << pre_stmt << "\n";
+          auto res = BuildExpr(BuildExprCtx(
+              init_expr, GetUsage(init_expr), false,
+              std::make_optional(std::make_pair(var_decl->getNameAsString(), var_decl->getType().getCanonicalType()))));
+
+          // if the final expression is empty, the decl comes first.
+          // this is because the init expr stuff needs to come AFTER the decl...
+          if (res.final_expr.empty()) {
+            os << PrintType(var_decl->getType(), var_decl->getName()) << ";";
           }
-          os << llvm::formatv("{0} = {1};", PrintType(var_decl->getType(), var_decl->getName()), res.final_expr);
+          os << llvm::join(res.pre_stmts | std::views::reverse, "\n");
+
+          if (!res.final_expr.empty()) {
+            // assign whatever final value there is...
+            os << llvm::formatv("{0} = {1};", PrintType(var_decl->getType(), var_decl->getName()), res.final_expr);
+          }
         } else {
           os << PrintType(var_decl->getType(), var_decl->getName()) << ";";
         }
@@ -983,7 +1176,7 @@ if ({2}) {
 
   auto TraverseStmt(Stmt *stmt) -> bool {
     auto &sm = data.Ctx.getSourceManager();
-    if (stmt == nullptr || sm.isInSystemHeader(sm.getSpellingLoc(stmt->getBeginLoc()))) {
+    if (stmt == nullptr || !sm.isInMainFile(sm.getSpellingLoc(stmt->getBeginLoc()))) {
       return true;
     }
 
@@ -992,7 +1185,7 @@ if ({2}) {
 
       std::string replacement_text;
       llvm::raw_string_ostream os(replacement_text);
-      auto res = BuildExpr(BuildExprCtx(expr, Usage::Effect, false));
+      auto res = BuildExpr(BuildExprCtx(expr, Usage::Effect, false, std::nullopt));
       os << llvm::join(res.pre_stmts | std::views::reverse, "\n");
 
       if (!res.final_expr.empty()) {
@@ -1030,6 +1223,13 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
 
   bool add_error_occurred = false;
   for (const auto &r : replacements) {
+    if (r.getFilePath().empty()) {
+      // if there's no file path then it means the replacement is some fucked macro expansion or whatever
+      // anyway, I don't know if there is any case where we do want to apply the replacement (I'm not even sure how
+      // these got generated in the first place :skull:).
+      continue;
+    }
+
     if (auto err = pa_ctx.replacements.add(r)) {
       llvm::consumeError(std::move(err));
       llvm::errs() << llvm::formatv("{0} Add replacement conflict, retrying next pass...\n", LogBegin(pa_ctx));

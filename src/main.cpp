@@ -1,5 +1,4 @@
 #include "Pass_LoopsToWhile.h"
-#include "Pass_LowerBitfieldOps.h"
 #include "Pass_NormaliseIfStatements.h"
 #include "Pass_PromoteRecords.h"
 #include "Pass_SwitchToIf.h"

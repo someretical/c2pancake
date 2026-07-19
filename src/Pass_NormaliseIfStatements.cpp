@@ -66,7 +66,7 @@ public:
 
   auto ConvertIfStmt(IfStmt *if_stmt) -> void {
     auto &sm = data.Ctx.getSourceManager();
-    if (if_stmt == nullptr || sm.isInSystemHeader(sm.getSpellingLoc(if_stmt->getBeginLoc()))) {
+    if (if_stmt == nullptr || !sm.isInMainFile(sm.getSpellingLoc(if_stmt->getBeginLoc()))) {
       return;
     }
 
