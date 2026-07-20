@@ -827,7 +827,7 @@ if (!({2})) {
   {1} = 0;
 } else {
   {3}
-  {1} = !!({4}); 
+  {1} = 0 != ({4}); 
 })",
             llvm::join(lhs_res.pre_stmts | std::views::reverse, "\n"), tmp_var_name, lhs_res.final_expr,
             llvm::join(rhs_res.pre_stmts | std::views::reverse, "\n"), rhs_res.final_expr,
@@ -857,7 +857,7 @@ if ({2}) {
   {1} = 1;
 } else {
   {3}
-  {1} = !!({4}); 
+  {1} = 0 != ({4}); 
 })",
             llvm::join(lhs_res.pre_stmts | std::views::reverse, "\n"), tmp_var_name, lhs_res.final_expr,
             llvm::join(rhs_res.pre_stmts | std::views::reverse, "\n"), rhs_res.final_expr,
