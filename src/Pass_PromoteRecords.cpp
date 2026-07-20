@@ -1,5 +1,4 @@
 #include "Pass_PromoteRecords.h"
-
 #include "Utils.h"
 
 #include <clang-tools-extra/clangd/FindTarget.h>
@@ -86,8 +85,7 @@ auto MakeRule() -> RewriteRule {
 
                       SourceLocation const l_brace = rd->getBraceRange().getBegin();
                       SourceLocation const r_brace = rd->getBraceRange().getEnd();
-                      os << Lexer::getSourceText(CharSourceRange::getTokenRange(l_brace, r_brace),
-                                                 *result.SourceManager, result.Context->getLangOpts());
+                      PrintSourceText(os, CharSourceRange::getTokenRange(l_brace, r_brace), *result.Context);
                       os.flush();
 
                       return edit(changeTo(node("record"), cat(replacement_text)))(result);
@@ -266,10 +264,8 @@ public:
       llvm::raw_string_ostream os(replacement_text);
       os << "\n/* c2pancake: promoted record declarations for function " << func_decl->getName() << " BEGIN */\n";
       for (const auto *record_decl : it->second) {
-        os << Lexer::getSourceText(CharSourceRange::getTokenRange(record_decl->getSourceRange()),
-                                   data.Ctx.getSourceManager(), data.Ctx.getLangOpts())
-                  .str()
-           << ";\n";
+        PrintSourceText(os, record_decl, data.Ctx);
+        os << ";\n";
       }
       os << "/* c2pancake: promoted record declarations for function " << func_decl->getName() << " END */\n";
       os.flush();

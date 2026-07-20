@@ -34,6 +34,28 @@ auto LogBegin(const PipelineActionCtx &ctx) -> std::string {
   return llvm::formatv("[c2pancake] {0} -> {1}: {2}(i={4:02}) {3}:", ctx.current_file, ctx.next_file, action_type_str,
                        ctx.action_name.value_or("UnknownAction"), ctx.major_pass_number);
 }
+
+auto PrintSourceText(llvm::raw_string_ostream &os, const clang::CharSourceRange &range, const clang::ASTContext &ctx)
+    -> void {
+  const auto &sm = ctx.getSourceManager();
+  const auto &lang_opts = ctx.getLangOpts();
+
+  if (range.isInvalid()) {
+    llvm::errs() << "Invalid token range for source range: ";
+    llvm::errs() << range.getBegin().printToString(sm) << " - " << range.getEnd().printToString(sm) << "\n";
+    llvm_unreachable("FATAL");
+  }
+
+  const auto file_range = clang::Lexer::makeFileCharRange(range, sm, lang_opts);
+  if (file_range.isInvalid()) {
+    llvm::errs() << "Invalid file range for source range: ";
+    llvm::errs() << range.getBegin().printToString(sm) << " - " << range.getEnd().printToString(sm) << "\n";
+    llvm_unreachable("FATAL");
+  } else {
+    os << clang::Lexer::getSourceText(file_range, sm, lang_opts);
+  }
+}
+
 auto PrintSourceText(llvm::raw_string_ostream &os, const clang::Expr *expr, const clang::ASTContext &ctx) -> void {
   const auto &sm = ctx.getSourceManager();
   const auto &lang_opts = ctx.getLangOpts();
@@ -53,6 +75,7 @@ auto PrintSourceText(llvm::raw_string_ostream &os, const clang::Expr *expr, cons
     os << clang::Lexer::getSourceText(file_range, sm, lang_opts);
   }
 }
+
 auto PrintSourceText(llvm::raw_string_ostream &os, const clang::Stmt *stmt, const clang::ASTContext &ctx) -> void {
   const auto &sm = ctx.getSourceManager();
   const auto &lang_opts = ctx.getLangOpts();
@@ -72,6 +95,7 @@ auto PrintSourceText(llvm::raw_string_ostream &os, const clang::Stmt *stmt, cons
     os << clang::Lexer::getSourceText(file_range, sm, lang_opts);
   }
 }
+
 auto PrintSourceText(llvm::raw_string_ostream &os, const clang::TagDecl *tag_decl, const clang::ASTContext &ctx)
     -> void {
   const auto &sm = ctx.getSourceManager();

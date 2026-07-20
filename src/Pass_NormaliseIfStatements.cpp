@@ -103,9 +103,7 @@ public:
 
     std::string replacement_text;
     llvm::raw_string_ostream os(replacement_text);
-    const std::string original_cond_text = Lexer::getSourceText(CharSourceRange::getTokenRange(cond->getSourceRange()),
-                                                                data.Ctx.getSourceManager(), data.Ctx.getLangOpts())
-                                               .str();
+    const std::string original_cond_text = GetSourceText(cond, data.Ctx);
     const std::string cond_name = needs_cond_hoist ? GetIfCondTempVarName() : original_cond_text;
 
     // if this if-statement is part of an else-if chain, we need to wrap it in a compound statement no matter what
@@ -119,24 +117,20 @@ public:
 
     os << llvm::formatv("if ({0}) ", cond_name);
     if (const auto *then_compound_stmt = dyn_cast<CompoundStmt>(then_stmt)) {
-      os << Lexer::getSourceText(CharSourceRange::getTokenRange(then_compound_stmt->getSourceRange()),
-                                 data.Ctx.getSourceManager(), data.Ctx.getLangOpts());
+      PrintSourceText(os, then_compound_stmt, data.Ctx);
     } else {
       os << "{\n";
-      os << Lexer::getSourceText(CharSourceRange::getTokenRange(then_stmt->getSourceRange()),
-                                 data.Ctx.getSourceManager(), data.Ctx.getLangOpts());
+      PrintSourceText(os, then_stmt, data.Ctx);
       os << ";\n}";
     }
 
     if (else_stmt != nullptr) {
       os << " else ";
       if (const auto *else_compound_stmt = dyn_cast<CompoundStmt>(else_stmt)) {
-        os << Lexer::getSourceText(CharSourceRange::getTokenRange(else_compound_stmt->getSourceRange()),
-                                   data.Ctx.getSourceManager(), data.Ctx.getLangOpts());
+        PrintSourceText(os, else_compound_stmt, data.Ctx);
       } else {
         os << "{\n";
-        os << Lexer::getSourceText(CharSourceRange::getTokenRange(else_stmt->getSourceRange()),
-                                   data.Ctx.getSourceManager(), data.Ctx.getLangOpts());
+        PrintSourceText(os, else_stmt, data.Ctx);
         os << "\n}";
       }
     }

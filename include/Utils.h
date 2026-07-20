@@ -73,6 +73,9 @@ inline auto LogBeginShort(const std::string &in_file) { return llvm::formatv("[c
 
 inline auto LogBeginShort(const llvm::StringRef in_file) { return llvm::formatv("[c2pancake] {0}:", in_file); }
 
+auto PrintSourceText(llvm::raw_string_ostream &os, const clang::CharSourceRange &range, const clang::ASTContext &ctx)
+    -> void;
+
 auto PrintSourceText(llvm::raw_string_ostream &os, const clang::Expr *expr, const clang::ASTContext &ctx) -> void;
 
 inline auto GetSourceText(const clang::Expr *expr, const clang::ASTContext &ctx) -> std::string {

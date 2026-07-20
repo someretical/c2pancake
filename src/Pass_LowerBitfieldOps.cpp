@@ -682,8 +682,7 @@ public:
     } else {
     // NOLINTNEXTLINE(cppcoreguidelines-avoid-goto)
     build_expr_else:
-      os << Lexer::getSourceText(CharSourceRange::getTokenRange(expr->getSourceRange()), data.Ctx.getSourceManager(),
-                                 data.Ctx.getLangOpts());
+      PrintSourceText(os, expr, data.Ctx);
     }
 
   // NOLINTNEXTLINE(cppcoreguidelines-avoid-goto)

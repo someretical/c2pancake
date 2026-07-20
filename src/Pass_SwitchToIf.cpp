@@ -400,10 +400,10 @@ public:
 
         if (const auto *case_stmt = dyn_cast<CaseStmt>(label)) {
           const auto range = CharSourceRange::getTokenRange(case_stmt->getCaseLoc(), case_stmt->getColonLoc());
-          os << Lexer::getSourceText(range, data.Ctx.getSourceManager(), data.Ctx.getLangOpts());
+          PrintSourceText(os, range, data.Ctx);
         } else if (const auto *default_stmt = dyn_cast<DefaultStmt>(label)) {
           const auto range = CharSourceRange::getTokenRange(default_stmt->getDefaultLoc(), default_stmt->getColonLoc());
-          os << Lexer::getSourceText(range, data.Ctx.getSourceManager(), data.Ctx.getLangOpts());
+          PrintSourceText(os, range, data.Ctx);
         }
 
         if (case_info.body.empty() || index < case_info.labels.size() - 1) {
@@ -428,9 +428,7 @@ public:
         bool terminating_stmt_found = false;
         const auto body_it = case_info.body | std::views::reverse;
         for (const auto &stmt : body_it) {
-          // stmt->printPretty(os, nullptr, data.Ctx.getPrintingPolicy());
-          os << Lexer::getSourceText(CharSourceRange::getTokenRange(stmt->getSourceRange()),
-                                     data.Ctx.getSourceManager(), data.Ctx.getLangOpts());
+          PrintSourceText(os, stmt, data.Ctx);
           if (isa<CompoundStmt>(stmt)) {
             os << "\n";
           } else {
@@ -571,8 +569,7 @@ public:
         if (is_last && isa<BreakStmt>(stmt)) {
           // don't output the last break statement
         } else {
-          os << Lexer::getSourceText(CharSourceRange::getTokenRange(stmt->getSourceRange()),
-                                     data.Ctx.getSourceManager(), data.Ctx.getLangOpts());
+          PrintSourceText(os, stmt, data.Ctx);
           if (isa<CompoundStmt>(stmt)) {
             os << "\n";
           } else {
@@ -654,8 +651,7 @@ public:
     auto *switch_cond = switchStmt->getCond();
     auto tmp_var_name = GetSwitchCondTempVarName();
     os << llvm::formatv("{0} {1} = {2};\n", switch_cond->getType().getAsString(), tmp_var_name,
-                        Lexer::getSourceText(CharSourceRange::getTokenRange(switch_cond->getSourceRange()),
-                                             data.Ctx.getSourceManager(), data.Ctx.getLangOpts()));
+                        GetSourceText(switch_cond, data.Ctx));
 
     // first case gets turned into an "if"
     // subsequent cases get turned into "else if"
