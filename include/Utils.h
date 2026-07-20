@@ -5,6 +5,7 @@
 #include <clang/AST/ASTContext.h>
 #include <clang/AST/Expr.h>
 #include <clang/AST/Stmt.h>
+#include <clang/Basic/AddressSpaces.h>
 #include <clang/Basic/SourceManager.h>
 #include <clang/Frontend/CompilerInstance.h>
 #include <clang/Lex/Lexer.h>
@@ -105,6 +106,10 @@ inline auto GetSourceText(const clang::TagDecl *tag_decl, const clang::ASTContex
   PrintSourceText(os, tag_decl, ctx);
   os.flush();
   return s;
+}
+
+inline auto GetPointerWidth(const clang::ASTContext &ctx) -> uint64_t {
+  return ctx.getTargetInfo().getPointerWidth(clang::LangAS::Default);
 }
 } // namespace pancake
 
