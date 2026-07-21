@@ -1,4 +1,5 @@
 #include "Pass_LowerBitfieldOps.h"
+#include "Pass_TransformLogicalExpressions.h"
 #include "Utils.h"
 
 #include <clang/AST/ASTConsumer.h>
@@ -207,21 +208,20 @@ public:
     }
   }
 
-  struct BuiltExpr {
-    llvm::SmallVector<std::string, 4> pre_stmts;
-    std::string final_expr;
-    QualType final_expr_type;
-  };
-
-  struct BuiltExprCtx {
-    size_t depth = 0;
-  };
+  using BuiltExpr = pancake::pass_lower_nested_expressions::BuiltExpr;
+  using BuildExprCtx = pancake::pass_lower_nested_expressions::BuildExprCtx;
+  using Usage = pancake::pass_lower_nested_expressions::Usage;
+  template <typename... Args>
+  auto GetUsage(Args &&...args)
+      -> decltype(pancake::pass_lower_nested_expressions::GetUsage(std::forward<Args>(args)...)) {
+    return pancake::pass_lower_nested_expressions::GetUsage(std::forward<Args>(args)...);
+  }
 
   // Equivalent to
   // https://clang.llvm.org/doxygen/classclang_1_1CodeGen_1_1CodeGenFunction.html#abce29203390acfa7bfcda7d0c9101629
   // We only use this function for VOLATILE bitfields since the loads/stores generated should be always 8,16,32,64
   // If this ever changes, then we're fucked because clang IR can generate arbitrary width loads/stores
-  auto BuildLoadOfBitFieldLValue(const MemberExpr *member_expr, const BuiltExprCtx &ctx) -> BuiltExpr {
+  auto BuildLoadOfBitFieldLValue(const MemberExpr *member_expr, const BuildExprCtx &ctx) -> BuiltExpr {
     const FieldDecl *fd = cast<FieldDecl>(member_expr->getMemberDecl());
     assert(fd->isBitField());
 
@@ -231,7 +231,8 @@ public:
     QualType const ft = member_expr->getType();
 
     // Build the base object subexpression (e.g. "s" for s.field, or the pointer expression for p->field)
-    BuiltExpr base_built_expr = BuildExpr(member_expr->getBase(), {.depth = ctx.depth + 1});
+    BuiltExpr base_built_expr =
+        BuildExpr(BuildExprCtx(member_expr->getBase(), Usage::Place, ctx.deref_force_extract, ctx.assigned_to));
     llvm::SmallVector<std::string, 4> pre_stmts;
     std::string base_addr =
         member_expr->isArrow() ? base_built_expr.final_expr : llvm::formatv("(&{0})", base_built_expr.final_expr);
@@ -310,10 +311,10 @@ public:
 
     auto final_pre_stmts = pre_stmts | std::views::reverse | std::ranges::to<llvm::SmallVector<std::string, 4>>();
     final_pre_stmts.insert(final_pre_stmts.end(), base_built_expr.pre_stmts.begin(), base_built_expr.pre_stmts.end());
-    return {.pre_stmts = std::move(final_pre_stmts), .final_expr = cast_temp, .final_expr_type = ft};
+    return BuiltExpr(std::move(final_pre_stmts), cast_temp, ft);
   }
 
-  auto BuildStoreThroughBitFieldLValue(const MemberExpr *member_expr, Expr *src_expr, const BuiltExprCtx &ctx)
+  auto BuildStoreThroughBitFieldLValue(const MemberExpr *member_expr, Expr *src_expr, const BuildExprCtx &ctx)
       -> BuiltExpr {
     const FieldDecl *fd = cast<FieldDecl>(member_expr->getMemberDecl());
     assert(fd->isBitField());
@@ -324,8 +325,10 @@ public:
     QualType const ft = member_expr->getType();
 
     // Build the base object subexpression (e.g. "s" for s.field, or the pointer expression for p->field)
-    BuiltExpr base_built_expr = BuildExpr(member_expr->getBase(), {.depth = ctx.depth + 1});
-    BuiltExpr src_built_expr = BuildExpr(src_expr, {.depth = ctx.depth + 1});
+    auto base_built_expr =
+        BuildExpr(BuildExprCtx(member_expr->getBase(), Usage::Place, ctx.deref_force_extract, ctx.assigned_to));
+    BuiltExpr src_built_expr =
+        BuildExpr(BuildExprCtx(src_expr, Usage::Value, ctx.deref_force_extract, ctx.assigned_to));
     llvm::SmallVector<std::string, 4> pre_stmts;
     std::string base_addr =
         member_expr->isArrow() ? base_built_expr.final_expr : llvm::formatv("(&{0})", base_built_expr.final_expr);
@@ -438,33 +441,18 @@ public:
     final_pre_stmts.insert(final_pre_stmts.end(), src_built_expr.pre_stmts.begin(), src_built_expr.pre_stmts.end());
     final_pre_stmts.insert(final_pre_stmts.end(), base_built_expr.pre_stmts.begin(), base_built_expr.pre_stmts.end());
 
-    return {.pre_stmts = std::move(final_pre_stmts), .final_expr = result_expr, .final_expr_type = ft};
+    return BuiltExpr(std::move(final_pre_stmts), result_expr, ft);
   }
 
-  auto BuildExpr(Expr *expr, const BuiltExprCtx ctx) -> BuiltExpr {
-    expr = expr->IgnoreParenImpCasts();
+  auto BuildExpr(const pass_lower_nested_expressions::BuildExprCtx &ctx) -> BuiltExpr {
+    auto *expr = ctx.expr->IgnoreParenImpCasts();
 
-    llvm::SmallVector<std::string, 4> pre_stmts;
-    std::string replacement_text;
-    llvm::raw_string_ostream os(replacement_text);
-    QualType const final_expr_type = expr->getType();
+    llvm::SmallVector<std::string, 8> pre_stmts;
+    std::string final_expr;
+    llvm::raw_string_ostream os(final_expr);
+    const QualType final_expr_type = expr->getType();
 
-    if (auto *decl_ref_expr = dyn_cast<DeclRefExpr>(expr)) {
-      os << Lexer::getSourceText(CharSourceRange::getTokenRange(decl_ref_expr->getSourceRange()),
-                                 data.Ctx.getSourceManager(), data.Ctx.getLangOpts());
-    } else if (auto *integer_literal = dyn_cast<IntegerLiteral>(expr)) {
-      os << Lexer::getSourceText(CharSourceRange::getTokenRange(integer_literal->getSourceRange()),
-                                 data.Ctx.getSourceManager(), data.Ctx.getLangOpts());
-    } else if (auto *floating_literal = dyn_cast<FloatingLiteral>(expr)) {
-      os << Lexer::getSourceText(CharSourceRange::getTokenRange(floating_literal->getSourceRange()),
-                                 data.Ctx.getSourceManager(), data.Ctx.getLangOpts());
-    } else if (auto *character_literal = dyn_cast<CharacterLiteral>(expr)) {
-      os << Lexer::getSourceText(CharSourceRange::getTokenRange(character_literal->getSourceRange()),
-                                 data.Ctx.getSourceManager(), data.Ctx.getLangOpts());
-    } else if (auto *string_literal = dyn_cast<StringLiteral>(expr)) {
-      os << Lexer::getSourceText(CharSourceRange::getTokenRange(string_literal->getSourceRange()),
-                                 data.Ctx.getSourceManager(), data.Ctx.getLangOpts());
-    } else if (auto *binary_operator = dyn_cast<BinaryOperator>(expr)) {
+    if (auto *binary_operator = dyn_cast<BinaryOperator>(expr)) {
       auto *lhs = binary_operator->getLHS()->IgnoreParenImpCasts();
       auto *rhs = binary_operator->getRHS()->IgnoreParenImpCasts();
 
@@ -485,13 +473,16 @@ public:
               // check here however, in BuildStoreThroughBitFieldLValue, we check for info.VolatileStorageSize != 0
               // to determine if we should use the volatile path
               if (use_volatile) {
-                auto built_expr = BuildStoreThroughBitFieldLValue(member_expr, rhs, {.depth = ctx.depth + 1});
+                auto built_expr = BuildStoreThroughBitFieldLValue(
+                    member_expr, rhs, BuildExprCtx(rhs, Usage::Value, ctx.deref_force_extract, ctx.assigned_to));
                 os << built_expr.final_expr;
                 pre_stmts.insert(pre_stmts.end(), built_expr.pre_stmts.begin(), built_expr.pre_stmts.end());
               } else {
                 // otherwise we can use the non-volatile helpers to do the bitfield store
-                BuiltExpr base_built_expr = BuildExpr(member_expr->getBase(), {.depth = ctx.depth + 1});
-                BuiltExpr rhs_built_expr = BuildExpr(rhs, {.depth = ctx.depth + 1});
+                BuiltExpr base_built_expr = BuildExpr(
+                    BuildExprCtx(member_expr->getBase(), Usage::Place, ctx.deref_force_extract, ctx.assigned_to));
+                BuiltExpr rhs_built_expr =
+                    BuildExpr(BuildExprCtx(rhs, GetUsage(rhs), ctx.deref_force_extract, ctx.assigned_to));
                 llvm::SmallVector<std::string, 4> pre_stmts;
                 std::string base_addr = member_expr->isArrow() ? base_built_expr.final_expr
                                                                : llvm::formatv("(&{0})", base_built_expr.final_expr);
@@ -512,21 +503,18 @@ public:
           }
         }
 
-        auto rhs_res = BuildExpr(rhs, {.depth = ctx.depth + 1});
-        auto lhs_res = BuildExpr(lhs, {.depth = ctx.depth + 1});
+        auto rhs_res = BuildExpr(BuildExprCtx(rhs, GetUsage(rhs), ctx.deref_force_extract, ctx.assigned_to));
+        auto lhs_res = BuildExpr(BuildExprCtx(lhs, Usage::Place, ctx.deref_force_extract, ctx.assigned_to));
 
-        if (ctx.depth == 0) {
-          // semi-colon is added by the caller
-          os << llvm::formatv("{0} = {1}", lhs_res.final_expr, rhs_res.final_expr);
-        } else {
-          // we need to hoist this before
-          pre_stmts.push_back(llvm::formatv("{0} = {1};", lhs_res.final_expr, rhs_res.final_expr).str());
+        assert(ctx.usage_kind != Usage::Place && "Assignment operator cannot be used as a place expression");
+
+        pre_stmts.push_back(llvm::formatv("{0} = {1};", lhs_res.final_expr, rhs_res.final_expr).str());
+        if (ctx.usage_kind == Usage::Value) {
           os << lhs_res.final_expr;
         }
 
         pre_stmts.insert(pre_stmts.end(), rhs_res.pre_stmts.begin(), rhs_res.pre_stmts.end());
         pre_stmts.insert(pre_stmts.end(), lhs_res.pre_stmts.begin(), lhs_res.pre_stmts.end());
-
         break;
       }
 
@@ -561,10 +549,13 @@ public:
       case BO_Xor:
         [[fallthrough]];
       case BO_Or: {
-        auto rhs_res = BuildExpr(rhs, {.depth = ctx.depth + 1});
-        auto lhs_res = BuildExpr(lhs, {.depth = ctx.depth + 1});
 
-        // recursion level doesn't matter
+        auto rhs_res = BuildExpr(BuildExprCtx(rhs, GetUsage(rhs), ctx.deref_force_extract, ctx.assigned_to));
+        auto lhs_res = BuildExpr(BuildExprCtx(lhs, GetUsage(lhs), ctx.deref_force_extract, ctx.assigned_to));
+
+        assert(ctx.usage_kind != Usage::Place && "Binary operator cannot be used as a place expression");
+
+        // don't return a pre stmt no matter what since these can be arbitrarily nested
         os << llvm::formatv("({0} {1} {2})", lhs_res.final_expr,
                             BinaryOperator::getOpcodeStr(binary_operator->getOpcode()), rhs_res.final_expr);
 
@@ -574,20 +565,40 @@ public:
       }
 
       default: {
-        llvm::outs() << "Unhandled binary operator: " << BinaryOperator::getOpcodeStr(binary_operator->getOpcode())
-                     << "\n";
         llvm_unreachable("Unhandled binary operator");
         break;
       }
       }
     } else if (auto *unary_operator = dyn_cast<UnaryOperator>(expr)) {
       auto *sub_expr = unary_operator->getSubExpr()->IgnoreParenImpCasts();
-      auto res = BuildExpr(sub_expr, {.depth = ctx.depth + 1});
+      // auto res = BuildExpr(sub_expr, depth + 1);
 
       switch (unary_operator->getOpcode()) {
+      case UO_Deref: {
+        auto usage_kind = ctx.deref_force_extract ? Usage::Value : ctx.usage_kind;
+        auto res = BuildExpr(BuildExprCtx(sub_expr, GetUsage(sub_expr), true, ctx.assigned_to));
+
+        if (usage_kind == Usage::Place) {
+          os << "*" << res.final_expr;
+        } else {
+          // extract into temp var
+          std::string const tmp_var_name = GetTempVarName("Deref");
+
+          auto decl_type = final_expr_type;
+          if (final_expr_type->isArrayType()) {
+            // Can't copy-initialize an array object. Declare a pointer to the array's element type instead
+            const auto *array_type = data.Ctx.getAsArrayType(final_expr_type);
+            decl_type = data.Ctx.getPointerType(array_type->getElementType());
+          }
+          pre_stmts.push_back(llvm::formatv("{0} = *{1};", PrintType(decl_type, tmp_var_name), res.final_expr).str());
+          os << tmp_var_name;
+        }
+
+        pre_stmts.insert(pre_stmts.end(), res.pre_stmts.begin(), res.pre_stmts.end());
+        break;
+      }
+
       case UO_AddrOf:
-        [[fallthrough]];
-      case UO_Deref:
         [[fallthrough]];
       case UO_Plus:
         [[fallthrough]];
@@ -602,7 +613,9 @@ public:
       case UO_Imag:
         [[fallthrough]];
       case UO_Extension: {
-        os << llvm::formatv("{0}({1})", UnaryOperator::getOpcodeStr(unary_operator->getOpcode()).str(), res.final_expr);
+        auto res = BuildExpr(BuildExprCtx(sub_expr, GetUsage(sub_expr), ctx.deref_force_extract, ctx.assigned_to));
+        os << llvm::formatv("{0}{1}", UnaryOperator::getOpcodeStr(unary_operator->getOpcode()).str(), res.final_expr);
+        pre_stmts.insert(pre_stmts.end(), res.pre_stmts.begin(), res.pre_stmts.end());
         break;
       }
 
@@ -611,15 +624,15 @@ public:
         break;
       }
       }
-
-      pre_stmts.insert(pre_stmts.end(), res.pre_stmts.begin(), res.pre_stmts.end());
     } else if (auto *call_expr = dyn_cast<CallExpr>(expr)) {
       llvm::SmallVector<BuiltExpr, 4> arg_built_exprs;
       for (auto *arg : call_expr->arguments()) {
-        arg_built_exprs.push_back(BuildExpr(arg, {.depth = ctx.depth + 1}));
+        arg_built_exprs.push_back(BuildExpr(
+            BuildExprCtx(arg->IgnoreParenImpCasts(), Usage::Value, ctx.deref_force_extract, ctx.assigned_to)));
       }
       // TODO
       // it's possible for getDirectCallee to return nullptr, but I don't know what to do in that case...
+      // TODO throw error on any function pointers
       os << llvm::formatv("{0}({1})", call_expr->getDirectCallee()->getName().str(),
                           llvm::join(arg_built_exprs | std::views::transform([](const BuiltExpr &e) -> std::string {
                                        return e.final_expr;
@@ -628,16 +641,6 @@ public:
       for (auto &&built_expr : arg_built_exprs | std::views::reverse) {
         pre_stmts.insert(pre_stmts.end(), built_expr.pre_stmts.begin(), built_expr.pre_stmts.end());
       }
-    } else if (auto *array_subscript_expr = dyn_cast<ArraySubscriptExpr>(expr)) {
-      auto *idx = array_subscript_expr->getIdx();
-      auto *base = array_subscript_expr->getBase();
-
-      auto res = BuildExpr(idx, {.depth = ctx.depth + 1});
-      os << llvm::formatv("{0}[{1}]",
-                          Lexer::getSourceText(CharSourceRange::getTokenRange(base->getSourceRange()),
-                                               data.Ctx.getSourceManager(), data.Ctx.getLangOpts()),
-                          res.final_expr);
-      pre_stmts.insert(pre_stmts.end(), res.pre_stmts.begin(), res.pre_stmts.end());
     } else if (auto *member_expr = dyn_cast<MemberExpr>(expr)) {
       // writes are handled by the assignment operator
       if (IsRead(member_expr)) {
@@ -653,14 +656,16 @@ public:
             // determine if we should use the volatile path
 
             if (use_volatile) {
-              auto res = BuildLoadOfBitFieldLValue(member_expr, {.depth = ctx.depth + 1});
+              auto res = BuildLoadOfBitFieldLValue(
+                  member_expr, BuildExprCtx(member_expr, Usage::Value, ctx.deref_force_extract, ctx.assigned_to));
               os << res.final_expr;
               pre_stmts.insert(pre_stmts.end(), res.pre_stmts.begin(), res.pre_stmts.end());
             } else {
               // otherwise fallback to helper functions
 
               // Build the base object subexpression (e.g. "s" for s.field, or the pointer expression for p->field)
-              BuiltExpr base_built_expr = BuildExpr(member_expr->getBase(), {.depth = ctx.depth + 1});
+              BuiltExpr base_built_expr = BuildExpr(
+                  BuildExprCtx(member_expr->getBase(), Usage::Value, ctx.deref_force_extract, ctx.assigned_to));
               llvm::SmallVector<std::string, 4> pre_stmts;
               std::string base_addr = member_expr->isArrow() ? base_built_expr.final_expr
                                                              : llvm::formatv("(&{0})", base_built_expr.final_expr);
@@ -680,48 +685,13 @@ public:
       // NOLINTNEXTLINE(cppcoreguidelines-avoid-goto)
       goto build_expr_else;
     } else {
-    // NOLINTNEXTLINE(cppcoreguidelines-avoid-goto)
     build_expr_else:
       PrintSourceText(os, expr, data.Ctx);
     }
 
-  // NOLINTNEXTLINE(cppcoreguidelines-avoid-goto)
   build_expr_end:
     os.flush();
-    return {.pre_stmts = std::move(pre_stmts),
-            .final_expr = std::move(replacement_text),
-            .final_expr_type = final_expr_type};
-  }
-
-  auto TraverseDeclStmt(DeclStmt *declStmt) -> bool {
-    auto &sm = data.Ctx.getSourceManager();
-    if (declStmt == nullptr || !sm.isInMainFile(sm.getSpellingLoc(declStmt->getBeginLoc()))) {
-      return true;
-    }
-
-    std::string replacement_text;
-    llvm::raw_string_ostream os(replacement_text);
-
-    for (auto *decl : declStmt->decls()) {
-      if (auto *var_decl = dyn_cast<VarDecl>(decl)) {
-        auto *init_expr = var_decl->getInit();
-        if (init_expr != nullptr) {
-          auto res = BuildExpr(init_expr->IgnoreParenImpCasts(), {.depth = 0});
-          os << llvm::join(res.pre_stmts | std::views::reverse, "\n");
-          os << llvm::formatv("{0} = {1};", PrintType(var_decl->getType(), var_decl->getName()), res.final_expr);
-        }
-      }
-    }
-
-    os.flush();
-    if (!replacement_text.empty()) {
-      data.replacements.emplace_back(data.Ctx.getSourceManager(),
-                                     CharSourceRange::getTokenRange(declStmt->getSourceRange()), replacement_text,
-                                     data.Ctx.getLangOpts());
-      return true;
-    }
-
-    return RecursiveASTVisitor::TraverseDeclStmt(declStmt);
+    return BuiltExpr(pre_stmts, final_expr, final_expr_type);
   }
 
   auto TraverseStmt(Stmt *stmt) -> bool {
@@ -729,21 +699,33 @@ public:
     if (stmt == nullptr || !sm.isInMainFile(sm.getSpellingLoc(stmt->getBeginLoc()))) {
       return true;
     }
+
     if (auto *expr = dyn_cast<Expr>(stmt)) {
       expr = expr->IgnoreParenImpCasts();
 
       std::string replacement_text;
       llvm::raw_string_ostream os(replacement_text);
-      auto res = BuildExpr(expr, {.depth = 0});
+      auto res = BuildExpr(BuildExprCtx(expr, Usage::Effect, false, std::nullopt));
       os << llvm::join(res.pre_stmts | std::views::reverse, "\n");
-      // for some reason we don't need a ; after this...
-      os << llvm::formatv("{0}", res.final_expr);
+
+      if (!res.final_expr.empty()) {
+        os << llvm::formatv("{0}", res.final_expr);
+      }
       os.flush();
 
       if (!replacement_text.empty()) {
-        data.replacements.emplace_back(data.Ctx.getSourceManager(),
-                                       CharSourceRange::getTokenRange(stmt->getSourceRange()), replacement_text,
-                                       data.Ctx.getLangOpts());
+        CharSourceRange range = CharSourceRange::getTokenRange(stmt->getSourceRange());
+        if (res.final_expr.empty()) {
+          auto start = stmt->getBeginLoc();
+          auto end = stmt->getEndLoc();
+          auto end_inc_semicolon =
+              Lexer::findLocationAfterToken(end, tok::semi, data.Ctx.getSourceManager(), data.Ctx.getLangOpts(), false);
+          range = CharSourceRange::getCharRange(start, end_inc_semicolon);
+        } else {
+          range = CharSourceRange::getTokenRange(stmt->getSourceRange());
+        }
+
+        data.replacements.emplace_back(data.Ctx.getSourceManager(), range, replacement_text, data.Ctx.getLangOpts());
       }
       return true;
     }

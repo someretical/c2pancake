@@ -239,6 +239,137 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
 } // namespace pancake::pass_rewrite_struct_stabs
 
 namespace pancake::pass_lower_nested_expressions {
+auto GetUsage(const Expr *expr) -> Usage {
+  if (const auto *_ = dyn_cast<DeclRefExpr>(expr)) {
+    return Usage::Place;
+  }
+  if (const auto *_ = dyn_cast<IntegerLiteral>(expr)) {
+    return Usage::Place;
+  }
+  if (const auto *_ = dyn_cast<FloatingLiteral>(expr)) {
+    return Usage::Place;
+  }
+  if (const auto *_ = dyn_cast<CharacterLiteral>(expr)) {
+    return Usage::Place;
+  }
+  if (const auto *_ = dyn_cast<StringLiteral>(expr)) {
+    return Usage::Place;
+  }
+  if (const auto *_ = dyn_cast<CompoundLiteralExpr>(expr)) {
+    return Usage::Value;
+  }
+  if (const auto *_ = dyn_cast<InitListExpr>(expr)) {
+    return Usage::Value;
+  }
+  if (const auto *_ = dyn_cast<StmtExpr>(expr)) {
+    return Usage::Value;
+  }
+  // CompoundAssignOperator is a specialization of BinaryOperator
+
+  if (const auto *_ = dyn_cast<CompoundAssignOperator>(expr)) {
+    return Usage::Value;
+  }
+  if (const auto *_ = dyn_cast<ConditionalOperator>(expr)) {
+    return Usage::Value;
+  }
+  if (const auto *binary_operator = dyn_cast<BinaryOperator>(expr)) {
+    switch (binary_operator->getOpcode()) {
+    case BO_LAnd:
+      [[fallthrough]];
+    case BO_LOr:
+      [[fallthrough]];
+    case BO_Assign:
+      [[fallthrough]];
+    case BO_Comma:
+      [[fallthrough]];
+    case BO_Mul:
+      [[fallthrough]];
+    case BO_Div:
+      [[fallthrough]];
+    case BO_Rem:
+      [[fallthrough]];
+    case BO_Add:
+      [[fallthrough]];
+    case BO_Sub:
+      [[fallthrough]];
+    case BO_Shl:
+      [[fallthrough]];
+    case BO_Shr:
+      [[fallthrough]];
+    case BO_LT:
+      [[fallthrough]];
+    case BO_GT:
+      [[fallthrough]];
+    case BO_LE:
+      [[fallthrough]];
+    case BO_GE:
+      [[fallthrough]];
+    case BO_EQ:
+      [[fallthrough]];
+    case BO_NE:
+      [[fallthrough]];
+    case BO_And:
+      [[fallthrough]];
+    case BO_Xor:
+      [[fallthrough]];
+    case BO_Or: {
+      return Usage::Value;
+    }
+
+    default: {
+      llvm_unreachable("Unhandled binary operator");
+      break;
+    }
+    }
+  } else if (const auto *unary_operator = dyn_cast<UnaryOperator>(expr)) {
+
+    switch (unary_operator->getOpcode()) {
+    case UO_PostInc:
+      [[fallthrough]];
+    case UO_PostDec: {
+      return Usage::Value;
+    }
+
+    case UO_PreInc:
+      [[fallthrough]];
+    case UO_PreDec: {
+      return Usage::Value;
+    }
+
+    case UO_Deref: {
+      return Usage::Place;
+    }
+
+    case UO_AddrOf:
+      [[fallthrough]];
+    case UO_Plus:
+      [[fallthrough]];
+    case UO_Minus:
+      [[fallthrough]];
+    case UO_Not:
+      [[fallthrough]];
+    case UO_LNot:
+      [[fallthrough]];
+    case UO_Real:
+      [[fallthrough]];
+    case UO_Imag:
+      [[fallthrough]];
+    case UO_Extension: {
+      return Usage::Place;
+    }
+
+    default: {
+      llvm_unreachable("Unhandled unary operator");
+      break;
+    }
+    }
+  } else if (const auto *_ = dyn_cast<CallExpr>(expr)) {
+    return Usage::Value;
+  } else {
+    return Usage::Place;
+  }
+}
+
 namespace {
 struct WorkerData {
   ASTContext &Ctx;
@@ -292,188 +423,6 @@ public:
     }
   }
 
-  enum class TailAccess : uint8_t {
-    None,
-    Dot,
-    Arrow,
-    Deref,
-  };
-  struct BuiltExpr {
-    llvm::SmallVector<std::string, 8> pre_stmts;
-    QualType final_expr_type;
-    std::string final_expr;
-    TailAccess tail_access;
-    explicit BuiltExpr(llvm::SmallVector<std::string, 8> pre_stmts, std::string final_expr, QualType final_expr_type,
-                       TailAccess tail_access)
-        : pre_stmts(std::move(pre_stmts)), final_expr_type(final_expr_type), final_expr(std::move(final_expr)),
-          tail_access(tail_access) {}
-  };
-
-  enum class Usage : uint8_t {
-    /**
-     * @brief Compute the expression's resulting value
-     *
-     * Used when: The caller needs the result
-     *
-     * Example: x = a + b, foo(expr), int y = (b = 3)
-     */
-    Value,
-
-    /**
-     * @brief Compute the reusable description of the storage location of the expression. Note this is very specifically
-     * not supposed to return a pointer!
-     *
-     * Used when: The caller needs to read/write memory at that location
-     *
-     * Example: x = 3 (lhs), *p = v, ++a->b
-     */
-    Place,
-
-    /**
-     * @brief Execute the expression only for its side effects; ignore its value
-     *
-     * Used when: The result is thrown away
-     *
-     * Example: a = 3;, foo(expr);, ++a;
-     */
-    Effect
-  };
-  struct BuildExprCtx {
-    Expr *expr;
-    Usage usage_kind;
-    bool deref_force_extract; // force the extraction of the next deref into a temp var
-    using AssignedToPair = std::pair<std::reference_wrapper<const std::string>, std::reference_wrapper<const QualType>>;
-    std::optional<AssignedToPair>
-        assigned_to; // if this expression is being assigned to a variable, this is the name and type of that variable.
-                     // This is only relevant for init list expressions
-    explicit BuildExprCtx(Expr *expr, Usage usage_kind, bool deref_force_extract,
-                          std::optional<AssignedToPair> assigned_to)
-        : expr(expr), usage_kind(usage_kind), deref_force_extract(deref_force_extract),
-          assigned_to(std::move(assigned_to)) {}
-  };
-
-  static auto GetUsage(const Expr *expr) -> Usage {
-    if (const auto *_ = dyn_cast<DeclRefExpr>(expr)) {
-      return Usage::Place;
-    }
-    if (const auto *_ = dyn_cast<IntegerLiteral>(expr)) {
-      return Usage::Place;
-    } else if (const auto *_ = dyn_cast<FloatingLiteral>(expr)) {
-      return Usage::Place;
-    } else if (const auto *_ = dyn_cast<CharacterLiteral>(expr)) {
-      return Usage::Place;
-    } else if (const auto *_ = dyn_cast<StringLiteral>(expr)) {
-      return Usage::Place;
-    } else if (const auto *_ = dyn_cast<CompoundLiteralExpr>(expr)) {
-      return Usage::Value;
-    } else if (const auto *_ = dyn_cast<InitListExpr>(expr)) {
-      return Usage::Value;
-    } else if (const auto *_ = dyn_cast<StmtExpr>(expr)) {
-      return Usage::Value;
-    }
-    // CompoundAssignOperator is a specialization of BinaryOperator
-    else if (const auto *_ = dyn_cast<CompoundAssignOperator>(expr)) {
-      return Usage::Value;
-    } else if (const auto *_ = dyn_cast<ConditionalOperator>(expr)) {
-      return Usage::Value;
-    } else if (const auto *binary_operator = dyn_cast<BinaryOperator>(expr)) {
-      switch (binary_operator->getOpcode()) {
-      case BO_LAnd:
-        [[fallthrough]];
-      case BO_LOr:
-        [[fallthrough]];
-      case BO_Assign:
-        [[fallthrough]];
-      case BO_Comma:
-        [[fallthrough]];
-      case BO_Mul:
-        [[fallthrough]];
-      case BO_Div:
-        [[fallthrough]];
-      case BO_Rem:
-        [[fallthrough]];
-      case BO_Add:
-        [[fallthrough]];
-      case BO_Sub:
-        [[fallthrough]];
-      case BO_Shl:
-        [[fallthrough]];
-      case BO_Shr:
-        [[fallthrough]];
-      case BO_LT:
-        [[fallthrough]];
-      case BO_GT:
-        [[fallthrough]];
-      case BO_LE:
-        [[fallthrough]];
-      case BO_GE:
-        [[fallthrough]];
-      case BO_EQ:
-        [[fallthrough]];
-      case BO_NE:
-        [[fallthrough]];
-      case BO_And:
-        [[fallthrough]];
-      case BO_Xor:
-        [[fallthrough]];
-      case BO_Or: {
-        return Usage::Value;
-      }
-
-      default: {
-        llvm_unreachable("Unhandled binary operator");
-        break;
-      }
-      }
-    } else if (const auto *unary_operator = dyn_cast<UnaryOperator>(expr)) {
-
-      switch (unary_operator->getOpcode()) {
-      case UO_PostInc:
-        [[fallthrough]];
-      case UO_PostDec: {
-        return Usage::Value;
-      }
-
-      case UO_PreInc:
-        [[fallthrough]];
-      case UO_PreDec: {
-        return Usage::Value;
-      }
-
-      case UO_Deref: {
-        return Usage::Place;
-      }
-
-      case UO_AddrOf:
-        [[fallthrough]];
-      case UO_Plus:
-        [[fallthrough]];
-      case UO_Minus:
-        [[fallthrough]];
-      case UO_Not:
-        [[fallthrough]];
-      case UO_LNot:
-        [[fallthrough]];
-      case UO_Real:
-        [[fallthrough]];
-      case UO_Imag:
-        [[fallthrough]];
-      case UO_Extension: {
-        return Usage::Place;
-      }
-
-      default: {
-        llvm_unreachable("Unhandled unary operator");
-        break;
-      }
-      }
-    } else if (const auto *_ = dyn_cast<CallExpr>(expr)) {
-      return Usage::Value;
-    } else {
-      return Usage::Place;
-    }
-  }
-
   auto BuildExpr(const BuildExprCtx &ctx) -> BuiltExpr {
     auto *expr = ctx.expr->IgnoreParenImpCasts();
 
@@ -481,7 +430,6 @@ public:
     std::string final_expr;
     llvm::raw_string_ostream os(final_expr);
     const QualType final_expr_type = expr->getType();
-    TailAccess const tail_access = TailAccess::None;
 
     if (auto *decl_ref_expr = dyn_cast<DeclRefExpr>(expr)) {
       PrintSourceText(os, decl_ref_expr, data.Ctx);
@@ -1110,7 +1058,7 @@ if ({2}) {
 
   build_expr_end:
     os.flush();
-    return BuiltExpr(pre_stmts, final_expr, final_expr_type, tail_access);
+    return BuiltExpr(pre_stmts, final_expr, final_expr_type);
   }
 
   auto TraverseDeclStmt(DeclStmt *declStmt) -> bool {
