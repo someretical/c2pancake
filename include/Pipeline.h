@@ -5,6 +5,7 @@
 
 #include <clang/AST/ASTConsumer.h>
 #include <clang/AST/ASTContext.h>
+#include <clang/Format/Format.h>
 #include <clang/Frontend/CompilerInstance.h>
 #include <clang/Frontend/FrontendAction.h>
 #include <clang/Rewrite/Core/Rewriter.h>
@@ -77,21 +78,48 @@ public:
       auto current_filename = getCurrentInput().getFile();
 
       auto buf = sm.getBufferOrFake(sm.getMainFileID());
-      std::string source_text(buf.getBuffer());
+      auto source_text = buf.getBuffer();
+      auto original_filename = current_filename.drop_back(pa_ctx.current_suffix.size());
+      auto output_path = llvm::formatv("{0}{1}", original_filename, pa_ctx.next_suffix).str();
 
-      auto result = applyAllReplacements(source_text, pa_ctx.replacements);
-      if (!result) {
-        // abnormal error!
-        llvm::errs() << llvm::formatv("{0} {1}\n", LogBegin(pa_ctx), llvm::fmt_consume(result.takeError()));
-        break;
+      std::string final_text;
+
+      if (pa_ctx.replacements.empty()) {
+        final_text = source_text;
+      } else {
+        auto result = clang::tooling::applyAllReplacements(source_text, pa_ctx.replacements);
+        if (!result) {
+          // abnormal error!
+          llvm::errs() << llvm::formatv("{0} {1}\n", LogBegin(pa_ctx), llvm::fmt_consume(result.takeError()));
+          break;
+        }
+
+        // apply clang-format pass
+        auto style_or_err =
+            clang::format::getStyle("file", output_path, "LLVM", *result, &sm.getFileManager().getVirtualFileSystem());
+        std::string formatted = *result;
+        if (style_or_err) {
+          auto style = *style_or_err;
+          // no way to avoid the cast from unsigned long to unsigned int
+          llvm::SmallVector<clang::tooling::Range, 1> ranges{clang::tooling::Range(0, (unsigned)result->size())};
+          auto format_replacements = clang::format::reformat(style, *result, ranges);
+          if (auto formatted_or_err = clang::tooling::applyAllReplacements(*result, format_replacements)) {
+            formatted = *formatted_or_err;
+          } else {
+            llvm::errs() << llvm::formatv("{0} clang-format apply failed: {1}\n", LogBegin(pa_ctx),
+                                          llvm::fmt_consume(formatted_or_err.takeError()));
+          }
+        } else {
+          llvm::errs() << llvm::formatv("{0} clang-format style lookup failed: {1}\n", LogBegin(pa_ctx),
+                                        llvm::fmt_consume(style_or_err.takeError()));
+        }
+        final_text = std::move(formatted);
       }
 
-      auto original_filename = current_filename.drop_back(pa_ctx.current_suffix.size());
-      std::string output_path = llvm::formatv("{0}{1}", original_filename, pa_ctx.next_suffix);
       std::error_code ec;
       llvm::raw_fd_ostream out(output_path, ec, llvm::sys::fs::OF_None);
       if (!ec) {
-        out << *result;
+        out << final_text;
       } else {
         llvm::errs() << llvm::formatv("{0} {1}\n", LogBegin(pa_ctx), ec.message());
       }

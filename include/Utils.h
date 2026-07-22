@@ -109,8 +109,12 @@ inline auto GetSourceText(const clang::TagDecl *tag_decl, const clang::ASTContex
 }
 
 inline auto GetPointerWidth(const clang::ASTContext &ctx) -> uint64_t {
-  return ctx.getTargetInfo().getPointerWidth(clang::LangAS::Default);
+  auto width = ctx.getTargetInfo().getPointerWidth(clang::LangAS::Default);
+  assert(width == 32 || width == 64);
+  return width;
 }
+
+inline auto GetWordTypeStr(const clang::ASTContext &ctx) { return llvm::formatv("uint{0}_t", GetPointerWidth(ctx)); }
 } // namespace pancake
 
 #endif // C2PANCAKE_UTILS_H

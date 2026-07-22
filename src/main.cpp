@@ -1,4 +1,5 @@
 #include "Pass_LoopsToWhile.h"
+#include "Pass_LowerBitfieldOps.h"
 #include "Pass_NormaliseIfStatements.h"
 #include "Pass_PromoteRecords.h"
 #include "Pass_SwitchToIf.h"
@@ -66,8 +67,8 @@ auto main(int argc, const char **argv) -> int {
   pipeline.AddPass<pass_rewrite_array_indexing::Action>();
   pipeline.AddPass<pass_rewrite_struct_stabs::Action>();
   pipeline.AddPass<pass_lower_nested_expressions::Action>();
-  // pipeline.AddPass<pass_lower_arrow_accesses::Action>();
-  // pipeline.AddPass<pass_lower_bitfield_ops::Action>();
+  pipeline.AddPass<pass_lower_bitfield_ops::Action>();
+  pipeline.AddPass<pass_simplify_addrof_deref::Action>();
   pipeline.AddPass<pass_promote_records::Action>();
 
   // pipeline.AddPass<pass_hoist_arrays_and_addresses::Action>();

@@ -32,8 +32,6 @@
 
 #include <cassert>
 #include <cstddef>
-#include <cstdint>
-#include <functional>
 #include <optional>
 #include <ranges>
 #include <string>
@@ -83,7 +81,7 @@ public:
     auto tmp_var_name = GetTempVarName("If");
     std::string replacement_text;
     llvm::raw_string_ostream os(replacement_text);
-    os << llvm::formatv("int {0} = {1};\n", tmp_var_name, GetSourceText(cond, data.Ctx));
+    os << llvm::formatv("{0} {1} = {2};\n", GetWordTypeStr(data.Ctx), tmp_var_name, GetSourceText(cond, data.Ctx));
     os << llvm::formatv("if ({0}) ", tmp_var_name);
 
     // we just want to replace the "if (COND)" part
@@ -117,7 +115,7 @@ public:
     auto tmp_var_name = GetTempVarName("Return");
     std::string replacement_text;
     llvm::raw_string_ostream os(replacement_text);
-    os << llvm::formatv("int {0} = ({1});\n", tmp_var_name, GetSourceText(cond, data.Ctx));
+    os << llvm::formatv("{0} {1} = ({2});\n", GetWordTypeStr(data.Ctx), tmp_var_name, GetSourceText(cond, data.Ctx));
     os << llvm::formatv("return {0}", tmp_var_name);
 
     // we want to replace the "return EXPR;" part
@@ -730,10 +728,11 @@ public:
           6 = rhs pre stmts
           7 = rhs final expr
           8 = var for result of ?: (without type)
+          9 = GetWordTypeStr
           */
           R"({0};
 {1}
-int {2} = {3};
+{9} {2} = {3};
 if ({2}) {
   {4}
   {8} = {5};
@@ -745,7 +744,8 @@ if ({2}) {
           PrintType(conditional_operator->getType(), tmp_var_name),
           llvm::join(cond_res.pre_stmts | std::views::reverse, "\n"), tmp_cond_name, cond_res.final_expr,
           llvm::join(lhs_res.pre_stmts | std::views::reverse, "\n"), lhs_res.final_expr,
-          llvm::join(rhs_res.pre_stmts | std::views::reverse, "\n"), rhs_res.final_expr, tmp_var_name);
+          llvm::join(rhs_res.pre_stmts | std::views::reverse, "\n"), rhs_res.final_expr, tmp_var_name,
+          GetWordTypeStr(data.Ctx));
 
       pre_stmts.push_back(if_cond);
       os << tmp_var_name;
@@ -766,11 +766,12 @@ if ({2}) {
             2 = lhs final expr
             3 = rhs pre stmts (only evaluated if lhs is true)
             4 = rhs final expr (only evaluated if lhs is true)
+            5 = GetWordTypeStr
             */
             R"({0}
 /* c2pancake: transformed logical && */
 /* original expr: {5} */
-int {1} = 0;
+{5} {1} = 0;
 if (!({2})) {
   {1} = 0;
 } else {
@@ -779,7 +780,7 @@ if (!({2})) {
 })",
             llvm::join(lhs_res.pre_stmts | std::views::reverse, "\n"), tmp_var_name, lhs_res.final_expr,
             llvm::join(rhs_res.pre_stmts | std::views::reverse, "\n"), rhs_res.final_expr,
-            GetSourceText(expr, data.Ctx));
+            GetSourceText(expr, data.Ctx), GetWordTypeStr(data.Ctx));
 
         pre_stmts.push_back(if_cond);
         os << tmp_var_name;
@@ -796,11 +797,12 @@ if (!({2})) {
             2 = lhs final expr
             3 = rhs pre stmts (only evaluated if lhs is false)
             4 = rhs final expr (only evaluated if lhs is false)
+            5 = GetWordTypeStr
             */
             R"({0}
 /* c2pancake: transformed logical || */
 /* original expr: {5} */
-int {1} = 0;
+{5} {1} = 0;
 if ({2}) {
   {1} = 1;
 } else {
@@ -809,7 +811,7 @@ if ({2}) {
 })",
             llvm::join(lhs_res.pre_stmts | std::views::reverse, "\n"), tmp_var_name, lhs_res.final_expr,
             llvm::join(rhs_res.pre_stmts | std::views::reverse, "\n"), rhs_res.final_expr,
-            GetSourceText(expr, data.Ctx));
+            GetSourceText(expr, data.Ctx), GetWordTypeStr(data.Ctx));
         pre_stmts.push_back(if_cond);
         os << tmp_var_name;
         break;
