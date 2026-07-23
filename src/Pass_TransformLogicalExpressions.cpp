@@ -163,7 +163,7 @@ auto MakeRule() -> RewriteRule {
 } // namespace
 
 auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
-  std::vector<AtomicChange> changes;
+  llvm::SmallVector<AtomicChange, 64> changes;
   auto t = Transformer(MakeRule(), [&changes](llvm::Expected<llvm::MutableArrayRef<AtomicChange>> c) -> void {
     if (c)
       changes.insert(changes.end(), c->begin(), c->end());
@@ -205,7 +205,7 @@ auto MakeRule() -> RewriteRule {
 } // namespace
 
 auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
-  std::vector<AtomicChange> changes;
+  llvm::SmallVector<AtomicChange, 64> changes;
   auto t = Transformer(MakeRule(), [&changes](llvm::Expected<llvm::MutableArrayRef<AtomicChange>> c) -> void {
     if (c)
       changes.insert(changes.end(), c->begin(), c->end());
@@ -238,6 +238,8 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
 
 namespace pancake::pass_lower_nested_expressions {
 auto GetUsage(const Expr *expr) -> Usage {
+  expr = expr->IgnoreParenImpCasts();
+
   if (const auto *_ = dyn_cast<DeclRefExpr>(expr)) {
     return Usage::Place;
   }
@@ -253,6 +255,9 @@ auto GetUsage(const Expr *expr) -> Usage {
   if (const auto *_ = dyn_cast<StringLiteral>(expr)) {
     return Usage::Place;
   }
+  if (const auto *c_style_cast_expr = dyn_cast<CStyleCastExpr>(expr)) {
+    return GetUsage(c_style_cast_expr->getSubExpr());
+  }
   if (const auto *_ = dyn_cast<CompoundLiteralExpr>(expr)) {
     return Usage::Value;
   }
@@ -263,7 +268,6 @@ auto GetUsage(const Expr *expr) -> Usage {
     return Usage::Value;
   }
   // CompoundAssignOperator is a specialization of BinaryOperator
-
   if (const auto *_ = dyn_cast<CompoundAssignOperator>(expr)) {
     return Usage::Value;
   }
@@ -441,6 +445,16 @@ public:
       PrintSourceText(os, string_literal, data.Ctx);
     } else if (auto *_ = dyn_cast<ImplicitValueInitExpr>(expr)) {
       llvm_unreachable("ImplicitValueInitExpr should not be present at this stage!");
+    } else if (auto *c_style_cast_expr = dyn_cast<CStyleCastExpr>(expr)) {
+      auto *sub_expr = c_style_cast_expr->getSubExpr();
+      auto res = BuildExpr(BuildExprCtx(sub_expr, GetUsage(sub_expr), ctx.deref_force_extract, ctx.assigned_to));
+
+      os << "(";
+      c_style_cast_expr->getTypeAsWritten().print(os, data.Ctx.getPrintingPolicy());
+      os << ")";
+      os << res.final_expr;
+
+      pre_stmts.insert(pre_stmts.end(), res.pre_stmts.begin(), res.pre_stmts.end());
     } else if (auto *init_list_expr = dyn_cast<InitListExpr>(expr)) {
       assert(ctx.usage_kind != Usage::Place && "InitListExpr cannot be used as a place expression");
       assert(ctx.usage_kind != Usage::Effect && "InitListExpr cannot be used as an effect expression");
@@ -530,7 +544,6 @@ public:
         llvm::SmallVector<std::string, 16> tmp_stmts; // this is in real order. it will need to be reversed later
 
         auto field_decl_iter = record_decl->field_begin();
-        init_list_expr->dump();
         for (unsigned i = 0; i < init_list_expr->getNumInits(); ++field_decl_iter) {
           auto *field_decl = *field_decl_iter;
 
@@ -633,6 +646,9 @@ public:
         os2 << "{\n";
         for (auto *stmt : compound_stmt->body()) {
           PrintSourceText(os2, stmt, data.Ctx);
+          if (StmtNeedsSemi(stmt)) {
+            os2 << ";";
+          }
           os2 << "\n";
           // we need to rerun this pass to process the statements in the block
           data.pa_ctx.run_result = RunResult::RepeatPass;
@@ -653,6 +669,9 @@ public:
             os2 << llvm::formatv("\n{0} = {1};", tmp_var_name, last_expr_built_expr.final_expr);
           } else {
             PrintSourceText(os2, stmt, data.Ctx);
+            if (StmtNeedsSemi(stmt)) {
+              os2 << ";";
+            }
             os2 << "\n";
             // we need to rerun this pass to process the statements in the block
             data.pa_ctx.run_result = RunResult::RepeatPass;
@@ -719,33 +738,32 @@ public:
       std::string tmp_cond_name = GetTempVarName("TernaryCond");
       const std::string if_cond = llvm::formatv(
           /*
-          0 = var for result of ?:
-          1 = condition bool pre stmts
-          2 = condition bool name
-          3 = condition bool final expr
-          4 = lhs pre stmts
-          5 = lhs final expr
-          6 = rhs pre stmts
-          7 = rhs final expr
-          8 = var for result of ?: (without type)
-          9 = GetWordTypeStr
+          0 = var for result of ?: (inc type)
+          1 = var for result (tmp var name)
+          2 = condition bool pre stmts
+          3 = condition bool type (GetWordTypeStr)
+          4 = condition bool name
+          5 = condition bool final expr
+          6 = lhs pre stmts
+          7 = lhs final expr
+          8 = rhs pre stmts
+          9 = rhs final expr
           */
           R"({0};
-{1}
-{9} {2} = {3};
-if ({2}) {
-  {4}
-  {8} = {5};
-} else {
+{2}
+{3} {4} = {5};
+if ({4}) {
   {6}
-  {8} = {7};
+  {1} = {7};
+} else {
+  {8}
+  {1} = {9};
 }
 )",
-          PrintType(conditional_operator->getType(), tmp_var_name),
-          llvm::join(cond_res.pre_stmts | std::views::reverse, "\n"), tmp_cond_name, cond_res.final_expr,
-          llvm::join(lhs_res.pre_stmts | std::views::reverse, "\n"), lhs_res.final_expr,
-          llvm::join(rhs_res.pre_stmts | std::views::reverse, "\n"), rhs_res.final_expr, tmp_var_name,
-          GetWordTypeStr(data.Ctx));
+          PrintType(conditional_operator->getType(), tmp_var_name), tmp_var_name,
+          llvm::join(cond_res.pre_stmts | std::views::reverse, "\n"), GetWordTypeStr(data.Ctx), tmp_cond_name,
+          cond_res.final_expr, llvm::join(lhs_res.pre_stmts | std::views::reverse, "\n"), lhs_res.final_expr,
+          llvm::join(rhs_res.pre_stmts | std::views::reverse, "\n"), rhs_res.final_expr);
 
       pre_stmts.push_back(if_cond);
       os << tmp_var_name;
@@ -761,26 +779,28 @@ if ({2}) {
         std::string tmp_var_name = GetTempVarName("LAnd");
         std::string const if_cond = llvm::formatv(
             /*
-            0 = lhs pre stmts
-            1 = tmp var for result of &&
-            2 = lhs final expr
-            3 = rhs pre stmts (only evaluated if lhs is true)
-            4 = rhs final expr (only evaluated if lhs is true)
-            5 = GetWordTypeStr
+            0 = GetSourceText
+            1 = lhs pre stmts
+            2 = GetWordTypeStr
+            3 = tmp var for result of &&
+            4 = lhs final expr
+            5 = rhs pre stmts (only evaluated if lhs is true)
+            6 = rhs final expr (only evaluated if lhs is true)
+            7 = GetWordTypeStr
             */
-            R"({0}
-/* c2pancake: transformed logical && */
-/* original expr: {5} */
-{5} {1} = 0;
-if (!({2})) {
-  {1} = 0;
+            R"(/* c2pancake: transformed logical && */
+/* original expr: {0} */
+{1}
+{2} {3} = 0;
+if (!({4})) {
+  {3} = 0;
 } else {
-  {3}
-  {1} = 0 != ({4}); 
+  {5}
+  {3} = 0 != ({6}); 
 })",
-            llvm::join(lhs_res.pre_stmts | std::views::reverse, "\n"), tmp_var_name, lhs_res.final_expr,
-            llvm::join(rhs_res.pre_stmts | std::views::reverse, "\n"), rhs_res.final_expr,
-            GetSourceText(expr, data.Ctx), GetWordTypeStr(data.Ctx));
+            GetSourceText(expr, data.Ctx), llvm::join(lhs_res.pre_stmts | std::views::reverse, "\n"),
+            GetWordTypeStr(data.Ctx), tmp_var_name, lhs_res.final_expr,
+            llvm::join(rhs_res.pre_stmts | std::views::reverse, "\n"), rhs_res.final_expr);
 
         pre_stmts.push_back(if_cond);
         os << tmp_var_name;
@@ -792,26 +812,27 @@ if (!({2})) {
         std::string tmp_var_name = GetTempVarName("LOr");
         const std::string if_cond = llvm::formatv(
             /*
-            0 = lhs pre stmts
-            1 = tmp var for result of ||
-            2 = lhs final expr
-            3 = rhs pre stmts (only evaluated if lhs is false)
-            4 = rhs final expr (only evaluated if lhs is false)
-            5 = GetWordTypeStr
+            0 = GetSourceText
+            1 = lhs pre stmts
+            2 = GetWordTypeStr
+            3 = tmp var for result of ||
+            4 = lhs final expr
+            5 = rhs pre stmts (only evaluated if lhs is false)
+            6 = rhs final expr (only evaluated if lhs is false)
             */
-            R"({0}
-/* c2pancake: transformed logical || */
-/* original expr: {5} */
-{5} {1} = 0;
-if ({2}) {
-  {1} = 1;
+            R"(/* c2pancake: transformed logical || */
+/* original expr: {0} */
+{1}
+{2} {3} = 0;
+if ({4}) {
+  {3} = 1;
 } else {
-  {3}
-  {1} = 0 != ({4}); 
+  {5}
+  {3} = 0 != ({6});
 })",
-            llvm::join(lhs_res.pre_stmts | std::views::reverse, "\n"), tmp_var_name, lhs_res.final_expr,
-            llvm::join(rhs_res.pre_stmts | std::views::reverse, "\n"), rhs_res.final_expr,
-            GetSourceText(expr, data.Ctx), GetWordTypeStr(data.Ctx));
+            GetSourceText(expr, data.Ctx), llvm::join(lhs_res.pre_stmts | std::views::reverse, "\n"),
+            GetWordTypeStr(data.Ctx), tmp_var_name, lhs_res.final_expr,
+            llvm::join(rhs_res.pre_stmts | std::views::reverse, "\n"), rhs_res.final_expr);
         pre_stmts.push_back(if_cond);
         os << tmp_var_name;
         break;

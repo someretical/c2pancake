@@ -32,7 +32,6 @@
 #include <ranges>
 #include <string>
 #include <utility>
-#include <vector>
 
 using namespace clang;
 using namespace clang::tooling;
@@ -49,7 +48,7 @@ auto MakeRule() -> RewriteRule {
 } // namespace
 
 auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
-  std::vector<AtomicChange> changes;
+  llvm::SmallVector<AtomicChange, 64> changes;
   auto t = Transformer(MakeRule(), [&changes](llvm::Expected<llvm::MutableArrayRef<AtomicChange>> c) -> void {
     if (c)
       changes.insert(changes.end(), c->begin(), c->end());
@@ -79,7 +78,7 @@ namespace pancake::pass_normalise_switches {
 namespace {
 struct WorkerData {
   ASTContext &Ctx;
-  std::vector<Replacement> &replacements;
+  llvm::SmallVector<Replacement, 64> &replacements;
 };
 
 class Worker : public RecursiveASTVisitor<Worker> {
@@ -159,11 +158,11 @@ public:
 
       // The body statements belonging to this case block.
       // CAN include the last break/return/continue statement
-      std::vector<Stmt *> body; // this is reverse order of the original source code
+      llvm::SmallVector<Stmt *, 16> body; // this is reverse order of the original source code
     };
-    std::vector<CaseInfo> case_infos;
+    llvm::SmallVector<CaseInfo, 16> case_infos;
 
-    std::vector<Stmt *> const stmt_buf;
+    llvm::SmallVector<Stmt *, 16> const stmt_buf;
     CaseInfo current_case_info;
     /*
     Set to true after we have processed a case statement.
@@ -412,13 +411,13 @@ public:
         }
 
         if (case_info.body.size() == 1) {
-          if (auto *compound_stmt = dyn_cast<CompoundStmt>(case_info.body.at(0))) {
+          if (auto *compound_stmt = dyn_cast<CompoundStmt>(case_info.body[0])) {
             if (compound_stmt->size() > 0 && !IsTerminatingStmt(compound_stmt->body_back())) {
               os << "\n{\n";
-              case_info.body.at(0)->printPretty(os, nullptr, data.Ctx.getPrintingPolicy());
+              compound_stmt->printPretty(os, nullptr, data.Ctx.getPrintingPolicy());
               os << "\nbreak;\n}";
             } else {
-              case_info.body.at(0)->printPretty(os, nullptr, data.Ctx.getPrintingPolicy());
+              compound_stmt->printPretty(os, nullptr, data.Ctx.getPrintingPolicy());
             }
             continue;
           }
@@ -473,7 +472,7 @@ public:
 } // namespace
 
 auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
-  std::vector<Replacement> replacements;
+  llvm::SmallVector<Replacement, 64> replacements;
   WorkerData data{.Ctx = Ctx, .replacements = replacements};
   Worker w(data);
   w.TraverseDecl(Ctx.getTranslationUnitDecl());
@@ -500,7 +499,7 @@ namespace {
 struct WorkerData {
   ASTContext &Ctx;
   PipelineActionCtx &pa_ctx;
-  std::vector<Replacement> &replacements;
+  llvm::SmallVector<Replacement, 64> &replacements;
   size_t switch_cond_tmp_var_counter = 0;
 };
 
@@ -510,7 +509,7 @@ struct CaseInfo {
 
   // The body statements belonging to this case block.
   // CAN include the last break/return/continue statement
-  std::vector<Stmt *> body; // this is reverse order of the original source code
+  llvm::SmallVector<Stmt *, 16> body; // this is reverse order of the original source code
 };
 
 class Worker : public RecursiveASTVisitor<Worker> {
@@ -596,9 +595,9 @@ public:
       return;
     }
 
-    std::vector<CaseInfo> case_infos;
+    llvm::SmallVector<CaseInfo, 16> case_infos;
 
-    std::vector<Stmt *> const stmt_buf;
+    llvm::SmallVector<Stmt *, 16> const stmt_buf;
     CaseInfo current_case_info{};
 
     for (auto it = switch_body->body_rbegin(); it != switch_body->body_rend(); ++it) {
@@ -643,7 +642,7 @@ public:
 
     auto valid_case_infos = case_infos |
                             std::views::filter([](const CaseInfo &ci) -> bool { return !ci.labels.empty(); }) |
-                            std::views::reverse | std::ranges::to<std::vector>();
+                            std::views::reverse | std::ranges::to<llvm::SmallVector<CaseInfo, 16>>();
     std::string converted;
     llvm::raw_string_ostream os(converted);
 
@@ -656,10 +655,9 @@ public:
     // first case gets turned into an "if"
     // subsequent cases get turned into "else if"
     // if any set of cases has a default, it becomes the last one and is turned into an "else"
-    for (size_t i = 0; i < valid_case_infos.size(); ++i) {
+    for (const auto &[i, ci] : std::views::enumerate(valid_case_infos)) {
       bool const is_first = (i == 0);
       // bool const is_last = (i + 1 == valid_case_infos.size());
-      const CaseInfo &ci = valid_case_infos.at(i);
       bool const has_default =
           std::ranges::any_of(ci.labels, [](SwitchCase *sc) -> bool { return isa<DefaultStmt>(sc); });
 
@@ -717,7 +715,7 @@ public:
 } // namespace
 
 auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
-  std::vector<Replacement> replacements;
+  llvm::SmallVector<Replacement, 64> replacements;
   WorkerData data{.Ctx = Ctx, .pa_ctx = pa_ctx, .replacements = replacements};
   Worker w(data);
   w.TraverseDecl(Ctx.getTranslationUnitDecl());

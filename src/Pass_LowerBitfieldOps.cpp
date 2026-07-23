@@ -55,8 +55,6 @@ namespace {
 // This helper code facilitates non-volatile bitfield operations.
 const char *non_volatile_bitfield_helpers =
     R"(/* c2pancake generated code start: helpers for non-volatile bitfield operations */
-#include <stdint.h>
-
 static inline uint{0}_t __c2pnk_get_bit_u{0}(uint{0}_t value, uint{0}_t bit) {{ return ((value >> bit) & 1ULL) != 0; }
 
 static inline void __c2pnk_set_bit(uint8_t *byte, uint{0}_t bit) {{
@@ -476,7 +474,17 @@ public:
     llvm::raw_string_ostream os(final_expr);
     const QualType final_expr_type = expr->getType();
 
-    if (auto *binary_operator = dyn_cast<BinaryOperator>(expr)) {
+    if (auto *c_style_cast_expr = dyn_cast<CStyleCastExpr>(expr)) {
+      auto *sub_expr = c_style_cast_expr->getSubExpr();
+      auto res = BuildExpr(BuildExprCtx(sub_expr, GetUsage(sub_expr), ctx.deref_force_extract, ctx.assigned_to));
+
+      os << "(";
+      c_style_cast_expr->getTypeAsWritten().print(os, data.Ctx.getPrintingPolicy());
+      os << ")";
+      os << res.final_expr;
+
+      pre_stmts.insert(pre_stmts.end(), res.pre_stmts.begin(), res.pre_stmts.end());
+    } else if (auto *binary_operator = dyn_cast<BinaryOperator>(expr)) {
       auto *lhs = binary_operator->getLHS()->IgnoreParenImpCasts();
       auto *rhs = binary_operator->getRHS()->IgnoreParenImpCasts();
 
@@ -871,7 +879,7 @@ auto MakeRule() -> RewriteRule {
 } // namespace
 
 auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
-  std::vector<AtomicChange> changes;
+  llvm::SmallVector<AtomicChange, 64> changes;
   auto t = Transformer(MakeRule(), [&changes](llvm::Expected<llvm::MutableArrayRef<AtomicChange>> c) -> void {
     if (c)
       changes.insert(changes.end(), c->begin(), c->end());

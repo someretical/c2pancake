@@ -65,7 +65,7 @@ auto MakeRule() -> RewriteRule {
 } // namespace
 
 auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
-  std::vector<AtomicChange> changes;
+  llvm::SmallVector<AtomicChange, 64> changes;
   auto t = Transformer(MakeRule(), [&changes](llvm::Expected<llvm::MutableArrayRef<AtomicChange>> c) -> void {
     if (c)
       changes.insert(changes.end(), c->begin(), c->end());
@@ -147,7 +147,7 @@ auto MakeRule() -> RewriteRule {
 } // namespace
 
 auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
-  std::vector<AtomicChange> changes;
+  llvm::SmallVector<AtomicChange, 64> changes;
   auto t = Transformer(MakeRule(), [&changes](llvm::Expected<llvm::MutableArrayRef<AtomicChange>> c) -> void {
     if (c)
       changes.insert(changes.end(), c->begin(), c->end());
@@ -236,7 +236,7 @@ auto MakeRule() -> RewriteRule {
 } // namespace
 
 auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
-  std::vector<AtomicChange> changes;
+  llvm::SmallVector<AtomicChange, 64> changes;
   auto t = Transformer(MakeRule(), [&changes](llvm::Expected<llvm::MutableArrayRef<AtomicChange>> c) -> void {
     if (c)
       changes.insert(changes.end(), c->begin(), c->end());
@@ -337,7 +337,7 @@ auto MakeRule() -> RewriteRule {
 } // namespace
 
 auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
-  std::vector<AtomicChange> changes;
+  llvm::SmallVector<AtomicChange, 64> changes;
   auto t = Transformer(MakeRule(), [&changes](llvm::Expected<llvm::MutableArrayRef<AtomicChange>> c) -> void {
     if (c)
       changes.insert(changes.end(), c->begin(), c->end());
@@ -405,7 +405,7 @@ auto MakeRule() -> RewriteRule {
 } // namespace
 
 auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
-  std::vector<AtomicChange> changes;
+  llvm::SmallVector<AtomicChange, 64> changes;
   auto t = Transformer(MakeRule(), [&changes](llvm::Expected<llvm::MutableArrayRef<AtomicChange>> c) -> void {
     if (c)
       changes.insert(changes.end(), c->begin(), c->end());

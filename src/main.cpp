@@ -1,3 +1,5 @@
+#include "Pass_InjectHeaders.h"
+#include "Pass_IntegerConversion.h"
 #include "Pass_LoopsToWhile.h"
 #include "Pass_LowerBitfieldOps.h"
 #include "Pass_NormaliseIfStatements.h"
@@ -52,6 +54,7 @@ auto main(int argc, const char **argv) -> int {
   };
   */
   Pipeline pipeline(*expected_parser);
+  pipeline.AddPass<pass_inject_headers::Action>();
   pipeline.AddPass<pass_name_anon_records::Action>();
   pipeline.AddPass<pass_rename_to_be_promoted_records::Action>();
   pipeline.AddPass<pass_normalise_while_loops::Action>();
@@ -70,6 +73,8 @@ auto main(int argc, const char **argv) -> int {
   pipeline.AddPass<pass_lower_bitfield_ops::Action>();
   pipeline.AddPass<pass_simplify_addrof_deref::Action>();
   pipeline.AddPass<pass_promote_records::Action>();
+  pipeline.AddPass<pass_implicit_to_explicit_casts::Action>();
+  // pipeline.AddPass<pass_integer_conversion::Action>();
 
   // pipeline.AddPass<pass_hoist_arrays_and_addresses::Action>();
   return pipeline.Run();

@@ -117,6 +117,53 @@ auto PrintSourceText(llvm::raw_string_ostream &os, const clang::TagDecl *tag_dec
   }
 }
 
+auto StmtNeedsSemi(const clang::Stmt *s) -> bool {
+  switch (s->getStmtClass()) {
+  case clang::Stmt::CompoundStmtClass:
+    return false; // ends in '}'
+
+  case clang::Stmt::IfStmtClass: {
+    const auto *if_stmt = cast<clang::IfStmt>(s);
+    return StmtNeedsSemi((if_stmt->getElse() != nullptr) ? if_stmt->getElse() : if_stmt->getThen());
+  }
+  case clang::Stmt::SwitchStmtClass:
+    return StmtNeedsSemi(cast<clang::SwitchStmt>(s)->getBody());
+  case clang::Stmt::WhileStmtClass:
+    return StmtNeedsSemi(cast<clang::WhileStmt>(s)->getBody());
+  case clang::Stmt::ForStmtClass:
+    return StmtNeedsSemi(cast<clang::ForStmt>(s)->getBody());
+  case clang::Stmt::LabelStmtClass:
+    return StmtNeedsSemi(cast<clang::LabelStmt>(s)->getSubStmt());
+  case clang::Stmt::CaseStmtClass:
+    return StmtNeedsSemi(cast<clang::CaseStmt>(s)->getSubStmt());
+  case clang::Stmt::DefaultStmtClass:
+    return StmtNeedsSemi(cast<clang::DefaultStmt>(s)->getSubStmt());
+
+  case clang::Stmt::DoStmtClass: // do ... while (cond) ;
+    [[fallthrough]];
+  case clang::Stmt::GotoStmtClass:
+    [[fallthrough]];
+  case clang::Stmt::ContinueStmtClass:
+    [[fallthrough]];
+  case clang::Stmt::BreakStmtClass:
+    [[fallthrough]];
+  case clang::Stmt::ReturnStmtClass:
+    return true;
+
+  case clang::Stmt::NullStmtClass: // ';' alone
+    return false;
+
+  case clang::Stmt::DeclStmtClass:
+    // Needs one syntactically, but Clang's DeclStmt::getSourceRange() already includes it
+    return false;
+
+  default:
+    // Anything else reaching here is an expression used as a statement
+    // (BinaryOperator, CallExpr, UnaryOperator, ...)
+    return true;
+  }
+}
+
 auto StagedCompilationDatabase::GetOriginalFilename(llvm::StringRef Filename) const -> llvm::StringRef {
   const auto ref = Filename;
   if (!current_suffix.empty() && ref.ends_with(current_suffix)) {

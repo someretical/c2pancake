@@ -115,6 +115,8 @@ inline auto GetPointerWidth(const clang::ASTContext &ctx) -> uint64_t {
 }
 
 inline auto GetWordTypeStr(const clang::ASTContext &ctx) { return llvm::formatv("uint{0}_t", GetPointerWidth(ctx)); }
+
+auto StmtNeedsSemi(const clang::Stmt *s) -> bool;
 } // namespace pancake
 
 #endif // C2PANCAKE_UTILS_H

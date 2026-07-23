@@ -15,7 +15,7 @@
 using namespace pancake;
 
 auto Pipeline::Run() -> int {
-  const std::vector<std::string> initial_files = options_parser.getSourcePathList();
+  const auto &initial_files = options_parser.getSourcePathList();
 
   for (const auto &initial_file : initial_files) {
     std::string current_suffix{};
@@ -30,7 +30,7 @@ auto Pipeline::Run() -> int {
         StagedCompilationDatabase const db(options_parser.getCompilations(), current_suffix);
         std::string const current_file = llvm::formatv("{0}{1}", initial_file, current_suffix);
         std::string const next_file = llvm::formatv("{0}{1}", initial_file, next_suffix);
-        clang::tooling::ClangTool tool(db, std::vector{current_file});
+        clang::tooling::ClangTool tool(db, llvm::SmallVector<std::string, 1>{current_file});
 
         clang::tooling::Replacements replacements;
         PipelineActionCtx ctx(j, k, replacements, current_file, current_suffix, next_file, next_suffix);
