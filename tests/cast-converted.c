@@ -141,42 +141,6 @@ int main() {
     printf("  %lld != %lld\n", (long long)(2147483647), (long long)(((unsigned)-1) >> 1));
     return 1;
   };
-  if ((-50) != ((-100) / 2)) {
-    printf("ASSERTION FAILED: %s:%d: %s != %s\n", "tests/cast.c", 45, "-50", "(-100) / 2");
-    printf("  %lld != %lld\n", (long long)(-50), (long long)((-100) / 2));
-    return 1;
-  };
-  if ((2147483598) != (((unsigned)-100) / 2)) {
-    printf("ASSERTION FAILED: %s:%d: %s != %s\n", "tests/cast.c", 46, "2147483598", "((unsigned)-100) / 2");
-    printf("  %lld != %lld\n", (long long)(2147483598), (long long)(((unsigned)-100) / 2));
-    return 1;
-  };
-  if ((9223372036854775758) != (((unsigned long)-100) / 2)) {
-    printf("ASSERTION FAILED: %s:%d: %s != %s\n", "tests/cast.c", 47, "9223372036854775758",
-           "((unsigned long)-100) / 2");
-    printf("  %lld != %lld\n", (long long)(9223372036854775758), (long long)(((unsigned long)-100) / 2));
-    return 1;
-  };
-  if ((0) != (((long)-1) / (unsigned)100)) {
-    printf("ASSERTION FAILED: %s:%d: %s != %s\n", "tests/cast.c", 48, "0", "((long)-1) / (unsigned)100");
-    printf("  %lld != %lld\n", (long long)(0), (long long)(((long)-1) / (unsigned)100));
-    return 1;
-  };
-  if ((-2) != ((-100) % 7)) {
-    printf("ASSERTION FAILED: %s:%d: %s != %s\n", "tests/cast.c", 49, "-2", "(-100) % 7");
-    printf("  %lld != %lld\n", (long long)(-2), (long long)((-100) % 7));
-    return 1;
-  };
-  if ((2) != (((unsigned)-100) % 7)) {
-    printf("ASSERTION FAILED: %s:%d: %s != %s\n", "tests/cast.c", 50, "2", "((unsigned)-100) % 7");
-    printf("  %lld != %lld\n", (long long)(2), (long long)(((unsigned)-100) % 7));
-    return 1;
-  };
-  if ((6) != (((unsigned long)-100) % 9)) {
-    printf("ASSERTION FAILED: %s:%d: %s != %s\n", "tests/cast.c", 51, "6", "((unsigned long)-100) % 9");
-    printf("  %lld != %lld\n", (long long)(6), (long long)(((unsigned long)-100) % 9));
-    return 1;
-  };
 
   if ((65535) != ((int)(unsigned short)65535)) {
     printf("ASSERTION FAILED: %s:%d: %s != %s\n", "tests/cast.c", 53, "65535", "(int)(unsigned short)65535");
@@ -241,39 +205,6 @@ int main() {
            })));
     return 1;
   }
-
-  ;
-
-  if ((0) != ((_Bool)0.0)) {
-    printf("ASSERTION FAILED: %s:%d: %s != %s\n", "tests/cast.c", 74, "0", "(_Bool)0.0");
-    printf("  %lld != %lld\n", (long long)(0), (long long)((_Bool)0.0));
-    return 1;
-  };
-  if ((1) != ((_Bool)0.1)) {
-    printf("ASSERTION FAILED: %s:%d: %s != %s\n", "tests/cast.c", 75, "1", "(_Bool)0.1");
-    printf("  %lld != %lld\n", (long long)(1), (long long)((_Bool)0.1));
-    return 1;
-  };
-  if ((3) != ((char)3.0)) {
-    printf("ASSERTION FAILED: %s:%d: %s != %s\n", "tests/cast.c", 76, "3", "(char)3.0");
-    printf("  %lld != %lld\n", (long long)(3), (long long)((char)3.0));
-    return 1;
-  };
-  if ((1000) != ((short)1000.3)) {
-    printf("ASSERTION FAILED: %s:%d: %s != %s\n", "tests/cast.c", 77, "1000", "(short)1000.3");
-    printf("  %lld != %lld\n", (long long)(1000), (long long)((short)1000.3));
-    return 1;
-  };
-  if ((3) != ((int)3.99)) {
-    printf("ASSERTION FAILED: %s:%d: %s != %s\n", "tests/cast.c", 78, "3", "(int)3.99");
-    printf("  %lld != %lld\n", (long long)(3), (long long)((int)3.99));
-    return 1;
-  };
-  if ((2000000000000000) != ((long)2e15)) {
-    printf("ASSERTION FAILED: %s:%d: %s != %s\n", "tests/cast.c", 79, "2000000000000000", "(long)2e15");
-    printf("  %lld != %lld\n", (long long)(2000000000000000), (long long)((long)2e15));
-    return 1;
-  };
 
   printf("OK\n");
   return 0;

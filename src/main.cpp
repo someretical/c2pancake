@@ -74,7 +74,7 @@ auto main(int argc, const char **argv) -> int {
   pipeline.AddPass<pass_simplify_addrof_deref::Action>();
   pipeline.AddPass<pass_promote_records::Action>();
   pipeline.AddPass<pass_implicit_to_explicit_casts::Action>();
-  // pipeline.AddPass<pass_integer_conversion::Action>();
+  pipeline.AddPass<pass_integer_conversion::Action>();
 
   // pipeline.AddPass<pass_hoist_arrays_and_addresses::Action>();
   return pipeline.Run();
