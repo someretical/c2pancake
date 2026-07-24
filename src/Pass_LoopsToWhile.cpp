@@ -21,7 +21,6 @@
 
 #include <string>
 #include <utility>
-#include <vector>
 
 // TODO have a check that runs before everything to find any loops that span ACROSS switch statements because those
 // cannot be safely transpiled!
@@ -50,7 +49,7 @@ auto MakeRule() -> RewriteRule {
                                       .bind(body_bind)))
                     .bind(while_bind),
                 changeTo(node(while_bind),
-                         cat("while (1) {\nif (!(", node(cond_bind), ")) { break; }", statements(body_bind), "\n}"))),
+                         cat("while (1UL) {\nif (!(", node(cond_bind), ")) { break; }", statements(body_bind), "\n}"))),
        makeRule(whileStmt(isExpansionInMainFile(), hasCondition(expr().bind(cond_bind)),
                           unless(hasCondition(ignoringParenImpCasts(integerLiteral(equals(1))))),
                           hasBody(
@@ -58,7 +57,7 @@ auto MakeRule() -> RewriteRule {
                               stmt(unless(compoundStmt())).bind(body_bind)))
                     .bind(while_bind),
                 changeTo(node(while_bind),
-                         cat("while (1) {\nif (!(", node(cond_bind), ")) { break; }", node(body_bind), ";\n}")))}
+                         cat("while (1UL) {\nif (!(", node(cond_bind), ")) { break; }", node(body_bind), ";\n}")))}
 
   );
 }
@@ -198,7 +197,7 @@ auto MakeRule() -> RewriteRule {
   into
   {
     OptInit
-    while (1) {
+    while (1UL) {
       if (!OptCond) {
         break;
       }
@@ -219,7 +218,7 @@ auto MakeRule() -> RewriteRule {
                                     anything())
                                     .bind(body_bind)))
                     .bind(for_bind),
-                changeTo(node(for_bind), cat("{\n", OptInit(), "while (1) {", BreakCond(), statements(body_bind),
+                changeTo(node(for_bind), cat("{\n", OptInit(), "while (1UL) {", BreakCond(), statements(body_bind),
                                              OptInc(), "\n}", "\n}"))),
        makeRule(forStmt(isExpansionInMainFile(), anyOf(hasLoopInit(stmt().bind(init_bind)), anything()),
                         anyOf(hasCondition(expr().bind(cond_bind)), anything()),
@@ -228,7 +227,7 @@ auto MakeRule() -> RewriteRule {
                             // Exclude compoundStmt so Case A takes priority in applyFirst.
                             stmt(unless(compoundStmt())).bind(body_bind)))
                     .bind(for_bind),
-                changeTo(node(for_bind), cat("{\n", OptInit(), "while (1) {", BreakCond(), node(body_bind), ";",
+                changeTo(node(for_bind), cat("{\n", OptInit(), "while (1UL) {", BreakCond(), node(body_bind), ";",
                                              OptInc(), "\n}", "\n}")))}
 
   );
@@ -278,7 +277,7 @@ do {
 to
 
 {
-    while (1) {
+    while (1UL) {
         body1
         if (cond) continue;
         body2
@@ -377,7 +376,7 @@ auto MakeRule() -> RewriteRule {
   do Body while (OptCond);
   into
   {
-    while (1) {
+    while (1UL) {
       Body
       if (!OptCond) break;
     }
@@ -390,15 +389,15 @@ auto MakeRule() -> RewriteRule {
                                    anything())
                                    .bind(body_bind)))
                     .bind(do_bind),
-                changeTo(node(do_bind), cat("while (1) {\n", statements(body_bind), "\nif (!(", node(cond_bind),
+                changeTo(node(do_bind), cat("while (1UL) {\n", statements(body_bind), "\nif (!(", node(cond_bind),
                                             ")) { break; }", "\n}"))),
        makeRule(doStmt(isExpansionInMainFile(), anyOf(hasCondition(expr().bind(cond_bind)), anything()),
                        hasBody(
                            // Exclude compoundStmt so Case A takes priority in applyFirst.
                            stmt(unless(compoundStmt())).bind(body_bind)))
                     .bind(do_bind),
-                changeTo(node(do_bind),
-                         cat("while (1) {\n", node(body_bind), ";\nif (!(", node(cond_bind), ")) { break; }", "\n}")))}
+                changeTo(node(do_bind), cat("while (1UL) {\n", node(body_bind), ";\nif (!(", node(cond_bind),
+                                            ")) { break; }", "\n}")))}
 
   );
 }

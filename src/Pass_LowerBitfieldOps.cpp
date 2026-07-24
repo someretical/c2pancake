@@ -16,10 +16,13 @@
 #include <clang/ASTMatchers/ASTMatchers.h>
 #include <clang/Basic/LLVM.h>
 #include <clang/Basic/SourceLocation.h>
+#include <clang/Basic/TokenKinds.h>
 #include <clang/Frontend/CompilerInstance.h>
 #include <clang/Lex/Lexer.h>
 #include <clang/Rewrite/Core/Rewriter.h>
 #include <clang/Tooling/Core/Replacement.h>
+#include <clang/Tooling/Refactoring/AtomicChange.h>
+#include <clang/Tooling/Transformer/RangeSelector.h>
 #include <clang/Tooling/Transformer/RewriteRule.h>
 #include <clang/Tooling/Transformer/Stencil.h>
 #include <clang/Tooling/Transformer/Transformer.h>
@@ -41,6 +44,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <ranges>
 #include <string>
 #include <utility>
@@ -55,18 +59,19 @@ namespace {
 // This helper code facilitates non-volatile bitfield operations.
 const char *non_volatile_bitfield_helpers =
     R"(/* c2pancake generated code start: helpers for non-volatile bitfield operations */
+#include <stdint.h>
 static inline uint{0}_t __c2pnk_get_bit_u{0}(uint{0}_t value, uint{0}_t bit) {{ return ((value >> bit) & 1ULL) != 0; }
 
 static inline void __c2pnk_set_bit(uint8_t *byte, uint{0}_t bit) {{
   uint{0}_t val = (uint{0}_t)*byte;
   // truncation
-  *byte = (uint8_t)(val | (uint{0}_t)(1ULL << bit));
+  *byte = (uint8_t)(val | (uint{0}_t)(1UL << bit));
 }
 
 static inline void __c2pnk_clear_bit(uint8_t *byte, uint{0}_t bit) {{
   uint{0}_t val = (uint{0}_t)*byte;
   // truncation
-  *byte = (uint8_t)(val & ~(1ULL << bit));
+  *byte = (uint8_t)(val & ~(1UL << bit));
 }
 
 /* [lhs_bit, rhs_bit) */
@@ -101,10 +106,10 @@ static uint{0}_t __c2pnk_get_bitfield_u{0}(const uint8_t *field, uint{0}_t lhs_b
 
     uint{0}_t byte = (uint{0}_t)field[bit_index >> 3]; // / 8
     uint{0}_t index = bit_index & 7;                  // % 8
-    uint{0}_t mask = (uint{0}_t)(1ULL << index);
+    uint{0}_t mask = (uint{0}_t)(1UL << index);
 
     if (byte & mask) {{
-      value = value | (1ULL << i);
+      value = value | (1UL << i);
     }
 
     i = i + 1;
@@ -121,7 +126,7 @@ static int{0}_t __c2pnk_get_bitfield_i{0}(const uint8_t *field, uint{0}_t lhs_bi
 
   /* manual sign-extend if the extracted field is narrower than {0} bits */
   if (width < {0}) {{
-    uint{0}_t sign = 1ULL << (width - 1);
+    uint{0}_t sign = 1UL << (width - 1);
     return (int{0}_t)((value ^ sign) - sign);
   }
 
@@ -259,7 +264,7 @@ public:
     // Compute the storage-unit pointer, equivalent to LV.getBitFieldAddress()
     std::string storage_type_name = GetIntTypeName(storage_size, false);
     auto storage_ptr =
-        llvm::formatv("(({0} *)((uint8_t *){1} + {2}))", storage_type_name, base_addr, storage_offset.getQuantity());
+        llvm::formatv("(({0} *)((uint8_t *){1} + {2}LU))", storage_type_name, base_addr, storage_offset.getQuantity());
 
     std::string load_temp = GetTempVarName("bf_load");
     pre_stmts.push_back(llvm::formatv("{0} {1} {2} = *{3};", is_volatile ? "volatile " : "", storage_type_name,
@@ -276,22 +281,23 @@ public:
       if (offset != 0U) {
         std::string lshr_temp = GetTempVarName("bf_lshr");
         pre_stmts.push_back(
-            llvm::formatv("{0} {1} = {2} >> {3};", storage_type_name, lshr_temp, extracted_temp, offset));
+            llvm::formatv("{0} {1} = {2} >> {3}U;", storage_type_name, lshr_temp, extracted_temp, offset));
         extracted_temp = lshr_temp;
       }
       if (static_cast<unsigned>(offset) + info.Size < storage_size) {
         llvm::APInt const low_mask = llvm::APInt::getLowBitsSet(storage_size, info.Size);
         std::string mask_temp = GetTempVarName("bf_mask");
-        pre_stmts.push_back(llvm::formatv("{0} {1} = {2} & {3};", storage_type_name, mask_temp, extracted_temp,
+        pre_stmts.push_back(llvm::formatv("{0} {1} = {2} & {3}U;", storage_type_name, mask_temp, extracted_temp,
                                           FormatAPIntHex(low_mask)));
         extracted_temp = mask_temp;
       }
       current_temp = extracted_temp;
 
-      // Sign-extend: sign = 1ULL << (Size - 1); (T)((value ^ sign) - sign)
+      // Sign-extend: sign = 1UL << (Size - 1); (T)((value ^ sign) - sign)
       llvm::APInt const sign_bit_mask = llvm::APInt::getOneBitSet(storage_size, info.Size - 1);
       std::string sign_temp = GetTempVarName("bf_sign");
-      pre_stmts.push_back(llvm::formatv("{0} {1} = {2};", storage_type_name, sign_temp, FormatAPIntHex(sign_bit_mask)));
+      pre_stmts.push_back(
+          llvm::formatv("{0} {1} = {2}U;", storage_type_name, sign_temp, FormatAPIntHex(sign_bit_mask)));
 
       std::string signed_temp = GetTempVarName("bf_signed");
       pre_stmts.push_back(
@@ -301,7 +307,8 @@ public:
       // Val = Builder.CreateLShr(Val, Offset, "bf.lshr");
       if (offset != 0U) {
         std::string lshr_temp = GetTempVarName("bf_lshr");
-        pre_stmts.push_back(llvm::formatv("{0} {1} = {2} >> {3};", storage_type_name, lshr_temp, current_temp, offset));
+        pre_stmts.push_back(
+            llvm::formatv("{0} {1} = {2} >> {3}U;", storage_type_name, lshr_temp, current_temp, offset));
         current_temp = lshr_temp;
       }
       // Val = Builder.CreateAnd(Val, getLowBitsSet(StorageSize, Size), "bf.clear");
@@ -309,7 +316,7 @@ public:
         llvm::APInt const mask = llvm::APInt::getLowBitsSet(storage_size, info.Size);
         std::string clear_temp = GetTempVarName("bf_clear");
         pre_stmts.push_back(
-            llvm::formatv("{0} {1} = {2} & {3};", storage_type_name, clear_temp, current_temp, FormatAPIntHex(mask)));
+            llvm::formatv("{0} {1} = {2} & {3}U;", storage_type_name, clear_temp, current_temp, FormatAPIntHex(mask)));
         current_temp = clear_temp;
       }
     }
@@ -358,7 +365,7 @@ public:
     // Compute the storage-unit pointer, equivalent to Dst.getBitFieldAddress()
     std::string storage_type_name = GetIntTypeName(storage_size, false);
     auto storage_ptr =
-        llvm::formatv("(({0} *)((uint8_t *){1} + {2}))", storage_type_name, base_addr, storage_offset.getQuantity());
+        llvm::formatv("(({0} *)((uint8_t *){1} + {2}LU))", storage_type_name, base_addr, storage_offset.getQuantity());
 
     // SrcVal = Builder.CreateIntCast(SrcVal, Ptr.getElementType(), /*isSigned=*/false);
     std::string src_cast_temp = GetTempVarName("bf_srccast");
@@ -381,7 +388,7 @@ public:
         llvm::APInt const low_mask = llvm::APInt::getLowBitsSet(storage_size, info.Size);
         std::string value_temp = GetTempVarName("bf_value");
         pre_stmts.push_back(
-            llvm::formatv("{0} {1} = {2} & {3};", storage_type_name, value_temp, src_temp, FormatAPIntHex(low_mask)));
+            llvm::formatv("{0} {1} = {2} & {3}U;", storage_type_name, value_temp, src_temp, FormatAPIntHex(low_mask)));
         src_temp = value_temp;
         masked_temp = value_temp;
       }
@@ -389,7 +396,7 @@ public:
       // if (Offset) SrcVal = Builder.CreateShl(SrcVal, Offset, "bf.shl");
       if (offset != 0U) {
         std::string shl_temp = GetTempVarName("bf_shl");
-        pre_stmts.push_back(llvm::formatv("{0} {1} = {2} << {3};", storage_type_name, shl_temp, src_temp, offset));
+        pre_stmts.push_back(llvm::formatv("{0} {1} = {2} << {3}U;", storage_type_name, shl_temp, src_temp, offset));
         src_temp = shl_temp;
       }
 
@@ -397,7 +404,7 @@ public:
       llvm::APInt const clear_mask = ~llvm::APInt::getBitsSet(storage_size, offset, offset + info.Size);
       std::string clear_temp = GetTempVarName("bf_clear");
       pre_stmts.push_back(
-          llvm::formatv("{0} {1} = {2} & {3};", storage_type_name, clear_temp, load_temp, FormatAPIntHex(clear_mask)));
+          llvm::formatv("{0} {1} = {2} & {3}U;", storage_type_name, clear_temp, load_temp, FormatAPIntHex(clear_mask)));
 
       // SrcVal = Builder.CreateOr(Val, SrcVal, "bf.set");
       std::string set_temp = GetTempVarName("bf_set");
@@ -519,14 +526,13 @@ public:
                     BuildExprCtx(member_expr->getBase(), Usage::Place, ctx.deref_force_extract, ctx.assigned_to));
                 BuiltExpr rhs_built_expr =
                     BuildExpr(BuildExprCtx(rhs, GetUsage(rhs), ctx.deref_force_extract, ctx.assigned_to));
-                llvm::SmallVector<std::string, 4> pre_stmts;
                 std::string base_addr =
                     llvm::formatv("(&{0})", base_built_expr.final_expr); // arrow member access not possible
                 uint64_t start_bit = (static_cast<uint64_t>(info.StorageOffset.getQuantity()) * 8) + info.Offset;
                 uint64_t end_bit = start_bit + info.Size; // info.Size = bitfield width in bits
 
                 pre_stmts.push_back(
-                    llvm::formatv("__c2pnk_set_bitfield_{0}{1}(({2}int{1}_t){3}, (uint8_t *){4}, {5}, {6})",
+                    llvm::formatv("__c2pnk_set_bitfield_{0}{1}(({2}int{1}_t){3}, (uint8_t *){4}, {5}UL, {6}UL);",
                                   info.IsSigned ? "i" : "u", GetPointerWidth(data.Ctx), info.IsSigned ? "" : "u",
                                   rhs_built_expr.final_expr, base_addr, start_bit, end_bit));
                 pre_stmts.insert(pre_stmts.end(), rhs_built_expr.pre_stmts.begin(), rhs_built_expr.pre_stmts.end());
@@ -709,7 +715,7 @@ public:
                   llvm::formatv("(&{0})", base_built_expr.final_expr); // arrow member access not possible
               uint64_t start_bit = (static_cast<uint64_t>(info.StorageOffset.getQuantity()) * 8) + info.Offset;
               uint64_t end_bit = start_bit + info.Size; // info.Size = bitfield width in bits
-              os << llvm::formatv("__c2pnk_get_bitfield_{0}{1}((const uint8_t *){2}, {3}, {4})",
+              os << llvm::formatv("__c2pnk_get_bitfield_{0}{1}((const uint8_t *){2}, {3}UL, {4}UL)",
                                   info.IsSigned ? "i" : "u", GetPointerWidth(data.Ctx), base_addr, start_bit, end_bit);
               pre_stmts.insert(pre_stmts.end(), base_built_expr.pre_stmts.begin(), base_built_expr.pre_stmts.end());
               data.need_non_volatile_bitfield_helpers = true;
@@ -851,6 +857,13 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
 
   bool add_error_occurred = false;
   for (const auto &r : replacements) {
+    if (r.getFilePath().empty()) {
+      // if there's no file path then it means the replacement is some fucked macro expansion or whatever
+      // anyway, I don't know if there is any case where we do want to apply the replacement (I'm not even sure how
+      // these got generated in the first place :skull:).
+      continue;
+    }
+
     if (auto err = pa_ctx.replacements.add(r)) {
       llvm::consumeError(std::move(err));
       llvm::errs() << llvm::formatv("{0} Add replacement conflict, retrying next pass...\n", LogBegin(pa_ctx));
@@ -858,11 +871,7 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
     }
   }
 
-  pa_ctx.run_result = RunResult::Success;
-  if (!add_error_occurred && replacements.empty()) {
-    // All edits successfully added; no need to repeat this pass
-    pa_ctx.run_result = RunResult::Success;
-  }
+  assert(!add_error_occurred && "Add replacement conflict should not occur in this pass");
 }
 } // namespace pancake::pass_lower_bitfield_ops
 

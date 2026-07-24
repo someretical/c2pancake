@@ -136,4 +136,21 @@ struct BuildExprCtx {
 auto GetUsage(const clang::Expr *expr) -> Usage;
 } // namespace pancake::pass_lower_nested_expressions
 
+namespace pancake::pass_simplify_double_negation {
+class Consumer : public C2PancakePass {
+public:
+  using C2PancakePass::C2PancakePass; // inherit constructor
+  void HandleTranslationUnit(clang::ASTContext &Ctx) override;
+};
+
+class Action : public PipelineAction<Consumer> {
+public:
+  explicit Action(PipelineActionCtx &ctx) : PipelineAction<Consumer>(ctx) {
+    ctx.action_name = "SimplifyDoubleNegation";
+    ctx.failure_behaviour = FailureBehaviour::RepeatPass;
+    ctx.action_type = PipelineActionType::Rewriter;
+  }
+};
+} // namespace pancake::pass_simplify_double_negation
+
 #endif // C2PANCAKE_PASS_TRANSFORM_LOGICAL_EXPRESSIONS

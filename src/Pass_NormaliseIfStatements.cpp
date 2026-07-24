@@ -112,7 +112,7 @@ public:
     }
 
     if (needs_cond_hoist) {
-      os << llvm::formatv("int {0} = ({1});\n", cond_name, original_cond_text);
+      os << llvm::formatv("{0} {1} = ({2});\n", GetWordTypeStr(data.Ctx), cond_name, original_cond_text);
     }
 
     os << llvm::formatv("if ({0}) ", cond_name);

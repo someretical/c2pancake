@@ -5,14 +5,9 @@
 #include <clang/AST/ASTContext.h>
 #include <clang/AST/Decl.h>
 #include <clang/AST/Expr.h>
-#include <clang/AST/OperationKinds.h>
-#include <clang/AST/ParentMapContext.h>
 #include <clang/AST/RecordLayout.h>
-#include <clang/AST/RecursiveASTVisitor.h>
 #include <clang/AST/Stmt.h>
 #include <clang/AST/TypeBase.h>
-#include <clang/ASTMatchers/ASTMatchFinder.h>
-#include <clang/ASTMatchers/ASTMatchers.h>
 #include <clang/Basic/LLVM.h>
 #include <clang/Basic/SourceLocation.h>
 #include <clang/Frontend/CompilerInstance.h>
@@ -21,13 +16,9 @@
 #include <clang/Tooling/Core/Replacement.h>
 #include <clang/Tooling/Inclusions/HeaderIncludes.h>
 #include <clang/Tooling/Inclusions/IncludeStyle.h>
-#include <clang/Tooling/Transformer/RewriteRule.h>
-#include <clang/Tooling/Transformer/Stencil.h>
-#include <clang/Tooling/Transformer/Transformer.h>
 #include <llvm/ADT/SmallVector.h>
 #include <llvm/ADT/StringExtras.h>
 #include <llvm/ADT/StringRef.h>
-#include <llvm/Support/Casting.h>
 #include <llvm/Support/Error.h>
 #include <llvm/Support/ErrorHandling.h>
 #include <llvm/Support/FormatVariadic.h>
@@ -41,13 +32,13 @@ using namespace clang::tooling;
 
 namespace pancake::pass_inject_headers {
 auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
-  tooling::IncludeStyle style;
+  const tooling::IncludeStyle style{};
   const auto &sm = Ctx.getSourceManager();
   const auto *file_entry = sm.getFileEntryForID(sm.getMainFileID());
   assert(file_entry != nullptr && "Main file entry should not be null");
   const auto &file_name = file_entry->tryGetRealPathName();
   const auto source_text = sm.getBufferOrFake(sm.getMainFileID()).getBuffer();
-  HeaderIncludes includes(file_name, source_text, style);
+  const HeaderIncludes includes(file_name, source_text, style);
 
   llvm::SmallVector<Replacement, 16> replacements;
 

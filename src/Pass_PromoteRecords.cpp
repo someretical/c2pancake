@@ -34,7 +34,6 @@
 #include <cassert>
 #include <string>
 #include <utility>
-#include <vector>
 
 using namespace clang;
 using namespace clang::ast_matchers;

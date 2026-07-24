@@ -12,7 +12,7 @@
             "args": [
                 "${file}",
                 "--",
-                "--target=aarch64-linux-gnu",
+                // "--target=aarch64-linux-gnu",
                 "-std=c23",
             ],
             "cwd": "${workspaceFolder}",

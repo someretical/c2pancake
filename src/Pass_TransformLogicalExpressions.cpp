@@ -36,7 +36,6 @@
 #include <ranges>
 #include <string>
 #include <utility>
-#include <vector>
 
 using namespace clang;
 using namespace clang::tooling;
@@ -451,8 +450,9 @@ public:
 
       os << "(";
       c_style_cast_expr->getTypeAsWritten().print(os, data.Ctx.getPrintingPolicy());
-      os << ")";
+      os << ")(";
       os << res.final_expr;
+      os << ")";
 
       pre_stmts.insert(pre_stmts.end(), res.pre_stmts.begin(), res.pre_stmts.end());
     } else if (auto *init_list_expr = dyn_cast<InitListExpr>(expr)) {
@@ -478,7 +478,7 @@ public:
               element_type); // we want to assign to a pointer to the element type, not the element type itself
 
           // must extract var to tmp var first, then assign to array
-          std::string const tmp_var_name = GetTempVarName("InitList");
+          const std::string tmp_var_name = GetTempVarName("InitList");
           tmp_stmts.emplace_back(llvm::formatv("{0} = {1};", PrintType(tmp_var_type, tmp_var_name), var_name));
           var_name = tmp_var_name;
         }
@@ -490,7 +490,7 @@ public:
             continue;
           }
 
-          std::string element_var_name = llvm::formatv("*({0} + {1})", var_name, i);
+          const std::string element_var_name = llvm::formatv("*({0} + {1}UL)", var_name, i);
           auto res = BuildExpr(
               BuildExprCtx(init_expr, GetUsage(init_expr), true, std::make_pair(element_var_name, element_type)));
 
@@ -791,12 +791,12 @@ if ({4}) {
             R"(/* c2pancake: transformed logical && */
 /* original expr: {0} */
 {1}
-{2} {3} = 0;
+{2} {3} = 0UL;
 if (!({4})) {
-  {3} = 0;
+  {3} = 0UL;
 } else {
   {5}
-  {3} = 0 != ({6}); 
+  {3} = 0UL != ({6}); 
 })",
             GetSourceText(expr, data.Ctx), llvm::join(lhs_res.pre_stmts | std::views::reverse, "\n"),
             GetWordTypeStr(data.Ctx), tmp_var_name, lhs_res.final_expr,
@@ -823,12 +823,12 @@ if (!({4})) {
             R"(/* c2pancake: transformed logical || */
 /* original expr: {0} */
 {1}
-{2} {3} = 0;
+{2} {3} = 0UL;
 if ({4}) {
-  {3} = 1;
+  {3} = 1UL;
 } else {
   {5}
-  {3} = 0 != ({6});
+  {3} = 0UL != ({6});
 })",
             GetSourceText(expr, data.Ctx), llvm::join(lhs_res.pre_stmts | std::views::reverse, "\n"),
             GetWordTypeStr(data.Ctx), tmp_var_name, lhs_res.final_expr,
@@ -938,7 +938,7 @@ if ({4}) {
                   0 = value of the sub expression
                   1 = the operator (+ or -)
                   */
-                  R"({0} = {0} {1} 1;)", res.final_expr, unary_operator->getOpcode() == UO_PostInc ? "+" : "-")
+                  R"({0} = {0} {1} 1UL;)", res.final_expr, unary_operator->getOpcode() == UO_PostInc ? "+" : "-")
                   .str());
         } else {
           std::string const tmp_var_name =
@@ -950,7 +950,7 @@ if ({4}) {
                                   2 = the operator (+ or -)
                                   */
                                   R"({0} = {1};
-{1} = {1} {2} 1;)",
+{1} = {1} {2} 1UL;)",
                                   PrintType(res.final_expr_type, tmp_var_name), res.final_expr,
                                   unary_operator->getOpcode() == UO_PostInc ? "+" : "-")
                                   .str());
@@ -975,7 +975,7 @@ if ({4}) {
                   0 = value of the sub expression
                   1 = the operator (+ or -)
                   */
-                  R"({0} = {0} {1} 1;)", res.final_expr, unary_operator->getOpcode() == UO_PreInc ? "+" : "-")
+                  R"({0} = {0} {1} 1UL;)", res.final_expr, unary_operator->getOpcode() == UO_PreInc ? "+" : "-")
                   .str());
         } else {
           std::string const tmp_var_name =
@@ -986,7 +986,7 @@ if ({4}) {
                                   1 = value of the sub expression
                                   2 = the operator (+ or -)
                                   */
-                                  R"({1} = {1} {2} 1;
+                                  R"({1} = {1} {2} 1UL;
                                   {0} = {1};)",
                                   PrintType(res.final_expr_type, tmp_var_name), res.final_expr,
                                   unary_operator->getOpcode() == UO_PreInc ? "+" : "-")
@@ -1218,3 +1218,47 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
   // The RepeatPass is set in the BuildExpr function when a StmtExpr is encountered, so we don't need to set it here.
 }
 } // namespace pancake::pass_lower_nested_expressions
+
+namespace pancake::pass_simplify_double_negation {
+namespace {
+auto MakeRule() -> RewriteRule {
+  return makeRule(
+      unaryOperator(isExpansionInMainFile(), hasOperatorName("!"),
+                    hasUnaryOperand(ignoringParenImpCasts(
+                        unaryOperator(hasOperatorName("!"), hasUnaryOperand(expr().bind("expr"))).bind("deref"))))
+          .bind("double_negation"),
+      changeTo(node("double_negation"), cat(node("expr"))));
+}
+} // namespace
+
+auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
+  llvm::SmallVector<AtomicChange, 64> changes;
+  auto t = Transformer(MakeRule(), [&changes](llvm::Expected<llvm::MutableArrayRef<AtomicChange>> c) -> void {
+    if (c)
+      changes.insert(changes.end(), c->begin(), c->end());
+    else
+      llvm::consumeError(c.takeError());
+  });
+
+  MatchFinder finder;
+  t.registerMatchers(&finder);
+  finder.matchAST(Ctx);
+
+  bool add_error_occurred = false;
+  for (const auto &change : changes) {
+    for (const auto &r : change.getReplacements()) {
+      if (auto err = pa_ctx.replacements.add(r)) {
+        llvm::consumeError(std::move(err));
+        llvm::errs() << llvm::formatv("{0} Add replacement conflict, retrying next pass...\n", LogBegin(pa_ctx));
+        add_error_occurred = true;
+      }
+    }
+  }
+
+  pa_ctx.run_result = RunResult::RepeatPass;
+  if (!add_error_occurred && changes.empty()) {
+    // All edits successfully added; no need to repeat this pass
+    pa_ctx.run_result = RunResult::Success;
+  }
+}
+} // namespace pancake::pass_simplify_double_negation

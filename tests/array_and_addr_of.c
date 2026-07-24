@@ -80,8 +80,8 @@ void nested(int n) {
 
 /*  Case 8: multi-dimensional array */
 void matrix(void) {
-  float mat[3][3] = {{1.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f}, {0.0f, 0.0f, 1.0f}};
-  printf("%f\n", mat[1][1]);
+  long mat[3][3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}};
+  printf("%ld\n", mat[1][1]);
 }
 
 /*  Case 9: address taken through cast  */

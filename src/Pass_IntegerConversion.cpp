@@ -7,7 +7,6 @@
 #include <clang/AST/Decl.h>
 #include <clang/AST/Expr.h>
 #include <clang/AST/OperationKinds.h>
-#include <clang/AST/ParentMapContext.h>
 #include <clang/AST/RecordLayout.h>
 #include <clang/AST/RecursiveASTVisitor.h>
 #include <clang/AST/Stmt.h>
@@ -16,22 +15,23 @@
 #include <clang/ASTMatchers/ASTMatchers.h>
 #include <clang/Basic/LLVM.h>
 #include <clang/Basic/SourceLocation.h>
+#include <clang/Basic/TokenKinds.h>
 #include <clang/Frontend/CompilerInstance.h>
 #include <clang/Lex/Lexer.h>
 #include <clang/Rewrite/Core/Rewriter.h>
 #include <clang/Tooling/Core/Replacement.h>
+#include <clang/Tooling/Refactoring/AtomicChange.h>
+#include <clang/Tooling/Transformer/MatchConsumer.h>
+#include <clang/Tooling/Transformer/RangeSelector.h>
 #include <clang/Tooling/Transformer/RewriteRule.h>
 #include <clang/Tooling/Transformer/Stencil.h>
 #include <clang/Tooling/Transformer/Transformer.h>
-#include <clang/lib/CodeGen/Address.h>
-#include <clang/lib/CodeGen/CGRecordLayout.h>
 #include <clang/lib/CodeGen/CodeGenFunction.h>
 #include <clang/lib/CodeGen/CodeGenModule.h>
 #include <clang/lib/CodeGen/CodeGenTypes.h>
 #include <llvm/ADT/SmallVector.h>
 #include <llvm/ADT/StringExtras.h>
 #include <llvm/ADT/StringRef.h>
-#include <llvm/Support/Casting.h>
 #include <llvm/Support/Error.h>
 #include <llvm/Support/ErrorHandling.h>
 #include <llvm/Support/FormatVariadic.h>
@@ -39,8 +39,8 @@
 
 #include <cassert>
 #include <cstddef>
-#include <cstdint>
 #include <memory>
+#include <optional>
 #include <ranges>
 #include <string>
 #include <utility>
@@ -135,8 +135,7 @@ This is because pancake only supports word sized variables on the stack.
 */
 namespace pancake::pass_integer_conversion {
 namespace {
-const char *signed_i64_helpers = R"(#include <assert.h>
-#include <stdint.h>
+const char *signed_i64_helpers = R"(#include <stdint.h>
 /* c2pancake generated code start: helpers for i64 signed ops */
 
 uint64_t __c2pnk_u8_to_u64(uint8_t x) {
@@ -225,14 +224,138 @@ uint64_t __c2pnk_i64_gte(uint64_t a, uint64_t b) {
 
 /* arithmetic right shift */
 uint64_t __c2pnk_i64_sar(uint64_t a, uint64_t n) {
-    assert(n > 0);
-    assert(n < 64);
-
     uint64_t sign = a >> 63;
     uint64_t mask = 0 - sign;
     uint64_t fill = mask << (64 - n);
 
     return (a >> n) | fill;
+}
+
+uint64_t __c2pnk_u64_div(uint64_t dividend, uint64_t divisor) {
+    if (divisor == 0) {
+        return 0; // uh oh
+    }
+
+    uint64_t quotient = 0;
+    uint64_t remainder = 0;
+    uint64_t i = 63;
+
+    while (i != UINT64_MAX) {
+        remainder = (remainder << 1) | ((dividend >> i) & 1ULL);
+        if (remainder >= divisor) {
+            remainder = remainder - divisor;
+            quotient = quotient | (1ULL << i);
+        }
+        i = i - 1;
+    }
+
+    return quotient;
+}
+
+uint64_t __c2pnk_u64_rem(uint64_t dividend, uint64_t divisor) {
+    if (divisor == 0) {
+        return 0; // uh oh
+    }
+
+    uint64_t remainder = 0;
+    uint64_t i = 63;
+
+    while (i != UINT64_MAX) {
+        remainder = (remainder << 1) | ((dividend >> i) & 1ULL);
+        if (remainder >= divisor) {
+            remainder = remainder - divisor;
+        }
+        i = i - 1;
+    }
+
+    return remainder;
+}
+
+uint64_t __c2pnk_i64_div(uint64_t dividend, uint64_t divisor, uint64_t width) {
+    if (divisor == 0) {
+        return 0; // uh oh
+    }
+
+    uint64_t int_min_n = 0ULL - (1ULL << (width - 1));
+    uint64_t neg_one = ~0ULL;
+
+    if (dividend == int_min_n) {
+        if (divisor == neg_one) {
+            return int_min_n; // N-bit overflow: wraps back to INT_MIN(N)
+        }
+    }
+
+    uint64_t dividend_sign = dividend >> 63;
+    uint64_t divisor_sign = divisor >> 63;
+    uint64_t quotient_sign = dividend_sign ^ divisor_sign;
+
+    uint64_t abs_dividend;
+    if (dividend_sign) {
+        abs_dividend = 0ULL - dividend;
+    } else {
+        abs_dividend = dividend;
+    }
+
+    uint64_t abs_divisor;
+    if (divisor_sign) {
+        abs_divisor = 0ULL - divisor;
+    } else {
+        abs_divisor = divisor;
+    }
+
+    uint64_t uq = __c2pnk_u64_div(abs_dividend, abs_divisor);
+
+    uint64_t quotient;
+    if (quotient_sign) {
+        quotient = 0ULL - uq;
+    } else {
+        quotient = uq;
+    }
+
+    return quotient;
+}
+
+uint64_t __c2pnk_i64_rem(uint64_t dividend, uint64_t divisor, uint64_t width) {
+    if (divisor == 0) {
+        return 0; // uh oh
+    }
+
+    uint64_t int_min_n = 0ULL - (1ULL << (width - 1));
+    uint64_t neg_one = ~0ULL;
+
+    if (dividend == int_min_n) {
+        if (divisor == neg_one) {
+            return 0; // N-bit overflow: remainder is 0 (exact division)
+        }
+    }
+
+    uint64_t dividend_sign = dividend >> 63;
+    uint64_t divisor_sign = divisor >> 63;
+
+    uint64_t abs_dividend;
+    if (dividend_sign) {
+        abs_dividend = 0ULL - dividend;
+    } else {
+        abs_dividend = dividend;
+    }
+
+    uint64_t abs_divisor;
+    if (divisor_sign) {
+        abs_divisor = 0ULL - divisor;
+    } else {
+        abs_divisor = divisor;
+    }
+
+    uint64_t ur = __c2pnk_u64_rem(abs_dividend, abs_divisor);
+
+    uint64_t remainder;
+    if (dividend_sign) {
+        remainder = 0ULL - ur;
+    } else {
+        remainder = ur;
+    }
+
+    return remainder;
 }
 
 uint64_t __c2pnk_trunc_u64_to_u64(uint64_t x) {
@@ -275,8 +398,7 @@ uint64_t __c2pnk_trunc_u64_to_i8(uint64_t x) {
 
 )";
 
-const char *signed_i32_helpers = R"(#include <assert.h>
-#include <stdint.h>
+const char *signed_i32_helpers = R"(#include <stdint.h>
 /* c2pancake generated code start: helpers for i32 signed ops */
 uint32_t __c2pnk_i8_to_u32(int8_t x) {
     uint32_t y = (uint8_t)x;
@@ -353,14 +475,138 @@ uint32_t __c2pnk_i32_gte(uint32_t a, uint32_t b) {
 }
 
 uint32_t __c2pnk_i32_sar(uint32_t a, uint32_t n) {
-    assert(n > 0);
-    assert(n < 32);
-
     uint32_t sign = a >> 31;
     uint32_t mask = 0 - sign;
     uint32_t fill = mask << (32 - n);
 
     return (a >> n) | fill;
+}
+
+uint32_t __c2pnk_u32_div(uint32_t dividend, uint32_t divisor) {
+    if (divisor == 0) {
+        return 0; // uh oh
+    }
+
+    uint32_t quotient = 0;
+    uint32_t remainder = 0;
+    uint32_t i = 31;
+
+    while (i != UINT32_MAX) {
+        remainder = (remainder << 1) | ((dividend >> i) & 1U);
+        if (remainder >= divisor) {
+            remainder = remainder - divisor;
+            quotient = quotient | (1U << i);
+        }
+        i = i - 1;
+    }
+
+    return quotient;
+}
+
+uint32_t __c2pnk_u32_rem(uint32_t dividend, uint32_t divisor) {
+    if (divisor == 0) {
+        return 0; // uh oh
+    }
+
+    uint32_t remainder = 0;
+    uint32_t i = 31;
+
+    while (i != UINT32_MAX) {
+        remainder = (remainder << 1) | ((dividend >> i) & 1U);
+        if (remainder >= divisor) {
+            remainder = remainder - divisor;
+        }
+        i = i - 1;
+    }
+
+    return remainder;
+}
+
+uint32_t __c2pnk_i32_div(uint32_t dividend, uint32_t divisor, uint32_t width) {
+    if (divisor == 0) {
+        return 0; // uh oh
+    }
+
+    uint32_t int_min_n = 0U - (1U << (width - 1));
+    uint32_t neg_one = ~0U;
+
+    if (dividend == int_min_n) {
+        if (divisor == neg_one) {
+            return int_min_n; // N-bit overflow: wraps back to INT_MIN(N)
+        }
+    }
+
+    uint32_t dividend_sign = dividend >> 31;
+    uint32_t divisor_sign = divisor >> 31;
+    uint32_t quotient_sign = dividend_sign ^ divisor_sign;
+
+    uint32_t abs_dividend;
+    if (dividend_sign) {
+        abs_dividend = 0U - dividend;
+    } else {
+        abs_dividend = dividend;
+    }
+
+    uint32_t abs_divisor;
+    if (divisor_sign) {
+        abs_divisor = 0U - divisor;
+    } else {
+        abs_divisor = divisor;
+    }
+
+    uint32_t uq = __c2pnk_u32_div(abs_dividend, abs_divisor);
+
+    uint32_t quotient;
+    if (quotient_sign) {
+        quotient = 0U - uq;
+    } else {
+        quotient = uq;
+    }
+
+    return quotient;
+}
+
+uint32_t __c2pnk_i32_rem(uint32_t dividend, uint32_t divisor, uint32_t width) {
+    if (divisor == 0) {
+        return 0; // uh oh
+    }
+
+    uint32_t int_min_n = 0U - (1U << (width - 1));
+    uint32_t neg_one = ~0U;
+
+    if (dividend == int_min_n) {
+        if (divisor == neg_one) {
+            return 0; // N-bit overflow: remainder is 0 (exact division)
+        }
+    }
+
+    uint32_t dividend_sign = dividend >> 31;
+    uint32_t divisor_sign = divisor >> 31;
+
+    uint32_t abs_dividend;
+    if (dividend_sign) {
+        abs_dividend = 0U - dividend;
+    } else {
+        abs_dividend = dividend;
+    }
+
+    uint32_t abs_divisor;
+    if (divisor_sign) {
+        abs_divisor = 0U - divisor;
+    } else {
+        abs_divisor = divisor;
+    }
+
+    uint32_t ur = __c2pnk_u32_rem(abs_dividend, abs_divisor);
+
+    uint32_t remainder;
+    if (dividend_sign) {
+        remainder = 0U - ur;
+    } else {
+        remainder = ur;
+    }
+
+    return remainder;
 }
 
 uint32_t __c2pnk_trunc_u32_to_u32(uint32_t x) {
@@ -400,6 +646,7 @@ struct WorkerData {
   llvm::SmallVector<Replacement, 64> &replacements;
   size_t tmp_var_counter = 0;
   bool need_int_helpers = false;
+  FunctionDecl *current_function_decl = nullptr;
 };
 
 class Worker : public RecursiveASTVisitor<Worker> {
@@ -408,7 +655,7 @@ class Worker : public RecursiveASTVisitor<Worker> {
 public:
   explicit Worker(struct WorkerData &data) : data(data) {}
 
-  bool shouldTraversePostOrder() const { return true; }
+  static auto shouldTraversePostOrder() -> bool { return false; }
 
   auto GetTempVarName(std::string hint) -> auto {
     return llvm::formatv("__c2pnk_{0}_{1}_{2}_{3}", hint, data.pa_ctx.major_pass_number, data.pa_ctx.minor_pass_number,
@@ -455,6 +702,10 @@ public:
       return "lte";
     case BO_GE:
       return "gte";
+    case BO_Div:
+      return "div";
+    case BO_Rem:
+      return "rem";
     default:
       llvm_unreachable("Unsupported binary operator");
     }
@@ -488,6 +739,10 @@ public:
           goto decl_ref_expr_general_case;
         }
 
+        if (!is_signed) {
+          goto decl_ref_expr_general_case;
+        }
+
         auto signed_to_unsigned = llvm::formatv("__c2pnk_{0}{1}_to_u{2}({3})", is_signed ? 'i' : 'u', bit_width,
                                                 GetPointerWidth(data.Ctx), GetSourceText(decl_ref_expr, data.Ctx));
         auto final_conv = llvm::formatv("__c2pnk_trunc_u{0}_to_{1}{2}({3})", GetPointerWidth(data.Ctx),
@@ -506,6 +761,8 @@ public:
       VerifyTypeWidth(type);
 
       if (bit_width == GetPointerWidth(data.Ctx) && !is_signed) {
+        PrintSourceText(os, integer_literal, data.Ctx);
+      } else if (!is_signed) {
         PrintSourceText(os, integer_literal, data.Ctx);
       } else {
         auto signed_to_unsigned = llvm::formatv("__c2pnk_{0}{1}_to_u{2}({3})", is_signed ? 'i' : 'u', bit_width,
@@ -526,11 +783,15 @@ public:
       auto bit_width = data.Ctx.getTypeSize(type);
       VerifyTypeWidth(type);
 
-      auto signed_to_unsigned = llvm::formatv("__c2pnk_{0}{1}_to_u{2}({3})", is_signed ? 'i' : 'u', bit_width,
-                                              GetPointerWidth(data.Ctx), GetSourceText(character_literal, data.Ctx));
-      auto final_conv = llvm::formatv("__c2pnk_trunc_u{0}_to_{1}{2}({3})", GetPointerWidth(data.Ctx),
-                                      is_signed ? 'i' : 'u', bit_width, signed_to_unsigned);
-      os << final_conv;
+      if (!is_signed) {
+        PrintSourceText(os, character_literal, data.Ctx);
+      } else {
+        auto signed_to_unsigned = llvm::formatv("__c2pnk_{0}{1}_to_u{2}({3})", is_signed ? 'i' : 'u', bit_width,
+                                                GetPointerWidth(data.Ctx), GetSourceText(character_literal, data.Ctx));
+        auto final_conv = llvm::formatv("__c2pnk_trunc_u{0}_to_{1}{2}({3})", GetPointerWidth(data.Ctx),
+                                        is_signed ? 'i' : 'u', bit_width, signed_to_unsigned);
+        os << final_conv;
+      }
     } else if (auto *string_literal = dyn_cast<StringLiteral>(expr)) {
       PrintSourceText(os, string_literal, data.Ctx);
     } else if (auto *c_style_cast_expr = dyn_cast<CStyleCastExpr>(expr)) {
@@ -548,9 +809,14 @@ public:
         auto dest_bit_width = data.Ctx.getTypeSize(dest_type);
         VerifyTypeWidth(dest_type);
 
-        os << llvm::formatv("__c2pnk_trunc_u{0}_to_{1}{2}({3})", GetPointerWidth(data.Ctx), dest_is_signed ? 'i' : 'u',
-                            dest_bit_width, res.final_expr);
+        if (dest_bit_width == GetPointerWidth(data.Ctx)) {
+          goto c_style_cast_general_case;
+        } else {
+          os << llvm::formatv("__c2pnk_trunc_u{0}_to_{1}{2}({3})", GetPointerWidth(data.Ctx),
+                              dest_is_signed ? 'i' : 'u', dest_bit_width, res.final_expr);
+        }
       } else {
+      c_style_cast_general_case:
         os << "(";
         c_style_cast_expr->getTypeAsWritten().print(os, data.Ctx.getPrintingPolicy());
         os << ")(";
@@ -571,13 +837,30 @@ public:
       auto *rhs = binary_operator->getRHS()->IgnoreParenImpCasts();
 
       auto rhs_res = BuildExpr(BuildExprCtx(rhs, Usage::Value, ctx.deref_force_extract, ctx.assigned_to));
-      auto lhs_res = BuildExpr(BuildExprCtx(lhs, Usage::Place, ctx.deref_force_extract, ctx.assigned_to));
+      auto lhs_res = BuildExpr(BuildExprCtx(lhs, Usage::Value, ctx.deref_force_extract, ctx.assigned_to));
 
       switch (binary_operator->getOpcode()) {
       case BO_Div:
         [[fallthrough]];
       case BO_Rem: {
-        llvm_unreachable("Division and remainder operators are not allowed!");
+        assert(lhs->getType()->isIntegerType() && rhs->getType()->isIntegerType() &&
+               "Binary operator (DIV, REM) operands must be integer types");
+        data.need_int_helpers = true;
+
+        auto lhs_type = lhs->getType();
+        auto lhs_is_signed = lhs_type->isSignedIntegerType();
+        auto lhs_bit_width = data.Ctx.getTypeSize(lhs_type);
+        VerifyTypeWidth(lhs_type);
+
+        if (lhs_is_signed) {
+          os << llvm::formatv("__c2pnk_i{0}_{1}({2}, {3}, {4})", GetPointerWidth(data.Ctx),
+                              BinOpTypeToStr(binary_operator->getOpcode()), lhs_res.final_expr, rhs_res.final_expr,
+                              lhs_bit_width);
+        } else {
+          os << llvm::formatv("__c2pnk_u{0}_{1}({2}, {3})", GetPointerWidth(data.Ctx),
+                              BinOpTypeToStr(binary_operator->getOpcode()), lhs_res.final_expr, rhs_res.final_expr);
+        }
+        break;
       }
 
       case BO_Assign: {
@@ -585,6 +868,10 @@ public:
         // this should then have been converted into an explicit cast
         // which would have been handled at this point already
         // so there's nothing to do...
+
+        // we want to build with the LHS as a place expression, and the RHS as a value expression
+        lhs_res = BuildExpr(BuildExprCtx(lhs, Usage::Place, ctx.deref_force_extract, ctx.assigned_to));
+
         pre_stmts.push_back(llvm::formatv("{0} = {1};", lhs_res.final_expr, rhs_res.final_expr).str());
         if (ctx.usage_kind == Usage::Value) {
           os << lhs_res.final_expr;
@@ -626,9 +913,12 @@ public:
         }
 
         data.need_int_helpers = true;
-
-        assert(lhs->getType()->getCanonicalTypeUnqualified() == rhs->getType()->getCanonicalTypeUnqualified() &&
-               "Binary operator (LT, GT, LE, GE) operands must have the same type");
+        if (lhs->getType()->getCanonicalTypeUnqualified() != rhs->getType()->getCanonicalTypeUnqualified()) {
+          llvm::errs() << llvm::formatv("{0} Binary operator (LT, GT, LE, GE) operands must have the same type, {1}\n",
+                                        LogBegin(data.pa_ctx),
+                                        binary_operator->getExprLoc().printToString(data.Ctx.getSourceManager()));
+          llvm_unreachable("Binary operator (LT, GT, LE, GE) operands must have the same type");
+        }
 
         auto type = lhs->getType();
         auto is_signed = type->isSignedIntegerType();
@@ -712,8 +1002,13 @@ public:
           auto bit_width = data.Ctx.getTypeSize(type);
           VerifyTypeWidth(type);
 
-          os << llvm::formatv("__c2pnk_trunc_u{0}_to_{1}{2}(-{3})", GetPointerWidth(data.Ctx), is_signed ? 'i' : 'u',
-                              bit_width, res.final_expr);
+          if (bit_width == GetPointerWidth(data.Ctx)) {
+            os << llvm::formatv("-{0}", res.final_expr);
+          } else {
+            os << llvm::formatv("__c2pnk_trunc_u{0}_to_{1}{2}(-{3})", GetPointerWidth(data.Ctx), is_signed ? 'i' : 'u',
+                                bit_width, res.final_expr);
+          }
+
         } else {
           goto unary_operator_general_case;
         }
@@ -751,20 +1046,22 @@ public:
       }
       // it's possible for getDirectCallee to return nullptr, but I don't know what to do in that case...
       // TODO throw error on any function pointers
-      os << llvm::formatv(
-          "{0}({1})", call_expr->getDirectCallee()->getName().str(),
-          llvm::join(arg_built_exprs | std::views::transform([this](const BuiltExpr &e) -> std::string {
-                       // we need to do a check here because of functions that take format strings like
-                       // printf. the "implicit" casts cannot be fixed by the previous pass.
-                       if (e.final_expr_type->isIntegerType()) {
+      os << llvm::formatv("{0}({1})", call_expr->getDirectCallee()->getName().str(),
+                          llvm::join(arg_built_exprs | std::views::transform([this](const BuiltExpr &e) -> std::string {
+                                       // we need to do a check here because of functions that take format strings like
+                                       // printf. the "implicit" casts cannot be fixed by the previous pass.
+                                       if (e.final_expr_type->isIntegerType()) {
+                                         // prevent sizeof exprs from returning __size_t which is impl defined...
+                                         auto final_expr_type = e.final_expr_type.getAsString(data.Ctx.getLangOpts());
+                                         if (final_expr_type == "__size_t") {
+                                           final_expr_type = "size_t";
+                                         }
 
-                         return llvm::formatv("({0}){1}", e.final_expr_type.getAsString(data.Ctx.getPrintingPolicy()),
-                                              e.final_expr)
-                             .str();
-                       }
-                       return e.final_expr;
-                     }),
-                     ", "));
+                                         return llvm::formatv("({0}){1}", final_expr_type, e.final_expr).str();
+                                       }
+                                       return e.final_expr;
+                                     }),
+                                     ", "));
       for (auto &&built_expr : arg_built_exprs | std::views::reverse) {
         pre_stmts.insert(pre_stmts.end(), built_expr.pre_stmts.begin(), built_expr.pre_stmts.end());
       }
@@ -781,8 +1078,12 @@ public:
         auto bit_width = data.Ctx.getTypeSize(type);
         VerifyTypeWidth(type);
 
-        os << llvm::formatv("__c2pnk_{0}{1}_to_u{2}({3})", is_signed ? 'i' : 'u', bit_width, GetPointerWidth(data.Ctx),
-                            final_expr);
+        if (!is_signed) {
+          os << final_expr;
+        } else {
+          os << llvm::formatv("__c2pnk_{0}{1}_to_u{2}({3})", is_signed ? 'i' : 'u', bit_width,
+                              GetPointerWidth(data.Ctx), final_expr);
+        }
       } else {
         os << final_expr;
       }
@@ -797,9 +1098,18 @@ public:
     return BuiltExpr(pre_stmts, final_expr, final_expr_type);
   }
 
+  auto TraverseFunctionDecl(FunctionDecl *func_decl) -> bool {
+    auto *prev_func_decl = data.current_function_decl;
+    data.current_function_decl = func_decl;
+    auto res = RecursiveASTVisitor::TraverseFunctionDecl(func_decl);
+    data.current_function_decl = prev_func_decl;
+    return res;
+  }
+
   auto TraverseDeclStmt(DeclStmt *declStmt) -> bool {
     auto &sm = data.Ctx.getSourceManager();
-    if (declStmt == nullptr || !sm.isInMainFile(sm.getSpellingLoc(declStmt->getBeginLoc()))) {
+    if (declStmt == nullptr || !sm.isInMainFile(sm.getSpellingLoc(declStmt->getBeginLoc())) ||
+        data.current_function_decl == nullptr) {
       return true;
     }
 
@@ -847,7 +1157,8 @@ public:
 
   auto TraverseStmt(Stmt *stmt) -> bool {
     auto &sm = data.Ctx.getSourceManager();
-    if (stmt == nullptr || !sm.isInMainFile(sm.getSpellingLoc(stmt->getBeginLoc()))) {
+    if (stmt == nullptr || !sm.isInMainFile(sm.getSpellingLoc(stmt->getBeginLoc())) ||
+        data.current_function_decl == nullptr) {
       return true;
     }
 
@@ -900,6 +1211,13 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
 
   bool add_error_occurred = false;
   for (const auto &r : replacements) {
+    if (r.getFilePath().empty()) {
+      // if there's no file path then it means the replacement is some fucked macro expansion or whatever
+      // anyway, I don't know if there is any case where we do want to apply the replacement (I'm not even sure how
+      // these got generated in the first place :skull:).
+      continue;
+    }
+
     if (auto err = pa_ctx.replacements.add(r)) {
       llvm::consumeError(std::move(err));
       llvm::errs() << llvm::formatv("{0} Add replacement conflict, retrying next pass...\n", LogBegin(pa_ctx));
@@ -907,7 +1225,6 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
     }
   }
 
-  pa_ctx.run_result = RunResult::Success;
-  assert(!add_error_occurred && "Singleshot pass");
+  assert(!add_error_occurred && "Add replacement conflict should not occur in this pass");
 }
 } // namespace pancake::pass_integer_conversion
