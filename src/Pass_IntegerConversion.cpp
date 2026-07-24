@@ -83,7 +83,7 @@ auto MakeRule() -> RewriteRule {
                                    unless(hasCastKind(CK_FunctionToPointerDecay)),
                                    unless(hasCastKind(CK_BuiltinFnToFnPtr)))
                       .bind("cast"),
-                  changeTo(node("cast"), cat("(", TypeName("cast"), ")", node("cast"))));
+                  changeTo(node("cast"), cat("(", TypeName("cast"), ")(", node("cast"), ")")));
 }
 } // namespace
 
@@ -120,14 +120,18 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
 } // namespace pancake::pass_implicit_to_explicit_casts
 
 /*
-This pass is kind of fucked on lots of levels but it does what it needs to do.
-The resulting code should not have any more explicit/implicit integral casts in it apart from the ones in the helper
-functions. If there are any other implicit truncation that happens, it will happen in a context where it will also
-happen in pancake in which case it'll be fine.
+Every value of every integer type u8, i8, u16, i16, ..., i64 is represented as a single uint64_t, but what that
+uint64_t looks like depends on signedness:
 
-The main purpose is to flush out the problematic signed arithmetic... We do this by converting ALL operations to act on
-uint64_ts/uint32_ts (for signed versions they are just encoded within the uint64_ts). The truncation only happens at the
-end when we assign back to an lvalue.
+- Unsigned N-bit value: stored as its plain zero-extended bit pattern in the low N bits, upper bits 0.
+- Signed N-bit value: stored sign-extended to the full 64 bit, i.e. the canonical form is "as if it were already cast to
+int64_t".
+
+So the "type" of a uint64_t value in this system isn't encoded in the bits themselves, and the operations (conversions,
+comparisons, shifts) are the things responsible for maintaining the correct bit-pattern invariant for whichever type
+it's supposed to represent at that point.
+
+This is because pancake only supports word sized variables on the stack.
 */
 namespace pancake::pass_integer_conversion {
 namespace {
@@ -254,15 +258,18 @@ uint64_t __c2pnk_trunc_u64_to_i64(uint64_t x) {
 }
 
 uint64_t __c2pnk_trunc_u64_to_i32(uint64_t x) {
-    return x & (uint64_t)0xffffffff;
+  uint64_t y = x & (uint64_t)0xffffffff;
+  return (y ^ (uint64_t)0x80000000) - (uint64_t)0x80000000;
 }
 
 uint64_t __c2pnk_trunc_u64_to_i16(uint64_t x) {
-    return x & (uint64_t)0xffff;
+  uint64_t y = x & (uint64_t)0xffff;
+  return (y ^ (uint64_t)0x8000) - (uint64_t)0x8000;
 }
 
 uint64_t __c2pnk_trunc_u64_to_i8(uint64_t x) {
-    return x & (uint64_t)0xff;
+  uint64_t y = x & (uint64_t)0xff;
+  return (y ^ (uint64_t)0x80) - (uint64_t)0x80;
 }
 /* c2pancake generated code end: helpers for i64 signed ops */
 
@@ -375,11 +382,13 @@ uint32_t __c2pnk_trunc_u32_to_i32(uint32_t x) {
 }
 
 uint32_t __c2pnk_trunc_u32_to_i16(uint32_t x) {
-    return x & (uint32_t)0xffff;
+    uint32_t y = x & (uint32_t)0xffff;
+    return (y ^ (uint32_t)0x8000) - (uint32_t)0x8000;
 }
 
 uint32_t __c2pnk_trunc_u32_to_i8(uint32_t x) {
-    return x & (uint32_t)0xff;
+    uint32_t y = x & (uint32_t)0xff;
+    return (y ^ (uint32_t)0x80) - (uint32_t)0x80;
 }
 /* c2pancake generated code end: helpers for i32 signed ops */
 
@@ -399,7 +408,6 @@ class Worker : public RecursiveASTVisitor<Worker> {
 public:
   explicit Worker(struct WorkerData &data) : data(data) {}
 
-  // need pre-order traversal here
   bool shouldTraversePostOrder() const { return true; }
 
   auto GetTempVarName(std::string hint) -> auto {
@@ -476,9 +484,17 @@ public:
         auto bit_width = data.Ctx.getTypeSize(type);
         VerifyTypeWidth(type);
 
-        os << llvm::formatv("__c2pnk_{0}{1}_to_u{2}({3})", is_signed ? 'i' : 'u', bit_width, GetPointerWidth(data.Ctx),
-                            GetSourceText(decl_ref_expr, data.Ctx));
+        if (bit_width == GetPointerWidth(data.Ctx) && !is_signed) {
+          goto decl_ref_expr_general_case;
+        }
+
+        auto signed_to_unsigned = llvm::formatv("__c2pnk_{0}{1}_to_u{2}({3})", is_signed ? 'i' : 'u', bit_width,
+                                                GetPointerWidth(data.Ctx), GetSourceText(decl_ref_expr, data.Ctx));
+        auto final_conv = llvm::formatv("__c2pnk_trunc_u{0}_to_{1}{2}({3})", GetPointerWidth(data.Ctx),
+                                        is_signed ? 'i' : 'u', bit_width, signed_to_unsigned);
+        os << final_conv;
       } else {
+      decl_ref_expr_general_case:
         PrintSourceText(os, decl_ref_expr, data.Ctx);
       }
     } else if (auto *integer_literal = dyn_cast<IntegerLiteral>(expr)) {
@@ -489,8 +505,16 @@ public:
       auto bit_width = data.Ctx.getTypeSize(type);
       VerifyTypeWidth(type);
 
-      os << llvm::formatv("__c2pnk_{0}{1}_to_u{2}({3})", is_signed ? 'i' : 'u', bit_width, GetPointerWidth(data.Ctx),
-                          GetSourceText(integer_literal, data.Ctx));
+      if (bit_width == GetPointerWidth(data.Ctx) && !is_signed) {
+        PrintSourceText(os, integer_literal, data.Ctx);
+      } else {
+        auto signed_to_unsigned = llvm::formatv("__c2pnk_{0}{1}_to_u{2}({3})", is_signed ? 'i' : 'u', bit_width,
+                                                GetPointerWidth(data.Ctx), GetSourceText(integer_literal, data.Ctx));
+        auto final_conv = llvm::formatv("__c2pnk_trunc_u{0}_to_{1}{2}({3})", GetPointerWidth(data.Ctx),
+                                        is_signed ? 'i' : 'u', bit_width, signed_to_unsigned);
+        os << final_conv;
+      }
+
     } else if (auto *_ = dyn_cast<FloatingLiteral>(expr)) {
       llvm::errs() << llvm::formatv("{0} Floating point literals are not allowed, {1}\n", LogBegin(data.pa_ctx),
                                     expr->getExprLoc().printToString(data.Ctx.getSourceManager()));
@@ -502,8 +526,11 @@ public:
       auto bit_width = data.Ctx.getTypeSize(type);
       VerifyTypeWidth(type);
 
-      os << llvm::formatv("__c2pnk_{0}{1}_to_u{2}({3})", is_signed ? 'i' : 'u', bit_width, GetPointerWidth(data.Ctx),
-                          GetSourceText(character_literal, data.Ctx));
+      auto signed_to_unsigned = llvm::formatv("__c2pnk_{0}{1}_to_u{2}({3})", is_signed ? 'i' : 'u', bit_width,
+                                              GetPointerWidth(data.Ctx), GetSourceText(character_literal, data.Ctx));
+      auto final_conv = llvm::formatv("__c2pnk_trunc_u{0}_to_{1}{2}({3})", GetPointerWidth(data.Ctx),
+                                      is_signed ? 'i' : 'u', bit_width, signed_to_unsigned);
+      os << final_conv;
     } else if (auto *string_literal = dyn_cast<StringLiteral>(expr)) {
       PrintSourceText(os, string_literal, data.Ctx);
     } else if (auto *c_style_cast_expr = dyn_cast<CStyleCastExpr>(expr)) {
@@ -526,8 +553,9 @@ public:
       } else {
         os << "(";
         c_style_cast_expr->getTypeAsWritten().print(os, data.Ctx.getPrintingPolicy());
-        os << ")";
+        os << ")(";
         os << res.final_expr;
+        os << ")";
       }
 
       pre_stmts.insert(pre_stmts.end(), res.pre_stmts.begin(), res.pre_stmts.end());
@@ -567,10 +595,11 @@ public:
       case BO_Shr: {
         assert(lhs->getType()->isIntegerType() && rhs->getType()->isIntegerType() &&
                "Binary operator (SHR) operands must be integer types");
+        data.need_int_helpers = true;
 
         auto lhs_type = lhs->getType();
         auto lhs_is_signed = lhs_type->isSignedIntegerType();
-        auto lhs_bit_width = data.Ctx.getTypeSize(lhs_type);
+        // auto lhs_bit_width = data.Ctx.getTypeSize(lhs_type);
         VerifyTypeWidth(lhs_type);
 
         auto rhs_type = rhs->getType();
@@ -603,7 +632,7 @@ public:
 
         auto type = lhs->getType();
         auto is_signed = type->isSignedIntegerType();
-        auto bit_width = data.Ctx.getTypeSize(type);
+        // auto bit_width = data.Ctx.getTypeSize(type);
         VerifyTypeWidth(type);
 
         if (is_signed) {
@@ -670,9 +699,28 @@ public:
         break;
       }
 
+      case UO_Minus: {
+        // this will not work correctly on smaller types that are located within a u64
+        // we need to mask the u64 to zero the high bits after applying the unary minus
+
+        auto type = sub_expr->getType();
+        if (type->isIntegerType()) {
+          data.need_int_helpers = true;
+          auto res = BuildExpr(BuildExprCtx(sub_expr, Usage::Value, ctx.deref_force_extract, ctx.assigned_to));
+
+          auto is_signed = type->isSignedIntegerType();
+          auto bit_width = data.Ctx.getTypeSize(type);
+          VerifyTypeWidth(type);
+
+          os << llvm::formatv("__c2pnk_trunc_u{0}_to_{1}{2}(-{3})", GetPointerWidth(data.Ctx), is_signed ? 'i' : 'u',
+                              bit_width, res.final_expr);
+        } else {
+          goto unary_operator_general_case;
+        }
+        break;
+      }
+
       case UO_Plus:
-        [[fallthrough]];
-      case UO_Minus:
         [[fallthrough]];
       case UO_Not:
         [[fallthrough]];
@@ -683,6 +731,7 @@ public:
       case UO_Imag:
         [[fallthrough]];
       case UO_Extension: {
+      unary_operator_general_case:
         auto res = BuildExpr(BuildExprCtx(sub_expr, Usage::Value, ctx.deref_force_extract, ctx.assigned_to));
         os << llvm::formatv("{0}{1}", UnaryOperator::getOpcodeStr(unary_operator->getOpcode()).str(), res.final_expr);
         pre_stmts.insert(pre_stmts.end(), res.pre_stmts.begin(), res.pre_stmts.end());
@@ -702,11 +751,20 @@ public:
       }
       // it's possible for getDirectCallee to return nullptr, but I don't know what to do in that case...
       // TODO throw error on any function pointers
-      os << llvm::formatv("{0}({1})", call_expr->getDirectCallee()->getName().str(),
-                          llvm::join(arg_built_exprs | std::views::transform([](const BuiltExpr &e) -> std::string {
-                                       return e.final_expr;
-                                     }),
-                                     ", "));
+      os << llvm::formatv(
+          "{0}({1})", call_expr->getDirectCallee()->getName().str(),
+          llvm::join(arg_built_exprs | std::views::transform([this](const BuiltExpr &e) -> std::string {
+                       // we need to do a check here because of functions that take format strings like
+                       // printf. the "implicit" casts cannot be fixed by the previous pass.
+                       if (e.final_expr_type->isIntegerType()) {
+
+                         return llvm::formatv("({0}){1}", e.final_expr_type.getAsString(data.Ctx.getPrintingPolicy()),
+                                              e.final_expr)
+                             .str();
+                       }
+                       return e.final_expr;
+                     }),
+                     ", "));
       for (auto &&built_expr : arg_built_exprs | std::views::reverse) {
         pre_stmts.insert(pre_stmts.end(), built_expr.pre_stmts.begin(), built_expr.pre_stmts.end());
       }
