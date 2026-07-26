@@ -65,33 +65,44 @@ auto MakeRule() -> RewriteRule {
 
 auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
   llvm::SmallVector<AtomicChange, 64> changes;
-  auto t = Transformer(MakeRule(), [&changes](llvm::Expected<llvm::MutableArrayRef<AtomicChange>> c) -> void {
+  llvm::Error err = llvm::Error::success();
+  auto t = Transformer(MakeRule(), [&](llvm::Expected<llvm::MutableArrayRef<AtomicChange>> c) -> void {
     if (c)
       changes.insert(changes.end(), c->begin(), c->end());
     else
-      llvm::consumeError(c.takeError());
+      err = c.takeError();
   });
 
   MatchFinder finder;
   t.registerMatchers(&finder);
   finder.matchAST(Ctx);
 
-  bool add_error_occurred = false;
+  if (err) {
+    ps_ctx.error =
+        CreateRuntimeError(llvm::formatv("Error during transformation: {0}", llvm::fmt_consume(std::move(err))));
+    ps_ctx.whats_next = WhatsNext::MoveToNextFile;
+    return;
+  }
+
+  int errors = 0;
   for (const auto &change : changes) {
     for (const auto &r : change.getReplacements()) {
-      if (auto err = pa_ctx.replacements.add(r)) {
+      if (auto err = ps_ctx.replacements.add(r)) {
         llvm::consumeError(std::move(err));
-        llvm::errs() << llvm::formatv("{0} Add replacement conflict, retrying next pass...\n", LogBegin(pa_ctx));
-        add_error_occurred = true;
+        errors++;
       }
     }
   }
 
-  pa_ctx.run_result = RunResult::RepeatPass;
-  if (!add_error_occurred && changes.empty()) {
-    // All edits successfully added; no need to repeat this pass
-    pa_ctx.run_result = RunResult::Success;
+  if (errors == 0 && changes.empty()) {
+    ps_ctx.whats_next = WhatsNext::MoveToNextPass;
+    return;
   }
+  if (errors > 0) {
+    PrintLogBegin(llvm::outs(), ps_ctx);
+    llvm::outs() << llvm::formatv("Couldn't add {0} replacement{1}\n", errors, errors != 1 ? "s" : "");
+  }
+  ps_ctx.whats_next = WhatsNext::RepeatPass;
 }
 } // namespace pancake::pass_normalise_while_loops
 
@@ -147,28 +158,36 @@ auto MakeRule() -> RewriteRule {
 
 auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
   llvm::SmallVector<AtomicChange, 64> changes;
-  auto t = Transformer(MakeRule(), [&changes](llvm::Expected<llvm::MutableArrayRef<AtomicChange>> c) -> void {
+  llvm::Error err = llvm::Error::success();
+  auto t = Transformer(MakeRule(), [&](llvm::Expected<llvm::MutableArrayRef<AtomicChange>> c) -> void {
     if (c)
       changes.insert(changes.end(), c->begin(), c->end());
     else
-      llvm::consumeError(c.takeError());
+      err = c.takeError();
   });
 
   MatchFinder finder;
   t.registerMatchers(&finder);
   finder.matchAST(Ctx);
 
+  if (err) {
+    ps_ctx.error =
+        CreateRuntimeError(llvm::formatv("Error during transformation: {0}", llvm::fmt_consume(std::move(err))));
+    ps_ctx.whats_next = WhatsNext::MoveToNextFile;
+    return;
+  }
+
   for (const auto &change : changes) {
     for (const auto &r : change.getReplacements()) {
-      if (auto err = pa_ctx.replacements.add(r)) {
-        llvm::reportFatalInternalError(
-            llvm::formatv("Failed to add replacement: {0}", llvm::fmt_consume(std::move(err))));
+      if (auto err = ps_ctx.replacements.add(r)) {
+        ps_ctx.error = CreateRuntimeError(llvm::formatv("Add replacement conflict: {0}", err));
+        ps_ctx.whats_next = WhatsNext::MoveToNextFile;
+        return;
       }
     }
   }
 
-  // this pass should only be executed once!
-  pa_ctx.run_result = RunResult::Success;
+  ps_ctx.whats_next = WhatsNext::MoveToNextPass;
 }
 } // namespace pancake::pass_process_continue_in_for_loops
 
@@ -236,33 +255,44 @@ auto MakeRule() -> RewriteRule {
 
 auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
   llvm::SmallVector<AtomicChange, 64> changes;
-  auto t = Transformer(MakeRule(), [&changes](llvm::Expected<llvm::MutableArrayRef<AtomicChange>> c) -> void {
+  llvm::Error err = llvm::Error::success();
+  auto t = Transformer(MakeRule(), [&](llvm::Expected<llvm::MutableArrayRef<AtomicChange>> c) -> void {
     if (c)
       changes.insert(changes.end(), c->begin(), c->end());
     else
-      llvm::consumeError(c.takeError());
+      err = c.takeError();
   });
 
   MatchFinder finder;
   t.registerMatchers(&finder);
   finder.matchAST(Ctx);
 
-  bool add_error_occurred = false;
+  if (err) {
+    ps_ctx.error =
+        CreateRuntimeError(llvm::formatv("Error during transformation: {0}", llvm::fmt_consume(std::move(err))));
+    ps_ctx.whats_next = WhatsNext::MoveToNextFile;
+    return;
+  }
+
+  int errors = 0;
   for (const auto &change : changes) {
     for (const auto &r : change.getReplacements()) {
-      if (auto err = pa_ctx.replacements.add(r)) {
+      if (auto err = ps_ctx.replacements.add(r)) {
         llvm::consumeError(std::move(err));
-        llvm::errs() << llvm::formatv("{0} Add replacement conflict, retrying next pass...\n", LogBegin(pa_ctx));
-        add_error_occurred = true;
+        errors++;
       }
     }
   }
 
-  pa_ctx.run_result = RunResult::RepeatPass;
-  if (!add_error_occurred && changes.empty()) {
-    // All edits successfully added; no need to repeat this pass
-    pa_ctx.run_result = RunResult::Success;
+  if (errors == 0 && changes.empty()) {
+    ps_ctx.whats_next = WhatsNext::MoveToNextPass;
+    return;
   }
+  if (errors > 0) {
+    PrintLogBegin(llvm::outs(), ps_ctx);
+    llvm::outs() << llvm::formatv("Couldn't add {0} replacement{1}\n", errors, errors != 1 ? "s" : "");
+  }
+  ps_ctx.whats_next = WhatsNext::RepeatPass;
 }
 } // namespace pancake::pass_for_to_while
 
@@ -337,28 +367,36 @@ auto MakeRule() -> RewriteRule {
 
 auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
   llvm::SmallVector<AtomicChange, 64> changes;
-  auto t = Transformer(MakeRule(), [&changes](llvm::Expected<llvm::MutableArrayRef<AtomicChange>> c) -> void {
+  llvm::Error err = llvm::Error::success();
+  auto t = Transformer(MakeRule(), [&](llvm::Expected<llvm::MutableArrayRef<AtomicChange>> c) -> void {
     if (c)
       changes.insert(changes.end(), c->begin(), c->end());
     else
-      llvm::consumeError(c.takeError());
+      err = c.takeError();
   });
 
   MatchFinder finder;
   t.registerMatchers(&finder);
   finder.matchAST(Ctx);
 
+  if (err) {
+    ps_ctx.error =
+        CreateRuntimeError(llvm::formatv("Error during transformation: {0}", llvm::fmt_consume(std::move(err))));
+    ps_ctx.whats_next = WhatsNext::MoveToNextFile;
+    return;
+  }
+
   for (const auto &change : changes) {
     for (const auto &r : change.getReplacements()) {
-      if (auto err = pa_ctx.replacements.add(r)) {
-        llvm::reportFatalInternalError(
-            llvm::formatv("Failed to add replacement: {0}", llvm::fmt_consume(std::move(err))));
+      if (auto err = ps_ctx.replacements.add(r)) {
+        ps_ctx.error = CreateRuntimeError(llvm::formatv("Add replacement conflict: {0}", err));
+        ps_ctx.whats_next = WhatsNext::MoveToNextFile;
+        return;
       }
     }
   }
 
-  // this pass should only be executed once!
-  pa_ctx.run_result = RunResult::Success;
+  ps_ctx.whats_next = WhatsNext::MoveToNextPass;
 }
 } // namespace pancake::pass_process_continue_in_do_while_loops
 
@@ -405,32 +443,43 @@ auto MakeRule() -> RewriteRule {
 
 auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
   llvm::SmallVector<AtomicChange, 64> changes;
-  auto t = Transformer(MakeRule(), [&changes](llvm::Expected<llvm::MutableArrayRef<AtomicChange>> c) -> void {
+  llvm::Error err = llvm::Error::success();
+  auto t = Transformer(MakeRule(), [&](llvm::Expected<llvm::MutableArrayRef<AtomicChange>> c) -> void {
     if (c)
       changes.insert(changes.end(), c->begin(), c->end());
     else
-      llvm::consumeError(c.takeError());
+      err = c.takeError();
   });
 
   MatchFinder finder;
   t.registerMatchers(&finder);
   finder.matchAST(Ctx);
 
-  bool add_error_occurred = false;
+  if (err) {
+    ps_ctx.error =
+        CreateRuntimeError(llvm::formatv("Error during transformation: {0}", llvm::fmt_consume(std::move(err))));
+    ps_ctx.whats_next = WhatsNext::MoveToNextFile;
+    return;
+  }
+
+  int errors = 0;
   for (const auto &change : changes) {
     for (const auto &r : change.getReplacements()) {
-      if (auto err = pa_ctx.replacements.add(r)) {
+      if (auto err = ps_ctx.replacements.add(r)) {
         llvm::consumeError(std::move(err));
-        llvm::errs() << llvm::formatv("{0} Add replacement conflict, retrying next pass...\n", LogBegin(pa_ctx));
-        add_error_occurred = true;
+        errors++;
       }
     }
   }
 
-  pa_ctx.run_result = RunResult::RepeatPass;
-  if (!add_error_occurred && changes.empty()) {
-    // All edits successfully added; no need to repeat this pass
-    pa_ctx.run_result = RunResult::Success;
+  if (errors == 0 && changes.empty()) {
+    ps_ctx.whats_next = WhatsNext::MoveToNextPass;
+    return;
   }
+  if (errors > 0) {
+    PrintLogBegin(llvm::outs(), ps_ctx);
+    llvm::outs() << llvm::formatv("Couldn't add {0} replacement{1}\n", errors, errors != 1 ? "s" : "");
+  }
+  ps_ctx.whats_next = WhatsNext::RepeatPass;
 }
 }; // namespace pancake::pass_do_while_to_while

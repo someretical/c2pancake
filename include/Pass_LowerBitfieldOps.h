@@ -10,13 +10,9 @@ public:
   void HandleTranslationUnit(clang::ASTContext &Ctx) override;
 };
 
-class Action : public PipelineAction<Consumer> {
+class Action : public PipelineStage<Consumer> {
 public:
-  explicit Action(PipelineActionCtx &ctx) : PipelineAction<Consumer>(ctx) {
-    ctx.action_name = "LowerBitfieldOps";
-    ctx.failure_behaviour = FailureBehaviour::MoveToNextPass;
-    ctx.action_type = PipelineActionType::Rewriter;
-  }
+  explicit Action(PipelineStageCtx &ctx) : PipelineStage<Consumer>(ctx) { ctx.action_name = "LowerBitfieldOps"; }
 };
 } // namespace pancake::pass_lower_bitfield_ops
 
@@ -27,12 +23,10 @@ public:
   void HandleTranslationUnit(clang::ASTContext &Ctx) override;
 };
 
-class Action : public PipelineAction<Consumer> {
+class Action : public PipelineStage<Consumer> {
 public:
-  explicit Action(PipelineActionCtx &ctx) : PipelineAction<Consumer>(ctx) {
+  explicit Action(PipelineStageCtx &ctx) : PipelineStage<Consumer>(ctx) {
     ctx.action_name = "SimplifyAddressOfFollowedByDereference";
-    ctx.failure_behaviour = FailureBehaviour::RepeatPass;
-    ctx.action_type = PipelineActionType::Rewriter;
   }
 };
 } // namespace pancake::pass_simplify_addrof_deref

@@ -111,13 +111,9 @@ public:
   void HandleTranslationUnit(clang::ASTContext &Ctx) override;
 };
 
-class Action : public PipelineAction<Consumer> {
+class Action : public PipelineStage<Consumer> {
 public:
-  explicit Action(PipelineActionCtx &ctx) : PipelineAction<Consumer>(ctx) {
-    ctx.action_name = "HoistArraysAndAddresses";
-    ctx.failure_behaviour = FailureBehaviour::MoveToNextFile;
-    ctx.action_type = PipelineActionType::Rewriter;
-  }
+  explicit Action(PipelineStageCtx &ctx) : PipelineStage<Consumer>(ctx) { ctx.action_name = "HoistArraysAndAddresses"; }
 };
 
 } // namespace pancake::pass_hoist_arrays_and_addresses

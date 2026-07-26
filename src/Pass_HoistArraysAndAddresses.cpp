@@ -340,8 +340,8 @@ void PassRename::AddReplacement(clang::SourceRange range, llvm::StringRef text) 
   // Expand to account for macro expansions so we replace the spelling loc.
   auto char_range = clang::CharSourceRange::getTokenRange(range);
   clang::tooling::Replacement const repl(SM, char_range, text);
-  if (auto err = Repls.add(repl)) {
-    llvm::errs() << llvm::formatv("Replacement conflict: {0}\n", llvm::fmt_consume(std::move(err)));
+  if (auto error = Repls.add(repl)) {
+    llvm::errs() << llvm::formatv("Replacement conflict: {0}\n", llvm::fmt_consume(std::move(error)));
     has_replacement_error = true;
   }
 }
@@ -415,20 +415,20 @@ void Consumer::HandleTranslationUnit(clang::ASTContext &Ctx) {
     // An insertion is modelled as a zero-length replacement at the offset.
     unsigned const insert_offset = sm.getFileOffset(first_func_loc);
     const clang::tooling::Replacement ins(sm.getFilename(first_func_loc), insert_offset, 0, global_block.str());
-    if (auto err = pa_ctx.replacements.add(ins)) {
-      llvm::errs() << llvm::formatv("{0} Replacement conflict\n", LogBegin(pa_ctx));
+    if (auto err = ps_ctx.replacements.add(ins)) {
+      PrintLogBegin(llvm::errs(), ps_ctx);
+      llvm::errs() << llvm::formatv("Replacement conflict\n");
 
       insertion_failed = true;
     }
   }
 
   // collect DeclStmt and DeclRefExpr replacements
-  PassRename crv(pa_ctx.replacements, Ctx, info);
+  PassRename crv(ps_ctx.replacements, Ctx, info);
   crv.TraverseDecl(tu);
 
   if (insertion_failed || crv.has_replacement_error) {
-    llvm::errs() << llvm::formatv("{0} Aborting due to replacement conflicts, no output written for \n",
-                                  LogBegin(pa_ctx));
-    return;
+    PrintLogBegin(llvm::errs(), ps_ctx);
+    llvm::errs() << llvm::formatv("Aborting due to replacement conflicts, no output written\n");
   }
 }

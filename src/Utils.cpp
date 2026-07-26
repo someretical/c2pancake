@@ -18,54 +18,47 @@
 #include <vector>
 
 namespace pancake {
-auto LogBegin(const PipelineActionCtx &ctx) -> std::string {
-  auto action_type = ctx.action_type.value_or(PipelineActionType::None);
-  const char *action_type_str{};
-  switch (action_type) {
-  case PipelineActionType::Rewriter:
-    action_type_str = "Rewriter";
-    break;
-  case PipelineActionType::Analyser:
-    action_type_str = "Analyser";
-    break;
-  default:
-    action_type_str = "UnknownActionType";
-    break;
-  }
-  return llvm::formatv("[c2pancake] {0} -> {1}: {2}(i={4:02}) {3}:", ctx.current_file, ctx.next_file, action_type_str,
-                       ctx.action_name.value_or("UnknownAction"), ctx.major_pass_number);
+auto PrintLogBegin(llvm::raw_ostream &os, const PipelineStageCtx &ctx) -> void {
+  const auto action_name = ctx.action_name ? llvm::StringRef(*ctx.action_name) : llvm::StringRef("UnknownAction");
+  os << llvm::formatv("[c2pancake] [{0:02}-{1:02}] {2}: {3}: ", ctx.major_pass_number, ctx.minor_pass_number,
+                      ctx.current_file, action_name);
+}
+
+auto PrintLogBeginShort(llvm::raw_ostream &os, const llvm::StringRef in_file) -> void {
+  os << llvm::formatv("[c2pancake] {0}: ", in_file);
 }
 
 auto PrintSourceText(llvm::raw_string_ostream &os, const clang::CharSourceRange &range, const clang::ASTContext &ctx)
-    -> void {
+    -> llvm::Error {
   const auto &sm = ctx.getSourceManager();
   const auto &lang_opts = ctx.getLangOpts();
 
   if (range.isInvalid()) {
-    llvm::errs() << "Invalid token range for source range: ";
-    llvm::errs() << range.getBegin().printToString(sm) << " - " << range.getEnd().printToString(sm) << "\n";
-    llvm_unreachable("FATAL");
+    return CreateRuntimeError(
+        std::move(llvm::formatv("Invalid token range for source range: {0} - {1}", range.getBegin().printToString(sm),
+                                range.getEnd().printToString(sm))));
   }
 
   const auto file_range = clang::Lexer::makeFileCharRange(range, sm, lang_opts);
   if (file_range.isInvalid()) {
-    llvm::errs() << "Invalid file range for source range: ";
-    llvm::errs() << range.getBegin().printToString(sm) << " - " << range.getEnd().printToString(sm) << "\n";
-    llvm_unreachable("FATAL");
-  } else {
-    os << clang::Lexer::getSourceText(file_range, sm, lang_opts);
-  }
+    return CreateRuntimeError(
+        std::move(llvm::formatv("Invalid file range for source range: {0} - {1}", range.getBegin().printToString(sm),
+                                range.getEnd().printToString(sm))));
+  }     os << clang::Lexer::getSourceText(file_range, sm, lang_opts);
+    return llvm::Error::success();
+ 
 }
 
-auto PrintSourceText(llvm::raw_string_ostream &os, const clang::Expr *expr, const clang::ASTContext &ctx) -> void {
+auto PrintSourceText(llvm::raw_string_ostream &os, const clang::Expr *expr, const clang::ASTContext &ctx)
+    -> llvm::Error {
   const auto &sm = ctx.getSourceManager();
   const auto &lang_opts = ctx.getLangOpts();
 
   const auto range = clang::CharSourceRange::getTokenRange(expr->getSourceRange());
   if (range.isInvalid()) {
-    llvm::errs() << "Invalid token range for source range: ";
-    expr->dump();
-    llvm_unreachable("FATAL");
+    return CreateRuntimeError(
+        std::move(llvm::formatv("Invalid token range for source range: {0} - {1}", range.getBegin().printToString(sm),
+                                range.getEnd().printToString(sm))));
   }
 
   const auto file_range = clang::Lexer::makeFileCharRange(range, sm, lang_opts);
@@ -75,17 +68,19 @@ auto PrintSourceText(llvm::raw_string_ostream &os, const clang::Expr *expr, cons
   } else {
     os << clang::Lexer::getSourceText(file_range, sm, lang_opts);
   }
+  return llvm::Error::success();
 }
 
-auto PrintSourceText(llvm::raw_string_ostream &os, const clang::Stmt *stmt, const clang::ASTContext &ctx) -> void {
+auto PrintSourceText(llvm::raw_string_ostream &os, const clang::Stmt *stmt, const clang::ASTContext &ctx)
+    -> llvm::Error {
   const auto &sm = ctx.getSourceManager();
   const auto &lang_opts = ctx.getLangOpts();
 
   const auto range = clang::CharSourceRange::getTokenRange(stmt->getSourceRange());
   if (range.isInvalid()) {
-    llvm::errs() << "Invalid token range for source range: ";
-    stmt->dump();
-    llvm_unreachable("FATAL");
+    return CreateRuntimeError(
+        std::move(llvm::formatv("Invalid token range for source range: {0} - {1}", range.getBegin().printToString(sm),
+                                range.getEnd().printToString(sm))));
   }
 
   const auto file_range = clang::Lexer::makeFileCharRange(range, sm, lang_opts);
@@ -95,18 +90,19 @@ auto PrintSourceText(llvm::raw_string_ostream &os, const clang::Stmt *stmt, cons
   } else {
     os << clang::Lexer::getSourceText(file_range, sm, lang_opts);
   }
+  return llvm::Error::success();
 }
 
 auto PrintSourceText(llvm::raw_string_ostream &os, const clang::TagDecl *tag_decl, const clang::ASTContext &ctx)
-    -> void {
+    -> llvm::Error {
   const auto &sm = ctx.getSourceManager();
   const auto &lang_opts = ctx.getLangOpts();
 
   const auto range = clang::CharSourceRange::getTokenRange(tag_decl->getSourceRange());
   if (range.isInvalid()) {
-    llvm::errs() << "Invalid token range for source range: ";
-    tag_decl->dump();
-    llvm_unreachable("FATAL");
+    return CreateRuntimeError(
+        std::move(llvm::formatv("Invalid token range for source range: {0} - {1}", range.getBegin().printToString(sm),
+                                range.getEnd().printToString(sm))));
   }
 
   const auto file_range = clang::Lexer::makeFileCharRange(range, sm, lang_opts);
@@ -116,6 +112,7 @@ auto PrintSourceText(llvm::raw_string_ostream &os, const clang::TagDecl *tag_dec
   } else {
     os << clang::Lexer::getSourceText(file_range, sm, lang_opts);
   }
+  return llvm::Error::success();
 }
 
 auto StmtNeedsSemi(const clang::Stmt *s) -> bool {

@@ -17,15 +17,11 @@
 #include <clang/Tooling/Inclusions/HeaderIncludes.h>
 #include <clang/Tooling/Inclusions/IncludeStyle.h>
 #include <llvm/ADT/SmallVector.h>
-#include <llvm/ADT/StringExtras.h>
 #include <llvm/ADT/StringRef.h>
 #include <llvm/Support/Error.h>
 #include <llvm/Support/ErrorHandling.h>
 #include <llvm/Support/FormatVariadic.h>
 #include <llvm/Support/raw_ostream.h>
-
-#include <cassert>
-#include <utility>
 
 using namespace clang;
 using namespace clang::tooling;
@@ -35,7 +31,12 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
   const tooling::IncludeStyle style{};
   const auto &sm = Ctx.getSourceManager();
   const auto *file_entry = sm.getFileEntryForID(sm.getMainFileID());
-  assert(file_entry != nullptr && "Main file entry should not be null");
+  if (file_entry == nullptr) {
+    ps_ctx.error = CreateRuntimeError(llvm::formatv("Main file entry is null"));
+    ps_ctx.whats_next = WhatsNext::MoveToNextFile;
+    return;
+  }
+
   const auto &file_name = file_entry->tryGetRealPathName();
   const auto source_text = sm.getBufferOrFake(sm.getMainFileID()).getBuffer();
   const HeaderIncludes includes(file_name, source_text, style);
@@ -50,14 +51,13 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
     // the header already exists
   }
 
-  bool add_error_occurred = false;
   for (const auto &r : replacements) {
-    if (auto err = pa_ctx.replacements.add(r)) {
-      llvm::consumeError(std::move(err));
-      llvm::errs() << llvm::formatv("{0} Add replacement conflict, retrying next pass...\n", LogBegin(pa_ctx));
-      add_error_occurred = true;
+    if (auto err = ps_ctx.replacements.add(r)) {
+      ps_ctx.error = CreateRuntimeError(llvm::formatv("Add replacement conflict: {0}", err));
+      ps_ctx.whats_next = WhatsNext::MoveToNextFile;
+      return;
     }
   }
-  assert(!add_error_occurred && "Failed to add header replacement");
+  ps_ctx.whats_next = WhatsNext::MoveToNextPass;
 }
 } // namespace pancake::pass_inject_headers

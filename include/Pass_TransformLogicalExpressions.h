@@ -3,6 +3,8 @@
 
 #include "Pipeline.h"
 
+#include <clang/Basic/LLVM.h>
+
 #include <cstdint>
 #include <functional>
 
@@ -17,12 +19,10 @@ public:
   void HandleTranslationUnit(clang::ASTContext &Ctx) override;
 };
 
-class Action : public PipelineAction<Consumer> {
+class Action : public PipelineStage<Consumer> {
 public:
-  explicit Action(PipelineActionCtx &ctx) : PipelineAction<Consumer>(ctx) {
+  explicit Action(PipelineStageCtx &ctx) : PipelineStage<Consumer>(ctx) {
     ctx.action_name = "HoistLogicalSideEffectExpressions";
-    ctx.failure_behaviour = FailureBehaviour::RepeatPass;
-    ctx.action_type = PipelineActionType::Rewriter;
   }
 };
 } // namespace pancake::pass_hoist_condition_expressions
@@ -34,13 +34,9 @@ public:
   void HandleTranslationUnit(clang::ASTContext &Ctx) override;
 };
 
-class Action : public PipelineAction<Consumer> {
+class Action : public PipelineStage<Consumer> {
 public:
-  explicit Action(PipelineActionCtx &ctx) : PipelineAction<Consumer>(ctx) {
-    ctx.action_name = "RewriteArrayIndexing";
-    ctx.failure_behaviour = FailureBehaviour::RepeatPass;
-    ctx.action_type = PipelineActionType::Rewriter;
-  }
+  explicit Action(PipelineStageCtx &ctx) : PipelineStage<Consumer>(ctx) { ctx.action_name = "RewriteArrayIndexing"; }
 };
 } // namespace pancake::pass_rewrite_array_indexing
 
@@ -51,13 +47,9 @@ public:
   void HandleTranslationUnit(clang::ASTContext &Ctx) override;
 };
 
-class Action : public PipelineAction<Consumer> {
+class Action : public PipelineStage<Consumer> {
 public:
-  explicit Action(PipelineActionCtx &ctx) : PipelineAction<Consumer>(ctx) {
-    ctx.action_name = "RewriteStructStabs";
-    ctx.failure_behaviour = FailureBehaviour::RepeatPass;
-    ctx.action_type = PipelineActionType::Rewriter;
-  }
+  explicit Action(PipelineStageCtx &ctx) : PipelineStage<Consumer>(ctx) { ctx.action_name = "RewriteStructStabs"; }
 };
 } // namespace pancake::pass_rewrite_struct_stabs
 
@@ -72,13 +64,9 @@ public:
   void HandleTranslationUnit(clang::ASTContext &Ctx) override;
 };
 
-class Action : public PipelineAction<Consumer> {
+class Action : public PipelineStage<Consumer> {
 public:
-  explicit Action(PipelineActionCtx &ctx) : PipelineAction<Consumer>(ctx) {
-    ctx.action_name = "LowerNestedExpressions";
-    ctx.failure_behaviour = FailureBehaviour::RepeatPass;
-    ctx.action_type = PipelineActionType::Rewriter;
-  }
+  explicit Action(PipelineStageCtx &ctx) : PipelineStage<Consumer>(ctx) { ctx.action_name = "LowerNestedExpressions"; }
 };
 
 struct BuiltExpr {
@@ -133,7 +121,7 @@ struct BuildExprCtx {
         assigned_to(std::move(assigned_to)) {}
 };
 
-auto GetUsage(const clang::Expr *expr) -> Usage;
+auto GetUsage(const clang::ASTContext &ctx, const clang::Expr *expr) -> llvm::Expected<Usage>;
 } // namespace pancake::pass_lower_nested_expressions
 
 namespace pancake::pass_simplify_double_negation {
@@ -143,13 +131,9 @@ public:
   void HandleTranslationUnit(clang::ASTContext &Ctx) override;
 };
 
-class Action : public PipelineAction<Consumer> {
+class Action : public PipelineStage<Consumer> {
 public:
-  explicit Action(PipelineActionCtx &ctx) : PipelineAction<Consumer>(ctx) {
-    ctx.action_name = "SimplifyDoubleNegation";
-    ctx.failure_behaviour = FailureBehaviour::RepeatPass;
-    ctx.action_type = PipelineActionType::Rewriter;
-  }
+  explicit Action(PipelineStageCtx &ctx) : PipelineStage<Consumer>(ctx) { ctx.action_name = "SimplifyDoubleNegation"; }
 };
 } // namespace pancake::pass_simplify_double_negation
 

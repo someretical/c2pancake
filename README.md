@@ -17,6 +17,7 @@ c2pancake options:
 
   --extra-arg=<string>        - Additional argument to append to the compiler command line
   --extra-arg-before=<string> - Additional argument to prepend to the compiler command line
+  --max-pass-retries=<ulong>  - Maximum number of retries for a pass before moving to the next pass (default: 10)
   -p <string>                 - Build path
 
 -p <build-path> is used to read a compile command database.

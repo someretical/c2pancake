@@ -10,13 +10,9 @@ public:
   void HandleTranslationUnit(clang::ASTContext &Ctx) override;
 };
 
-class Action : public PipelineAction<Consumer> {
+class Action : public PipelineStage<Consumer> {
 public:
-  explicit Action(PipelineActionCtx &ctx) : PipelineAction<Consumer>(ctx) {
-    ctx.action_name = "InjectHeaders";
-    ctx.failure_behaviour = FailureBehaviour::MoveToNextPass;
-    ctx.action_type = PipelineActionType::Rewriter;
-  }
+  explicit Action(PipelineStageCtx &ctx) : PipelineStage<Consumer>(ctx) { ctx.action_name = "InjectHeaders"; }
 };
 } // namespace pancake::pass_inject_headers
 

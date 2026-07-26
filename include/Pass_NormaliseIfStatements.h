@@ -10,13 +10,9 @@ public:
   void HandleTranslationUnit(clang::ASTContext &Ctx) override;
 };
 
-class Action : public PipelineAction<Consumer> {
+class Action : public PipelineStage<Consumer> {
 public:
-  explicit Action(PipelineActionCtx &ctx) : PipelineAction<Consumer>(ctx) {
-    ctx.action_name = "NormaliseIfStatements";
-    ctx.failure_behaviour = FailureBehaviour::RepeatPass;
-    ctx.action_type = PipelineActionType::Rewriter;
-  }
+  explicit Action(PipelineStageCtx &ctx) : PipelineStage<Consumer>(ctx) { ctx.action_name = "NormaliseIfStatements"; }
 };
 } // namespace pancake::pass_normalise_if_statements
 

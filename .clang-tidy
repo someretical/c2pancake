@@ -25,7 +25,9 @@ Checks: >
   -cppcoreguidelines-avoid-const-or-ref-data-members,
   -readability-function-cognitive-complexity,
   -bugprone-throwing-static-initialization,-cert-err58-cpp,
-  -bugprone-derived-method-shadowing-base-method
+  -bugprone-derived-method-shadowing-base-method,
+  -cppcoreguidelines-avoid-non-const-global-variables,
+  -cppcoreguidelines-interfaces-global-init
 
 WarningsAsErrors: '*'
 SystemHeaders: false

@@ -3,118 +3,166 @@
 
 #include <clang/Tooling/Core/Replacement.h>
 #include <clang/Tooling/Tooling.h>
+#include <llvm-22/llvm/Support/Error.h>
 #include <llvm/ADT/SmallVector.h>
+#include <llvm/ADT/StringExtras.h>
+#include <llvm/Support/CommandLine.h>
 #include <llvm/Support/ErrorHandling.h>
+#include <llvm/Support/FileSystem.h>
 #include <llvm/Support/FormatVariadic.h>
 #include <llvm/Support/raw_ostream.h>
 
 #include <cstddef>
+#include <ranges>
 #include <string>
+#include <system_error>
 #include <utility>
 #include <vector>
 
 using namespace pancake;
+
+extern llvm::cl::opt<size_t> max_pass_retries;
 
 auto Pipeline::Run() -> int {
   const auto &initial_files = options_parser.getSourcePathList();
 
   for (const auto &initial_file : initial_files) {
     std::string current_suffix{};
-    bool move_onto_next_file = false;
 
-    llvm::outs() << llvm::formatv("{0} Starting processing\n", LogBeginShort(initial_file));
+    PrintLogBeginShort(llvm::outs(), initial_file);
+    llvm::outs() << "Starting processing\n";
 
     for (size_t j = 0; j < factories.size(); ++j) {
       auto &factory = factories.at(j);
-      for (size_t k = 0; k < 10; ++k) {
+      for (size_t k = 0; k < max_pass_retries; ++k) {
         std::string next_suffix = llvm::formatv(".{0}-{1}-c2pnk.c", j, k);
-        StagedCompilationDatabase const db(options_parser.getCompilations(), current_suffix);
-        std::string const current_file = llvm::formatv("{0}{1}", initial_file, current_suffix);
-        std::string const next_file = llvm::formatv("{0}{1}", initial_file, next_suffix);
+        const StagedCompilationDatabase db(options_parser.getCompilations(), current_suffix);
+        const std::string current_file = llvm::formatv("{0}{1}", initial_file, current_suffix);
+        const std::string next_file = llvm::formatv("{0}{1}", initial_file, next_suffix);
         clang::tooling::ClangTool tool(db, llvm::SmallVector<std::string, 1>{current_file});
-
-        clang::tooling::Replacements replacements;
-        PipelineActionCtx ctx(j, k, replacements, current_file, current_suffix, next_file, next_suffix);
-        auto action = factory->BetterCreate(ctx);
-        if (!ctx.failure_behaviour.has_value()) {
-          llvm_unreachable("Action did not set a failure behaviour");
-        }
-        if (!ctx.action_name.has_value()) {
-          llvm_unreachable("Action did not set an action name");
-        }
-        if (!ctx.action_type.has_value()) {
-          llvm_unreachable("Action did not set an action type");
-        }
 
         auto commands = db.getCompileCommands(current_file);
         if (commands.size() > 1) {
-          llvm::outs() << llvm::formatv("{0} WARNING: {1} (>1) compile commands found\n", LogBegin(ctx),
+          PrintLogBeginShort(llvm::errs(), current_file);
+          llvm::errs() << llvm::formatv("WARNING: {0} (>1) compile commands found, only executing the first one\n",
                                         commands.size());
+          for (const auto [i, cmd] : std::views::enumerate(commands)) {
+            llvm::errs() << llvm::formatv("    {0}: {1}\n", i, llvm::join(cmd.CommandLine, " "));
+          }
         }
-        for (auto &cmd : commands) {
-          clang::tooling::ToolInvocation invocation(cmd.CommandLine, std::move(action), &tool.getFiles());
-          if (!invocation.run()) {
-            // abnormal failure
-            llvm::errs() << llvm::formatv("{0} ERROR: {1} failed.\n", LogBegin(ctx), ctx.action_name.value());
+
+        const auto &command = commands.at(0);
+        clang::tooling::Replacements replacements;
+        PipelineStageCtx ctx(j, k, replacements, current_file, current_suffix, next_file, next_suffix);
+        auto action = factory->BetterCreate(ctx);
+        if (!ctx.action_name.has_value()) {
+          PrintLogBegin(llvm::errs(), ctx);
+          llvm::errs() << llvm::formatv("FATAL: Action did not set an action name\n");
+          return 1;
+        }
+
+        clang::tooling::ToolInvocation invocation(command.CommandLine, std::move(action), &tool.getFiles());
+        if (!invocation.run()) {
+          // abnormal failure
+          PrintLogBegin(llvm::errs(), ctx);
+          llvm::errs() << llvm::formatv("FATAL: ToolInvocation.run() failed\n");
+          return 1;
+        };
+
+        if (!ctx.whats_next.has_value()) {
+          PrintLogBegin(llvm::errs(), ctx);
+          llvm::errs() << llvm::formatv("FATAL: Action did not set what's next\n");
+          return 1;
+        }
+
+        if (ctx.end_src_file_action_error) {
+          PrintLogBegin(llvm::errs(), ctx);
+          llvm::errs() << llvm::formatv("FATAL: Tool invocation {0} failed: {1}\n", ctx.action_name.value(),
+                                        ctx.end_src_file_action_error);
+          return 1;
+        }
+
+        if (ctx.error) {
+          // runtime error
+          PrintLogBegin(llvm::errs(), ctx);
+          llvm::errs() << ctx.error;
+          return 1;
+        }
+
+        switch (ctx.whats_next.value()) {
+        case WhatsNext::MoveToNextFile: {
+          PrintLogBegin(llvm::outs(), ctx);
+          llvm::outs() << llvm::formatv("Move to next file requested\n");
+          goto move_to_next_file;
+        }
+        case WhatsNext::MoveToNextPass: {
+          PrintLogBegin(llvm::outs(), ctx);
+          llvm::outs() << llvm::formatv("Move to next pass requested\n");
+          if (ctx.file_modified) {
+            current_suffix = next_suffix;
+          }
+          goto move_to_next_pass;
+        }
+        case WhatsNext::RepeatPass: {
+          PrintLogBegin(llvm::outs(), ctx);
+          llvm::outs() << llvm::formatv("Repeat pass requested\n");
+
+          if (!ctx.file_modified) {
+            PrintLogBegin(llvm::errs(), ctx);
+            llvm::errs() << llvm::formatv("FATAL: Repeat pass requested but no modifications were made to the source "
+                                          "file, this will result in an infinite loop\n");
             return 1;
-          };
+          }
+
+          current_suffix = next_suffix;
+
+          if (k + 1 >= max_pass_retries) {
+            PrintLogBegin(llvm::errs(), ctx);
+            llvm::errs() << llvm::formatv(
+                "WARNING: Maximum number of passes ({0}) reached, consider increasing the limit\n", max_pass_retries);
+          }
+          continue;
+        }
+        case WhatsNext::Abort: {
+          PrintLogBegin(llvm::errs(), ctx);
+          llvm::errs() << llvm::formatv("FATAL: Abort requested\n");
+          return 1;
+        }
+        default: {
+          PrintLogBegin(llvm::errs(), ctx);
+          llvm::errs() << llvm::formatv("FATAL: Unknown WhatsNext value: {0}\n",
+                                        std::to_underlying(ctx.whats_next.value()));
+          return 1;
+        }
         }
 
-        llvm::outs() << llvm::formatv("{0} {1} change(s) applied\n", LogBegin(ctx), ctx.replacements.size());
-
-        auto action_type = ctx.action_type.value();
-        if (action_type == PipelineActionType::Rewriter) {
-          if (ctx.run_result == RunResult::Success) {
-            llvm::outs() << llvm::formatv("{0} Complete after {2} iteration(s)\n", LogBegin(ctx),
-                                          ctx.action_name.value(), k + 1);
-            current_suffix = next_suffix;
-            break;
-          }
-
-          if (ctx.run_result == RunResult::Fail) {
-            llvm::errs() << llvm::formatv("{0} Failed after {2} iteration(s)\n", LogBegin(ctx), ctx.action_name.value(),
-                                          k + 1);
-            move_onto_next_file = true;
-            break;
-          }
-
-          if (ctx.failure_behaviour == FailureBehaviour::RepeatPass && ctx.run_result == RunResult::RepeatPass) {
-            current_suffix = next_suffix;
-            // run pass again
-          } else {
-
-            llvm::outs() << llvm::formatv("{0} Unknown state, ctx.failure_behaviour: {1}, ctx.failure_mode: {2}\n",
-                                          LogBegin(ctx), std::to_underlying(ctx.failure_behaviour.value()),
-                                          std::to_underlying(ctx.run_result));
-            llvm_unreachable("");
-          }
-        } else if (action_type == PipelineActionType::Analyser) {
-          if (ctx.run_result == RunResult::Success) {
-            llvm::outs() << llvm::formatv("{0} Analysis successful\n", LogBegin(ctx), ctx.action_name.value());
-            break;
-          }
-
-          if (ctx.run_result == RunResult::Fail) {
-            llvm::errs() << llvm::formatv("{0} Analysis failed\n", LogBegin(ctx), ctx.action_name.value());
-            move_onto_next_file = true;
-            break;
-          }
-
-          llvm_unreachable("Analyser passes should not set failure_mode to RepeatPass");
-        } else {
-          llvm_unreachable("Unknown PipelineActionType");
+        // NOLINTNEXTLINE(readability-simplify-boolean-expr)
+        if (false) {
+        move_to_next_pass:
+          break;
         }
       }
 
-      if (move_onto_next_file) {
+      // NOLINTNEXTLINE(readability-simplify-boolean-expr)
+      if (false) {
+      move_to_next_file:
         break;
       }
     }
 
-    llvm::outs() << llvm::formatv("{0} All passes complete, output written to {1}{2}\n", LogBeginShort(initial_file),
-                                  initial_file, current_suffix);
+    const std::string final_file = llvm::formatv("{0}.c2pnk.c", initial_file);
+    if (std::error_code const ec =
+            llvm::sys::fs::copy_file(llvm::Twine(initial_file + current_suffix), llvm::Twine(final_file))) {
+      PrintLogBeginShort(llvm::errs(), initial_file);
+      llvm::errs() << llvm::formatv("FATAL: Failed to copy {0} to {1}: {2}\n", initial_file + current_suffix,
+                                    final_file, ec.message());
+      return 1;
+    }
+
+    PrintLogBeginShort(llvm::outs(), initial_file);
+    llvm::outs() << llvm::formatv("All passes complete, final output at {0}\n", final_file);
   }
 
-  llvm::outs() << "[c2pancake] All passes completed successfully\n";
+  llvm::outs() << "[c2pancake] All files completed\n";
   return 0;
 }

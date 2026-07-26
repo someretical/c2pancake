@@ -37,10 +37,10 @@
 #include <llvm/Support/Casting.h>
 #include <llvm/Support/Error.h>
 #include <llvm/Support/ErrorHandling.h>
+#include <llvm/Support/FormatAdapters.h>
 #include <llvm/Support/FormatVariadic.h>
 #include <llvm/Support/raw_ostream.h>
 
-#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -60,7 +60,7 @@ namespace {
 const char *non_volatile_bitfield_helpers =
     R"(/* c2pancake generated code start: helpers for non-volatile bitfield operations */
 #include <stdint.h>
-static inline uint{0}_t __c2pnk_get_bit_u{0}(uint{0}_t value, uint{0}_t bit) {{ return ((value >> bit) & 1ULL) != 0; }
+static inline uint{0}_t __c2pnk_get_bit_u{0}(uint{0}_t value, uint{0}_t bit) {{ return ((value >> bit) & 1UL) != 0UL; }
 
 static inline void __c2pnk_set_bit(uint8_t *byte, uint{0}_t bit) {{
   uint{0}_t val = (uint{0}_t)*byte;
@@ -78,41 +78,41 @@ static inline void __c2pnk_clear_bit(uint8_t *byte, uint{0}_t bit) {{
 static void __c2pnk_set_bitfield_u{0}(uint{0}_t value, uint8_t *field, uint{0}_t lhs_bit, uint{0}_t rhs_bit) {{
   uint{0}_t width = rhs_bit - lhs_bit;
 
-  uint{0}_t i = 0;
+  uint{0}_t i = 0UL;
   while (i < width) {{
     uint{0}_t bit_index = lhs_bit + i;
-    uint8_t *byte = &field[bit_index >> 3]; // / 8
+    uint8_t *byte = &field[bit_index >> 3UL]; // / 8
 
     uint{0}_t cond = __c2pnk_get_bit_u{0}(value, i);
-    uint{0}_t index = bit_index & 7; // % 8
+    uint{0}_t index = bit_index & 7UL; // % 8
     if (cond) {{
       __c2pnk_set_bit(byte, index);
     } else {{
       __c2pnk_clear_bit(byte, index);
     }
 
-    i = i + 1;
+    i = i + 1UL;
   }
 }
 
 /* [lhs_bit, rhs_bit) */
 static uint{0}_t __c2pnk_get_bitfield_u{0}(const uint8_t *field, uint{0}_t lhs_bit, uint{0}_t rhs_bit) {{
-  uint{0}_t value = 0;
+  uint{0}_t value = 0UL;
   uint{0}_t width = rhs_bit - lhs_bit;
 
-  uint{0}_t i = 0;
+  uint{0}_t i = 0UL;
   while (i < width) {{
     uint{0}_t bit_index = lhs_bit + i;
 
-    uint{0}_t byte = (uint{0}_t)field[bit_index >> 3]; // / 8
-    uint{0}_t index = bit_index & 7;                  // % 8
-    uint{0}_t mask = (uint{0}_t)(1UL << index);
+    uint{0}_t byte = (uint{0}_t)field[bit_index >> 3UL]; // / 8
+    uint{0}_t index = bit_index & 7UL;                  // % 8
+    uint{0}_t mask = (1UL << index);
 
     if (byte & mask) {{
       value = value | (1UL << i);
     }
 
-    i = i + 1;
+    i = i + 1UL;
   }
 
   return value;
@@ -125,8 +125,8 @@ static int{0}_t __c2pnk_get_bitfield_i{0}(const uint8_t *field, uint{0}_t lhs_bi
   uint{0}_t width = rhs_bit - lhs_bit;
 
   /* manual sign-extend if the extracted field is narrower than {0} bits */
-  if (width < {0}) {{
-    uint{0}_t sign = 1UL << (width - 1);
+  if (width < {0}UL) {{
+    uint{0}_t sign = 1UL << (width - 1UL);
     return (int{0}_t)((value ^ sign) - sign);
   }
 
@@ -144,8 +144,9 @@ static void __c2pnk_set_bitfield_i{0}(int{0}_t value, uint8_t *field, uint{0}_t 
 struct WorkerData {
   ASTContext &Ctx;
   CodeGen::CodeGenModule &code_gen_module;
-  PipelineActionCtx &pa_ctx;
+  PipelineStageCtx &pa_ctx;
   llvm::SmallVector<Replacement, 64> &replacements;
+  llvm::Error error = llvm::Error::success();
   size_t tmp_var_counter = 0;
   bool need_non_volatile_bitfield_helpers = false;
 };
@@ -232,13 +233,20 @@ public:
   // https://github.com/llvm/llvm-project/blob/2078da43e25a4623cab2d0d60decddf709aaea28/clang/lib/CodeGen/CGExpr.cpp#L2334
   // We only use this function for VOLATILE bitfields since the loads/stores generated should be always 8,16,32,64
   // If this ever changes, then we're fucked because clang IR can generate arbitrary width loads/stores
-  auto BuildLoadOfBitFieldLValue(const BuildExprCtx &ctx) -> BuiltExpr {
-    assert(ctx.usage_kind == Usage::Value ||
-           ctx.usage_kind ==
-               Usage::Place); // technically can't take address of a bitfield but Place also isn't a pointer...
+  auto BuildLoadOfBitFieldLValue(const BuildExprCtx &ctx) -> Expected<BuiltExpr> {
     const MemberExpr *member_expr = cast<MemberExpr>(ctx.expr);
+    // technically can't take address of a bitfield but Place also isn't a pointer...
+    if (ctx.usage_kind != Usage::Value && ctx.usage_kind != Usage::Place) {
+      return CreateRuntimeError(std::move(llvm::formatv(
+          "\n    at {0}\nUsage kind must be Value or Place, got {0}",
+          member_expr->getExprLoc().printToString(data.Ctx.getSourceManager()), std::to_underlying(ctx.usage_kind))));
+    }
     const FieldDecl *fd = cast<FieldDecl>(member_expr->getMemberDecl());
-    assert(fd->isBitField());
+    if (!fd->isBitField()) {
+      return CreateRuntimeError(std::move(
+          llvm::formatv("\n    at {0}\nField {1} is not a bitfield",
+                        member_expr->getExprLoc().printToString(data.Ctx.getSourceManager()), fd->getNameAsString())));
+    }
 
     const CodeGen::CGBitFieldInfo &info =
         data.code_gen_module.getTypes().getCGRecordLayout(fd->getParent()).getBitFieldInfo(fd);
@@ -246,11 +254,14 @@ public:
     QualType const ft = member_expr->getType();
 
     // Build the base object subexpression (e.g. "s" for s.field, or the pointer expression for p->field)
-    BuiltExpr base_built_expr =
+    auto base_built_expr =
         BuildExpr(BuildExprCtx(member_expr->getBase(), Usage::Place, ctx.deref_force_extract, ctx.assigned_to));
+    if (auto error = base_built_expr.takeError()) {
+      return error;
+    }
     llvm::SmallVector<std::string, 4> pre_stmts;
     std::string base_addr =
-        member_expr->isArrow() ? base_built_expr.final_expr : llvm::formatv("(&{0})", base_built_expr.final_expr);
+        member_expr->isArrow() ? base_built_expr->final_expr : llvm::formatv("(&{0})", base_built_expr->final_expr);
 
     const auto is_volatile = ft.isVolatileQualified();
     const auto use_volatile =
@@ -258,7 +269,12 @@ public:
 
     const auto offset = use_volatile ? info.VolatileOffset : info.Offset;
     const auto storage_size = use_volatile ? info.VolatileStorageSize : info.StorageSize;
-    assert(storage_size <= 64 && "ggs if we ended up here it's over");
+    if (storage_size > GetPointerWidth(data.Ctx)) {
+      return CreateRuntimeError(
+          std::move(llvm::formatv("\n    at {0}\nBitfield storage size {1} exceeds pointer width {2}",
+                                  member_expr->getExprLoc().printToString(data.Ctx.getSourceManager()), storage_size,
+                                  GetPointerWidth(data.Ctx))));
+    }
     const auto storage_offset = use_volatile ? info.VolatileStorageOffset : info.StorageOffset;
 
     // Compute the storage-unit pointer, equivalent to LV.getBitFieldAddress()
@@ -272,7 +288,11 @@ public:
     std::string current_temp = load_temp;
 
     if (info.IsSigned) {
-      assert(static_cast<unsigned>(offset + info.Size) <= storage_size);
+      if (static_cast<unsigned>(offset + info.Size) > storage_size) {
+        return CreateRuntimeError(std::move(llvm::formatv(
+            "\n    at {0}\nBitfield offset {1} + size {2} exceeds storage size {3}",
+            member_expr->getExprLoc().printToString(data.Ctx.getSourceManager()), offset, info.Size, storage_size)));
+      }
       std::string signed_type_name = GetIntTypeName(storage_size, true);
 
       // Extract the field: (current_temp >> offset) & low_bits_mask(Size)
@@ -327,17 +347,24 @@ public:
     // pre_stmts.push_back(llvm::formatv("{0} {1} = ({0}){2};", ft.getAsString(), cast_temp, current_temp));
 
     auto final_pre_stmts = pre_stmts | std::views::reverse | std::ranges::to<llvm::SmallVector<std::string, 4>>();
-    final_pre_stmts.insert(final_pre_stmts.end(), base_built_expr.pre_stmts.begin(), base_built_expr.pre_stmts.end());
+    final_pre_stmts.insert(final_pre_stmts.end(), base_built_expr->pre_stmts.begin(), base_built_expr->pre_stmts.end());
     return BuiltExpr(std::move(final_pre_stmts), current_temp, ft);
   }
 
   // https://github.com/llvm/llvm-project/blob/2078da43e25a4623cab2d0d60decddf709aaea28/clang/lib/CodeGen/CGExpr.cpp#L2607
-  auto BuildStoreThroughBitFieldLValue(const BuildExprCtx &ctx, Expr *src_expr) -> BuiltExpr {
-    assert(ctx.usage_kind == Usage::Effect);
-
+  auto BuildStoreThroughBitFieldLValue(const BuildExprCtx &ctx, Expr *src_expr) -> Expected<BuiltExpr> {
     const MemberExpr *member_expr = cast<MemberExpr>(ctx.expr);
+    if (ctx.usage_kind != Usage::Effect) {
+      return CreateRuntimeError(std::move(llvm::formatv(
+          "\n    at {0}\nUsage kind must be Effect, got {1}",
+          ctx.expr->getExprLoc().printToString(data.Ctx.getSourceManager()), std::to_underlying(ctx.usage_kind))));
+    }
     const FieldDecl *fd = cast<FieldDecl>(member_expr->getMemberDecl());
-    assert(fd->isBitField());
+    if (!fd->isBitField()) {
+      return CreateRuntimeError(std::move(
+          llvm::formatv("\n    at {0}\nField {1} is not a bitfield",
+                        ctx.expr->getExprLoc().printToString(data.Ctx.getSourceManager()), fd->getNameAsString())));
+    }
 
     const CodeGen::CGBitFieldInfo &info =
         data.code_gen_module.getTypes().getCGRecordLayout(fd->getParent()).getBitFieldInfo(fd);
@@ -347,11 +374,16 @@ public:
     // Build the base object subexpression (e.g. "s" for s.field, or the pointer expression for p->field)
     auto base_built_expr =
         BuildExpr(BuildExprCtx(member_expr->getBase(), Usage::Place, ctx.deref_force_extract, ctx.assigned_to));
-    BuiltExpr src_built_expr =
-        BuildExpr(BuildExprCtx(src_expr, Usage::Value, ctx.deref_force_extract, ctx.assigned_to));
+    if (auto error = base_built_expr.takeError()) {
+      return error;
+    }
+    auto src_built_expr = BuildExpr(BuildExprCtx(src_expr, Usage::Value, ctx.deref_force_extract, ctx.assigned_to));
+    if (auto error = src_built_expr.takeError()) {
+      return error;
+    }
     llvm::SmallVector<std::string, 4> pre_stmts;
     std::string base_addr =
-        member_expr->isArrow() ? base_built_expr.final_expr : llvm::formatv("(&{0})", base_built_expr.final_expr);
+        member_expr->isArrow() ? base_built_expr->final_expr : llvm::formatv("(&{0})", base_built_expr->final_expr);
 
     const auto is_volatile = ft.isVolatileQualified();
     const auto use_volatile =
@@ -359,7 +391,12 @@ public:
 
     const auto offset = use_volatile ? info.VolatileOffset : info.Offset;
     const auto storage_size = use_volatile ? info.VolatileStorageSize : info.StorageSize;
-    assert(storage_size <= 64 && "ggs if we ended up here it's over");
+    if (storage_size > GetPointerWidth(data.Ctx)) {
+      return CreateRuntimeError(
+          std::move(llvm::formatv("\n    at {0}\nBitfield storage size {1} exceeds pointer width {2}",
+                                  member_expr->getExprLoc().printToString(data.Ctx.getSourceManager()), storage_size,
+                                  GetPointerWidth(data.Ctx))));
+    }
     const auto storage_offset = use_volatile ? info.VolatileStorageOffset : info.StorageOffset;
 
     // Compute the storage-unit pointer, equivalent to Dst.getBitFieldAddress()
@@ -370,13 +407,17 @@ public:
     // SrcVal = Builder.CreateIntCast(SrcVal, Ptr.getElementType(), /*isSigned=*/false);
     std::string src_cast_temp = GetTempVarName("bf_srccast");
     pre_stmts.push_back(
-        llvm::formatv("{0} {1} = ({0}){2};", storage_type_name, src_cast_temp, src_built_expr.final_expr));
+        llvm::formatv("{0} {1} = ({0}){2};", storage_type_name, src_cast_temp, src_built_expr->final_expr));
     std::string src_temp = src_cast_temp;
     // MaskedVal = SrcVal (pre-shift, pre-merge)
     std::string masked_temp = src_cast_temp;
 
     if (storage_size != info.Size) {
-      assert(storage_size > info.Size && "Invalid bitfield size.");
+      if (storage_size <= info.Size) {
+        return CreateRuntimeError(std::move(llvm::formatv(
+            "\n    at {0}\nBitfield storage size {1} must be greater than bitfield size {2}",
+            member_expr->getExprLoc().printToString(data.Ctx.getSourceManager()), storage_size, info.Size)));
+      }
 
       // Val = Builder.CreateLoad(Ptr, Dst.isVolatileQualified(), "bf.load");
       std::string load_temp = GetTempVarName("bf_load");
@@ -385,7 +426,7 @@ public:
 
       // Mask the source value as needed, unless the destination has a boolean representation.
       if (!ft->hasBooleanRepresentation()) {
-        llvm::APInt const low_mask = llvm::APInt::getLowBitsSet(storage_size, info.Size);
+        const llvm::APInt low_mask = llvm::APInt::getLowBitsSet(storage_size, info.Size);
         std::string value_temp = GetTempVarName("bf_value");
         pre_stmts.push_back(
             llvm::formatv("{0} {1} = {2} & {3}U;", storage_type_name, value_temp, src_temp, FormatAPIntHex(low_mask)));
@@ -401,7 +442,7 @@ public:
       }
 
       // Val = Builder.CreateAnd(Val, ~getBitsSet(StorageSize, Offset, Offset + Size), "bf.clear");
-      llvm::APInt const clear_mask = ~llvm::APInt::getBitsSet(storage_size, offset, offset + info.Size);
+      const llvm::APInt clear_mask = ~llvm::APInt::getBitsSet(storage_size, offset, offset + info.Size);
       std::string clear_temp = GetTempVarName("bf_clear");
       pre_stmts.push_back(
           llvm::formatv("{0} {1} = {2} & {3}U;", storage_type_name, clear_temp, load_temp, FormatAPIntHex(clear_mask)));
@@ -411,7 +452,11 @@ public:
       pre_stmts.push_back(llvm::formatv("{0} {1} = {2} | {3};", storage_type_name, set_temp, clear_temp, src_temp));
       src_temp = set_temp;
     } else {
-      assert(offset == 0);
+      if (offset != 0) {
+        return CreateRuntimeError(std::move(llvm::formatv(
+            "\n    at {0}\nBitfield offset {1} must be zero when storage size {2} equals bitfield size {3}",
+            member_expr->getExprLoc().printToString(data.Ctx.getSourceManager()), offset, storage_size, info.Size)));
+      }
       // According to the AACPS:
       // When a volatile bit-field is written, and its container does not overlap
       // with any non-bit-field member, its container must be read exactly once
@@ -445,7 +490,7 @@ public:
     //   if (high_bits != 0U) {
     //     std::string signed_type_name = GetIntTypeName(storage_size, true);
 
-    //     // sign = 1ULL << (Size - 1)
+    //     // sign = 1UL << (Size - 1)
     //     llvm::APInt const sign_bit_mask = llvm::APInt::getOneBitSet(storage_size, info.Size - 1);
     //     std::string sign_temp = GetTempVarName("bf_result_sign");
     //     pre_stmts.push_back(
@@ -467,13 +512,13 @@ public:
     // std::string const result_expr = result_cast_temp;
 
     auto final_pre_stmts = pre_stmts | std::views::reverse | std::ranges::to<llvm::SmallVector<std::string, 4>>();
-    final_pre_stmts.insert(final_pre_stmts.end(), src_built_expr.pre_stmts.begin(), src_built_expr.pre_stmts.end());
-    final_pre_stmts.insert(final_pre_stmts.end(), base_built_expr.pre_stmts.begin(), base_built_expr.pre_stmts.end());
+    final_pre_stmts.insert(final_pre_stmts.end(), src_built_expr->pre_stmts.begin(), src_built_expr->pre_stmts.end());
+    final_pre_stmts.insert(final_pre_stmts.end(), base_built_expr->pre_stmts.begin(), base_built_expr->pre_stmts.end());
 
     return BuiltExpr(std::move(final_pre_stmts), "", ft);
   }
 
-  auto BuildExpr(const pass_lower_nested_expressions::BuildExprCtx &ctx) -> BuiltExpr {
+  auto BuildExpr(const pass_lower_nested_expressions::BuildExprCtx &ctx) -> Expected<BuiltExpr> {
     auto *expr = ctx.expr->IgnoreParenImpCasts();
 
     llvm::SmallVector<std::string, 8> pre_stmts;
@@ -483,14 +528,21 @@ public:
 
     if (auto *c_style_cast_expr = dyn_cast<CStyleCastExpr>(expr)) {
       auto *sub_expr = c_style_cast_expr->getSubExpr();
-      auto res = BuildExpr(BuildExprCtx(sub_expr, GetUsage(sub_expr), ctx.deref_force_extract, ctx.assigned_to));
+      auto sub_expr_usage = GetUsage(data.Ctx, sub_expr);
+      if (auto error = sub_expr_usage.takeError()) {
+        return std::move(error);
+      }
+      auto res = BuildExpr(BuildExprCtx(sub_expr, *sub_expr_usage, ctx.deref_force_extract, ctx.assigned_to));
+      if (auto error = res.takeError()) {
+        return std::move(error);
+      }
 
       os << "(";
       c_style_cast_expr->getTypeAsWritten().print(os, data.Ctx.getPrintingPolicy());
       os << ")";
-      os << res.final_expr;
+      os << res->final_expr;
 
-      pre_stmts.insert(pre_stmts.end(), res.pre_stmts.begin(), res.pre_stmts.end());
+      pre_stmts.insert(pre_stmts.end(), res->pre_stmts.begin(), res->pre_stmts.end());
     } else if (auto *binary_operator = dyn_cast<BinaryOperator>(expr)) {
       auto *lhs = binary_operator->getLHS()->IgnoreParenImpCasts();
       auto *rhs = binary_operator->getRHS()->IgnoreParenImpCasts();
@@ -499,7 +551,11 @@ public:
       case BO_Assign: {
         // always a store operation here
         if (auto *member_expr = dyn_cast<MemberExpr>(lhs)) {
-          assert(!member_expr->isArrow() && "Arrow member access should not appear at this point!");
+          if (member_expr->isArrow()) {
+            return CreateRuntimeError(
+                std::move(llvm::formatv("\n    at {0}\nArrow member access is not allowed in this context",
+                                        member_expr->getExprLoc().printToString(data.Ctx.getSourceManager()))));
+          }
           if (auto *field_decl = llvm::dyn_cast<clang::FieldDecl>(member_expr->getMemberDecl())) {
             if (field_decl->isBitField()) {
               const CodeGen::CGBitFieldInfo &info = data.code_gen_module.getTypes()
@@ -513,30 +569,45 @@ public:
               // check here however, in BuildStoreThroughBitFieldLValue, we check for info.VolatileStorageSize != 0
               // to determine if we should use the volatile path
 
-              assert(ctx.usage_kind == Usage::Effect);
+              if (ctx.usage_kind != Usage::Effect) {
+                return CreateRuntimeError(
+                    std::move(llvm::formatv("\n    at {0}\nUsage kind must be Effect, got {1}",
+                                            member_expr->getExprLoc().printToString(data.Ctx.getSourceManager()),
+                                            std::to_underlying(ctx.usage_kind))));
+              }
 
               if (use_volatile) {
                 auto built_expr = BuildStoreThroughBitFieldLValue(
                     BuildExprCtx(member_expr, Usage::Effect, ctx.deref_force_extract, ctx.assigned_to), rhs);
-                os << built_expr.final_expr;
-                pre_stmts.insert(pre_stmts.end(), built_expr.pre_stmts.begin(), built_expr.pre_stmts.end());
+                os << built_expr->final_expr;
+                pre_stmts.insert(pre_stmts.end(), built_expr->pre_stmts.begin(), built_expr->pre_stmts.end());
               } else {
                 // otherwise we can use the non-volatile helpers to do the bitfield store
-                BuiltExpr base_built_expr = BuildExpr(
+                auto base_built_expr = BuildExpr(
                     BuildExprCtx(member_expr->getBase(), Usage::Place, ctx.deref_force_extract, ctx.assigned_to));
-                BuiltExpr rhs_built_expr =
-                    BuildExpr(BuildExprCtx(rhs, GetUsage(rhs), ctx.deref_force_extract, ctx.assigned_to));
+                if (auto error = base_built_expr.takeError()) {
+                  return std::move(error);
+                }
+                auto rhs_usage = GetUsage(data.Ctx, rhs);
+                if (auto error = rhs_usage.takeError()) {
+                  return std::move(error);
+                }
+                auto rhs_built_expr =
+                    BuildExpr(BuildExprCtx(rhs, *rhs_usage, ctx.deref_force_extract, ctx.assigned_to));
+                if (auto error = rhs_built_expr.takeError()) {
+                  return std::move(error);
+                }
                 std::string base_addr =
-                    llvm::formatv("(&{0})", base_built_expr.final_expr); // arrow member access not possible
+                    llvm::formatv("(&{0})", base_built_expr->final_expr); // arrow member access not possible
                 uint64_t start_bit = (static_cast<uint64_t>(info.StorageOffset.getQuantity()) * 8) + info.Offset;
                 uint64_t end_bit = start_bit + info.Size; // info.Size = bitfield width in bits
 
                 pre_stmts.push_back(
                     llvm::formatv("__c2pnk_set_bitfield_{0}{1}(({2}int{1}_t){3}, (uint8_t *){4}, {5}UL, {6}UL);",
                                   info.IsSigned ? "i" : "u", GetPointerWidth(data.Ctx), info.IsSigned ? "" : "u",
-                                  rhs_built_expr.final_expr, base_addr, start_bit, end_bit));
-                pre_stmts.insert(pre_stmts.end(), rhs_built_expr.pre_stmts.begin(), rhs_built_expr.pre_stmts.end());
-                pre_stmts.insert(pre_stmts.end(), base_built_expr.pre_stmts.begin(), base_built_expr.pre_stmts.end());
+                                  rhs_built_expr->final_expr, base_addr, start_bit, end_bit));
+                pre_stmts.insert(pre_stmts.end(), rhs_built_expr->pre_stmts.begin(), rhs_built_expr->pre_stmts.end());
+                pre_stmts.insert(pre_stmts.end(), base_built_expr->pre_stmts.begin(), base_built_expr->pre_stmts.end());
                 data.need_non_volatile_bitfield_helpers = true;
               }
 
@@ -546,18 +617,36 @@ public:
           }
         }
 
-        auto rhs_res = BuildExpr(BuildExprCtx(rhs, GetUsage(rhs), ctx.deref_force_extract, ctx.assigned_to));
-        auto lhs_res = BuildExpr(BuildExprCtx(lhs, Usage::Place, ctx.deref_force_extract, ctx.assigned_to));
-
-        assert(ctx.usage_kind != Usage::Place && "Assignment operator cannot be used as a place expression");
-
-        pre_stmts.push_back(llvm::formatv("{0} = {1};", lhs_res.final_expr, rhs_res.final_expr).str());
-        if (ctx.usage_kind == Usage::Value) {
-          os << lhs_res.final_expr;
+        auto rhs_usage = GetUsage(data.Ctx, rhs);
+        if (auto error = rhs_usage.takeError()) {
+          return std::move(error);
+        }
+        auto rhs_res = BuildExpr(BuildExprCtx(rhs, *rhs_usage, ctx.deref_force_extract, ctx.assigned_to));
+        if (auto error = rhs_res.takeError()) {
+          return std::move(error);
+        }
+        auto lhs_usage = GetUsage(data.Ctx, lhs);
+        if (auto error = lhs_usage.takeError()) {
+          return std::move(error);
+        }
+        auto lhs_res = BuildExpr(BuildExprCtx(lhs, *lhs_usage, ctx.deref_force_extract, ctx.assigned_to));
+        if (auto error = lhs_res.takeError()) {
+          return std::move(error);
         }
 
-        pre_stmts.insert(pre_stmts.end(), rhs_res.pre_stmts.begin(), rhs_res.pre_stmts.end());
-        pre_stmts.insert(pre_stmts.end(), lhs_res.pre_stmts.begin(), lhs_res.pre_stmts.end());
+        if (ctx.usage_kind == Usage::Place) {
+          return CreateRuntimeError(
+              std::move(llvm::formatv("\n    at {0}\nAssignment operator cannot be used as a place expression",
+                                      binary_operator->getExprLoc().printToString(data.Ctx.getSourceManager()))));
+        }
+
+        pre_stmts.push_back(llvm::formatv("{0} = {1};", lhs_res->final_expr, rhs_res->final_expr).str());
+        if (ctx.usage_kind == Usage::Value) {
+          os << lhs_res->final_expr;
+        }
+
+        pre_stmts.insert(pre_stmts.end(), rhs_res->pre_stmts.begin(), rhs_res->pre_stmts.end());
+        pre_stmts.insert(pre_stmts.end(), lhs_res->pre_stmts.begin(), lhs_res->pre_stmts.end());
         break;
       }
 
@@ -593,36 +682,63 @@ public:
         [[fallthrough]];
       case BO_Or: {
 
-        auto rhs_res = BuildExpr(BuildExprCtx(rhs, GetUsage(rhs), ctx.deref_force_extract, ctx.assigned_to));
-        auto lhs_res = BuildExpr(BuildExprCtx(lhs, GetUsage(lhs), ctx.deref_force_extract, ctx.assigned_to));
+        auto rhs_usage = GetUsage(data.Ctx, rhs);
+        if (auto error = rhs_usage.takeError()) {
+          return std::move(error);
+        }
+        auto rhs_res = BuildExpr(BuildExprCtx(rhs, *rhs_usage, ctx.deref_force_extract, ctx.assigned_to));
+        if (auto error = rhs_res.takeError()) {
+          return std::move(error);
+        }
+        auto lhs_usage = GetUsage(data.Ctx, lhs);
+        if (auto error = lhs_usage.takeError()) {
+          return std::move(error);
+        }
+        auto lhs_res = BuildExpr(BuildExprCtx(lhs, *lhs_usage, ctx.deref_force_extract, ctx.assigned_to));
+        if (auto error = lhs_res.takeError()) {
+          return std::move(error);
+        }
 
-        assert(ctx.usage_kind != Usage::Place && "Binary operator cannot be used as a place expression");
+        if (ctx.usage_kind == Usage::Place) {
+          return CreateRuntimeError(
+              std::move(llvm::formatv("\n    at {0}\nBinary operator cannot be used as a place expression",
+                                      binary_operator->getExprLoc().printToString(data.Ctx.getSourceManager()))));
+        }
 
         // don't return a pre stmt no matter what since these can be arbitrarily nested
-        os << llvm::formatv("({0} {1} {2})", lhs_res.final_expr,
-                            BinaryOperator::getOpcodeStr(binary_operator->getOpcode()), rhs_res.final_expr);
+        os << llvm::formatv("({0} {1} {2})", lhs_res->final_expr,
+                            BinaryOperator::getOpcodeStr(binary_operator->getOpcode()), rhs_res->final_expr);
 
-        pre_stmts.insert(pre_stmts.end(), rhs_res.pre_stmts.begin(), rhs_res.pre_stmts.end());
-        pre_stmts.insert(pre_stmts.end(), lhs_res.pre_stmts.begin(), lhs_res.pre_stmts.end());
+        pre_stmts.insert(pre_stmts.end(), rhs_res->pre_stmts.begin(), rhs_res->pre_stmts.end());
+        pre_stmts.insert(pre_stmts.end(), lhs_res->pre_stmts.begin(), lhs_res->pre_stmts.end());
         break;
       }
 
       default: {
-        llvm_unreachable("Unhandled binary operator");
+        return CreateRuntimeError(
+            std::move(llvm::formatv("\n    at {0}\nUnhandled binary operator {1}",
+                                    binary_operator->getExprLoc().printToString(data.Ctx.getSourceManager()),
+                                    BinaryOperator::getOpcodeStr(binary_operator->getOpcode()).str())));
         break;
       }
       }
     } else if (auto *unary_operator = dyn_cast<UnaryOperator>(expr)) {
       auto *sub_expr = unary_operator->getSubExpr()->IgnoreParenImpCasts();
-      // auto res = BuildExpr(sub_expr, depth + 1);
 
       switch (unary_operator->getOpcode()) {
       case UO_Deref: {
         auto usage_kind = ctx.deref_force_extract ? Usage::Value : ctx.usage_kind;
-        auto res = BuildExpr(BuildExprCtx(sub_expr, GetUsage(sub_expr), true, ctx.assigned_to));
+        auto sub_expr_usage = GetUsage(data.Ctx, sub_expr);
+        if (auto error = sub_expr_usage.takeError()) {
+          return std::move(error);
+        }
+        auto res = BuildExpr(BuildExprCtx(sub_expr, *sub_expr_usage, true, ctx.assigned_to));
+        if (auto error = res.takeError()) {
+          return std::move(error);
+        }
 
         if (usage_kind == Usage::Place) {
-          os << "*" << res.final_expr;
+          os << "*" << res->final_expr;
         } else {
           // extract into temp var
           std::string const tmp_var_name = GetTempVarName("Deref");
@@ -633,11 +749,11 @@ public:
             const auto *array_type = data.Ctx.getAsArrayType(final_expr_type);
             decl_type = data.Ctx.getPointerType(array_type->getElementType());
           }
-          pre_stmts.push_back(llvm::formatv("{0} = *{1};", PrintType(decl_type, tmp_var_name), res.final_expr).str());
+          pre_stmts.push_back(llvm::formatv("{0} = *{1};", PrintType(decl_type, tmp_var_name), res->final_expr).str());
           os << tmp_var_name;
         }
 
-        pre_stmts.insert(pre_stmts.end(), res.pre_stmts.begin(), res.pre_stmts.end());
+        pre_stmts.insert(pre_stmts.end(), res->pre_stmts.begin(), res->pre_stmts.end());
         break;
       }
 
@@ -656,26 +772,46 @@ public:
       case UO_Imag:
         [[fallthrough]];
       case UO_Extension: {
-        auto res = BuildExpr(BuildExprCtx(sub_expr, GetUsage(sub_expr), ctx.deref_force_extract, ctx.assigned_to));
-        os << llvm::formatv("{0}{1}", UnaryOperator::getOpcodeStr(unary_operator->getOpcode()).str(), res.final_expr);
-        pre_stmts.insert(pre_stmts.end(), res.pre_stmts.begin(), res.pre_stmts.end());
+        auto sub_expr_usage = GetUsage(data.Ctx, sub_expr);
+        if (auto error = sub_expr_usage.takeError()) {
+          return std::move(error);
+        }
+        auto res = BuildExpr(BuildExprCtx(sub_expr, *sub_expr_usage, ctx.deref_force_extract, ctx.assigned_to));
+        if (auto error = res.takeError()) {
+          return std::move(error);
+        }
+        os << llvm::formatv("{0}{1}", UnaryOperator::getOpcodeStr(unary_operator->getOpcode()).str(), res->final_expr);
+        pre_stmts.insert(pre_stmts.end(), res->pre_stmts.begin(), res->pre_stmts.end());
         break;
       }
 
       default: {
-        llvm_unreachable("Unhandled unary operator");
+        return CreateRuntimeError(
+            std::move(llvm::formatv("\n    at {0}\nUnhandled unary operator {1}",
+                                    unary_operator->getExprLoc().printToString(data.Ctx.getSourceManager()),
+                                    UnaryOperator::getOpcodeStr(unary_operator->getOpcode()).str())));
         break;
       }
       }
     } else if (auto *call_expr = dyn_cast<CallExpr>(expr)) {
       llvm::SmallVector<BuiltExpr, 4> arg_built_exprs;
       for (auto *arg : call_expr->arguments()) {
-        arg_built_exprs.push_back(BuildExpr(
-            BuildExprCtx(arg->IgnoreParenImpCasts(), Usage::Value, ctx.deref_force_extract, ctx.assigned_to)));
+        auto arg_usage = GetUsage(data.Ctx, arg);
+        if (auto error = arg_usage.takeError()) {
+          return std::move(error);
+        }
+        auto res = BuildExpr(BuildExprCtx(arg, *arg_usage, ctx.deref_force_extract, ctx.assigned_to));
+        if (auto error = res.takeError()) {
+          return std::move(error);
+        }
+        arg_built_exprs.push_back(std::move(*res));
       }
-      // TODO
-      // it's possible for getDirectCallee to return nullptr, but I don't know what to do in that case...
-      // TODO throw error on any function pointers
+
+      if (call_expr->getDirectCallee() == nullptr) {
+        return CreateRuntimeError(
+            std::move(llvm::formatv("\n    at {0}\ngetDirectCallee returned nullptr for a call expression",
+                                    call_expr->getExprLoc().printToString(data.Ctx.getSourceManager()))));
+      }
       os << llvm::formatv("{0}({1})", call_expr->getDirectCallee()->getName().str(),
                           llvm::join(arg_built_exprs | std::views::transform([](const BuiltExpr &e) -> std::string {
                                        return e.final_expr;
@@ -689,7 +825,11 @@ public:
       if (IsRead(member_expr)) {
         if (auto *field_decl = llvm::dyn_cast<clang::FieldDecl>(member_expr->getMemberDecl())) {
           if (field_decl->isBitField()) {
-            assert(!member_expr->isArrow() && "Arrow member access should not appear at this point");
+            if (member_expr->isArrow()) {
+              return CreateRuntimeError(
+                  std::move(llvm::formatv("\n    at {0}\nArrow member access is not allowed in this context",
+                                          member_expr->getExprLoc().printToString(data.Ctx.getSourceManager()))));
+            }
 
             const CodeGen::CGBitFieldInfo &info =
                 data.code_gen_module.getTypes().getCGRecordLayout(field_decl->getParent()).getBitFieldInfo(field_decl);
@@ -701,23 +841,37 @@ public:
             // determine if we should use the volatile path
 
             if (use_volatile) {
+              auto member_expr_usage = GetUsage(data.Ctx, member_expr);
+              if (auto error = member_expr_usage.takeError()) {
+                return std::move(error);
+              }
               auto res = BuildLoadOfBitFieldLValue(
-                  BuildExprCtx(member_expr, GetUsage(member_expr), ctx.deref_force_extract, ctx.assigned_to));
-              os << res.final_expr;
-              pre_stmts.insert(pre_stmts.end(), res.pre_stmts.begin(), res.pre_stmts.end());
+                  BuildExprCtx(member_expr, *member_expr_usage, ctx.deref_force_extract, ctx.assigned_to));
+              if (auto error = res.takeError()) {
+                return std::move(error);
+              }
+              os << res->final_expr;
+              pre_stmts.insert(pre_stmts.end(), res->pre_stmts.begin(), res->pre_stmts.end());
             } else {
               // otherwise fallback to helper functions
 
               // Build the base object subexpression (e.g. "s" for s.field, or the pointer expression for p->field)
-              BuiltExpr base_built_expr = BuildExpr(BuildExprCtx(
-                  member_expr->getBase(), GetUsage(member_expr->getBase()), ctx.deref_force_extract, ctx.assigned_to));
+              auto base_usage = GetUsage(data.Ctx, member_expr->getBase());
+              if (auto error = base_usage.takeError()) {
+                return std::move(error);
+              }
+              auto base_built_expr = BuildExpr(
+                  BuildExprCtx(member_expr->getBase(), *base_usage, ctx.deref_force_extract, ctx.assigned_to));
+              if (auto error = base_built_expr.takeError()) {
+                return std::move(error);
+              }
               std::string base_addr =
-                  llvm::formatv("(&{0})", base_built_expr.final_expr); // arrow member access not possible
+                  llvm::formatv("(&{0})", base_built_expr->final_expr); // arrow member access not possible
               uint64_t start_bit = (static_cast<uint64_t>(info.StorageOffset.getQuantity()) * 8) + info.Offset;
               uint64_t end_bit = start_bit + info.Size; // info.Size = bitfield width in bits
               os << llvm::formatv("__c2pnk_get_bitfield_{0}{1}((const uint8_t *){2}, {3}UL, {4}UL)",
                                   info.IsSigned ? "i" : "u", GetPointerWidth(data.Ctx), base_addr, start_bit, end_bit);
-              pre_stmts.insert(pre_stmts.end(), base_built_expr.pre_stmts.begin(), base_built_expr.pre_stmts.end());
+              pre_stmts.insert(pre_stmts.end(), base_built_expr->pre_stmts.begin(), base_built_expr->pre_stmts.end());
               data.need_non_volatile_bitfield_helpers = true;
             }
 
@@ -730,7 +884,11 @@ public:
       goto build_expr_else;
     } else {
     build_expr_else:
-      PrintSourceText(os, expr, data.Ctx);
+      if (auto err = PrintSourceText(os, expr, data.Ctx)) {
+        return CreateRuntimeError(std::move(llvm::formatv(
+            "\n    at {0}\nFailed to print source text for expression: {1}",
+            expr->getExprLoc().printToString(data.Ctx.getSourceManager()), llvm::fmt_consume(std::move(err)))));
+      }
     }
 
   build_expr_end:
@@ -739,6 +897,10 @@ public:
   }
 
   auto TraverseDeclStmt(DeclStmt *declStmt) -> bool {
+    if (data.error) {
+      return false;
+    }
+
     auto &sm = data.Ctx.getSourceManager();
     if (declStmt == nullptr || !sm.isInMainFile(sm.getSpellingLoc(declStmt->getBeginLoc()))) {
       return true;
@@ -754,20 +916,29 @@ public:
           // normally we would put Usage::Value here but since every Usage::Place is also a Usage::Value, we can just
           // use Usage::Place to avoid an extra copy of the expression
           init_expr = init_expr->IgnoreParenImpCasts();
+          auto init_expr_usage = GetUsage(data.Ctx, init_expr);
+          if (auto error = init_expr_usage.takeError()) {
+            data.error = std::move(error);
+            return false;
+          }
           auto res = BuildExpr(BuildExprCtx(
-              init_expr, GetUsage(init_expr), false,
+              init_expr, *init_expr_usage, false,
               std::make_optional(std::make_pair(var_decl->getNameAsString(), var_decl->getType().getCanonicalType()))));
+          if (auto error = res.takeError()) {
+            data.error = std::move(error);
+            return false;
+          }
 
           // if the final expression is empty, the decl comes first.
           // this is because the init expr stuff needs to come AFTER the decl...
-          if (res.final_expr.empty()) {
+          if (res->final_expr.empty()) {
             os << PrintType(var_decl->getType(), var_decl->getName()) << ";";
           }
-          os << llvm::join(res.pre_stmts | std::views::reverse, "\n");
+          os << llvm::join(res->pre_stmts | std::views::reverse, "\n");
 
-          if (!res.final_expr.empty()) {
+          if (!res->final_expr.empty()) {
             // assign whatever final value there is...
-            os << llvm::formatv("{0} = {1};", PrintType(var_decl->getType(), var_decl->getName()), res.final_expr);
+            os << llvm::formatv("{0} = {1};", PrintType(var_decl->getType(), var_decl->getName()), res->final_expr);
           }
         } else {
           os << PrintType(var_decl->getType(), var_decl->getName()) << ";";
@@ -787,6 +958,10 @@ public:
   }
 
   auto TraverseStmt(Stmt *stmt) -> bool {
+    if (data.error) {
+      return false;
+    }
+
     auto &sm = data.Ctx.getSourceManager();
     if (stmt == nullptr || !sm.isInMainFile(sm.getSpellingLoc(stmt->getBeginLoc()))) {
       return true;
@@ -798,16 +973,20 @@ public:
       std::string replacement_text;
       llvm::raw_string_ostream os(replacement_text);
       auto res = BuildExpr(BuildExprCtx(expr, Usage::Effect, false, std::nullopt));
-      os << llvm::join(res.pre_stmts | std::views::reverse, "\n");
+      if (auto error = res.takeError()) {
+        data.error = std::move(error);
+        return false;
+      }
+      os << llvm::join(res->pre_stmts | std::views::reverse, "\n");
 
-      if (!res.final_expr.empty()) {
-        os << llvm::formatv("{0}", res.final_expr);
+      if (!res->final_expr.empty()) {
+        os << llvm::formatv("{0}", res->final_expr);
       }
       os.flush();
 
       if (!replacement_text.empty()) {
         CharSourceRange range = CharSourceRange::getTokenRange(stmt->getSourceRange());
-        if (res.final_expr.empty()) {
+        if (res->final_expr.empty()) {
           auto start = stmt->getBeginLoc();
           auto end = stmt->getEndLoc();
           auto end_inc_semicolon =
@@ -841,13 +1020,15 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
                                          ci.getDiagnostics());
 
   llvm::SmallVector<Replacement, 64> replacements;
-  WorkerData data{.Ctx = Ctx,
-                  .code_gen_module = code_gen_module,
-                  .pa_ctx = pa_ctx,
-                  .replacements = replacements,
-                  .need_non_volatile_bitfield_helpers = false};
+  WorkerData data{.Ctx = Ctx, .code_gen_module = code_gen_module, .pa_ctx = ps_ctx, .replacements = replacements};
   Worker w(data);
   w.TraverseDecl(Ctx.getTranslationUnitDecl());
+
+  if (data.error) {
+    ps_ctx.error = std::move(data.error);
+    ps_ctx.whats_next = WhatsNext::MoveToNextFile;
+    return;
+  }
 
   if (data.need_non_volatile_bitfield_helpers) {
     replacements.emplace_back(Ctx.getSourceManager(),
@@ -855,7 +1036,6 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
                               llvm::formatv(non_volatile_bitfield_helpers, GetPointerWidth(Ctx)).str());
   }
 
-  bool add_error_occurred = false;
   for (const auto &r : replacements) {
     if (r.getFilePath().empty()) {
       // if there's no file path then it means the replacement is some fucked macro expansion or whatever
@@ -864,14 +1044,14 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
       continue;
     }
 
-    if (auto err = pa_ctx.replacements.add(r)) {
-      llvm::consumeError(std::move(err));
-      llvm::errs() << llvm::formatv("{0} Add replacement conflict, retrying next pass...\n", LogBegin(pa_ctx));
-      add_error_occurred = true;
+    if (auto err = ps_ctx.replacements.add(r)) {
+      ps_ctx.error = CreateRuntimeError(llvm::formatv("Add replacement conflict: {0}", err));
+      ps_ctx.whats_next = WhatsNext::MoveToNextFile;
+      return;
     }
   }
 
-  assert(!add_error_occurred && "Add replacement conflict should not occur in this pass");
+  ps_ctx.whats_next = WhatsNext::MoveToNextPass;
 }
 } // namespace pancake::pass_lower_bitfield_ops
 
@@ -889,32 +1069,43 @@ auto MakeRule() -> RewriteRule {
 
 auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
   llvm::SmallVector<AtomicChange, 64> changes;
-  auto t = Transformer(MakeRule(), [&changes](llvm::Expected<llvm::MutableArrayRef<AtomicChange>> c) -> void {
+  llvm::Error err = llvm::Error::success();
+  auto t = Transformer(MakeRule(), [&](llvm::Expected<llvm::MutableArrayRef<AtomicChange>> c) -> void {
     if (c)
       changes.insert(changes.end(), c->begin(), c->end());
     else
-      llvm::consumeError(c.takeError());
+      err = c.takeError();
   });
 
   MatchFinder finder;
   t.registerMatchers(&finder);
   finder.matchAST(Ctx);
 
-  bool add_error_occurred = false;
+  if (err) {
+    ps_ctx.error =
+        CreateRuntimeError(llvm::formatv("Error during transformation: {0}", llvm::fmt_consume(std::move(err))));
+    ps_ctx.whats_next = WhatsNext::MoveToNextFile;
+    return;
+  }
+
+  int errors = 0;
   for (const auto &change : changes) {
     for (const auto &r : change.getReplacements()) {
-      if (auto err = pa_ctx.replacements.add(r)) {
+      if (auto err = ps_ctx.replacements.add(r)) {
         llvm::consumeError(std::move(err));
-        llvm::errs() << llvm::formatv("{0} Add replacement conflict, retrying next pass...\n", LogBegin(pa_ctx));
-        add_error_occurred = true;
+        errors++;
       }
     }
   }
 
-  pa_ctx.run_result = RunResult::RepeatPass;
-  if (!add_error_occurred && changes.empty()) {
-    // All edits successfully added; no need to repeat this pass
-    pa_ctx.run_result = RunResult::Success;
+  if (errors == 0 && changes.empty()) {
+    ps_ctx.whats_next = WhatsNext::MoveToNextPass;
+    return;
   }
+  if (errors > 0) {
+    PrintLogBegin(llvm::outs(), ps_ctx);
+    llvm::outs() << llvm::formatv("Couldn't add {0} replacement{1}\n", errors, errors != 1 ? "s" : "");
+  }
+  ps_ctx.whats_next = WhatsNext::RepeatPass;
 }
 } // namespace pancake::pass_simplify_addrof_deref

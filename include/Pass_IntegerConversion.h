@@ -10,13 +10,9 @@ public:
   void HandleTranslationUnit(clang::ASTContext &Ctx) override;
 };
 
-class Action : public PipelineAction<Consumer> {
+class Action : public PipelineStage<Consumer> {
 public:
-  explicit Action(PipelineActionCtx &ctx) : PipelineAction<Consumer>(ctx) {
-    ctx.action_name = "ImplicitToExplicitCasts";
-    ctx.failure_behaviour = FailureBehaviour::RepeatPass;
-    ctx.action_type = PipelineActionType::Rewriter;
-  }
+  explicit Action(PipelineStageCtx &ctx) : PipelineStage<Consumer>(ctx) { ctx.action_name = "ImplicitToExplicitCasts"; }
 };
 } // namespace pancake::pass_implicit_to_explicit_casts
 
@@ -27,13 +23,9 @@ public:
   void HandleTranslationUnit(clang::ASTContext &Ctx) override;
 };
 
-class Action : public PipelineAction<Consumer> {
+class Action : public PipelineStage<Consumer> {
 public:
-  explicit Action(PipelineActionCtx &ctx) : PipelineAction<Consumer>(ctx) {
-    ctx.action_name = "ConvertIntegerTypes";
-    ctx.failure_behaviour = FailureBehaviour::MoveToNextFile;
-    ctx.action_type = PipelineActionType::Rewriter;
-  }
+  explicit Action(PipelineStageCtx &ctx) : PipelineStage<Consumer>(ctx) { ctx.action_name = "ConvertIntegerTypes"; }
 };
 } // namespace pancake::pass_integer_conversion
 

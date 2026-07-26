@@ -13,13 +13,14 @@
 #include <clang/Tooling/CompilationDatabase.h>
 #include <clang/Tooling/Core/Replacement.h>
 #include <clang/Tooling/Tooling.h>
+#include <llvm-22/llvm/Support/ErrorHandling.h>
 #include <llvm/ADT/StringRef.h>
 #include <llvm/Support/FormatAdapters.h>
 #include <llvm/Support/FormatVariadic.h>
 
-#include <cassert>
 #include <memory>
 #include <string>
+#include <utility>
 
 namespace pancake {
 // This is what all passes should inherit from
@@ -27,15 +28,15 @@ class C2PancakePass : public clang::ASTConsumer {
 protected:
   const clang::CompilerInstance &ci;
   std::string in_file;
-  PipelineActionCtx &pa_ctx;
+  PipelineStageCtx &ps_ctx;
   size_t tmp_var_counter = 0;
 
 public:
-  explicit C2PancakePass(const clang::CompilerInstance &CI, llvm::StringRef in_file, PipelineActionCtx &pa_ctx)
-      : ci(CI), in_file(in_file), pa_ctx(pa_ctx) {}
+  explicit C2PancakePass(const clang::CompilerInstance &CI, llvm::StringRef in_file, PipelineStageCtx &ps_ctx)
+      : ci(CI), in_file(in_file), ps_ctx(ps_ctx) {}
 
   auto GetTempVarName(std::string hint) -> auto {
-    return llvm::formatv("__c2pnk_{0}_{1}_{2}_{3}", hint, pa_ctx.major_pass_number, pa_ctx.minor_pass_number,
+    return llvm::formatv("__c2pnk_{0}_{1}_{2}_{3}", hint, ps_ctx.major_pass_number, ps_ctx.minor_pass_number,
                          tmp_var_counter++);
   }
 
@@ -48,87 +49,82 @@ public:
   }
 
   // children must implement HandleTranslationUnit
+  void HandleTranslationUnit(clang::ASTContext &Ctx) override = 0;
 };
 
 // T is used for CRTP for GetActionName
 template <typename T>
   requires std::derived_from<T, C2PancakePass>
-class PipelineAction : public clang::ASTFrontendAction {
-  PipelineActionCtx &pa_ctx;
+class PipelineStage : public clang::ASTFrontendAction {
+  PipelineStageCtx &ps_ctx;
 
 public:
-  explicit PipelineAction(PipelineActionCtx &pa_ctx) : pa_ctx(pa_ctx) {}
+  explicit PipelineStage(PipelineStageCtx &ps_ctx) : ps_ctx(ps_ctx) {}
 
   auto CreateASTConsumer(clang::CompilerInstance &compiler, llvm::StringRef in_file)
       -> std::unique_ptr<clang::ASTConsumer> override {
-    return std::make_unique<T>(compiler, in_file, pa_ctx);
+    return std::make_unique<T>(compiler, in_file, ps_ctx);
   }
 
   auto EndSourceFileAction() -> void override {
-    if (!pa_ctx.action_type.has_value()) {
-      llvm_unreachable("Action did not set a failure behaviour");
+    if (ps_ctx.error) {
+      PrintLogBegin(llvm::errs(), ps_ctx);
+      llvm::errs() << "Not writing output file due to error";
+      return;
     }
 
-    switch (pa_ctx.action_type.value()) {
-    case PipelineActionType::Analyser:
-      // nothing to do for analysers
-      break;
-    case PipelineActionType::Rewriter: {
-      auto &sm = getCompilerInstance().getSourceManager();
-      auto current_filename = getCurrentInput().getFile();
-
-      auto buf = sm.getBufferOrFake(sm.getMainFileID());
-      auto source_text = buf.getBuffer();
-      auto original_filename = current_filename.drop_back(pa_ctx.current_suffix.size());
-      auto output_path = llvm::formatv("{0}{1}", original_filename, pa_ctx.next_suffix).str();
-
-      std::string final_text;
-
-      if (pa_ctx.replacements.empty()) {
-        final_text = source_text;
-      } else {
-        auto result = clang::tooling::applyAllReplacements(source_text, pa_ctx.replacements);
-        if (!result) {
-          // abnormal error!
-          llvm::errs() << llvm::formatv("{0} {1}\n", LogBegin(pa_ctx), llvm::fmt_consume(result.takeError()));
-          break;
-        }
-
-        // apply clang-format pass
-        auto style_or_err =
-            clang::format::getStyle("file", output_path, "LLVM", *result, &sm.getFileManager().getVirtualFileSystem());
-        std::string formatted = *result;
-        if (style_or_err) {
-          auto style = *style_or_err;
-          // no way to avoid the cast from unsigned long to unsigned int
-          llvm::SmallVector<clang::tooling::Range, 1> ranges{clang::tooling::Range(0, (unsigned)result->size())};
-          auto format_replacements = clang::format::reformat(style, *result, ranges);
-          if (auto formatted_or_err = clang::tooling::applyAllReplacements(*result, format_replacements)) {
-            formatted = *formatted_or_err;
-          } else {
-            llvm::errs() << llvm::formatv("{0} clang-format apply failed: {1}\n", LogBegin(pa_ctx),
-                                          llvm::fmt_consume(formatted_or_err.takeError()));
-          }
-        } else {
-          llvm::errs() << llvm::formatv("{0} clang-format style lookup failed: {1}\n", LogBegin(pa_ctx),
-                                        llvm::fmt_consume(style_or_err.takeError()));
-        }
-        final_text = std::move(formatted);
-      }
-
-      std::error_code ec;
-      llvm::raw_fd_ostream out(output_path, ec, llvm::sys::fs::OF_None);
-      if (!ec) {
-        out << final_text;
-      } else {
-        llvm::errs() << llvm::formatv("{0} {1}\n", LogBegin(pa_ctx), ec.message());
-      }
-
-      break;
+    if (ps_ctx.replacements.empty()) {
+      PrintLogBegin(llvm::outs(), ps_ctx);
+      llvm::outs() << "No replacements to apply, skipping output file write\n";
+      return;
     }
-    default: {
-      llvm_unreachable("Unknown PipelineActionType");
+
+    auto &sm = getCompilerInstance().getSourceManager();
+    auto current_filename = getCurrentInput().getFile();
+
+    auto buf = sm.getBufferOrFake(sm.getMainFileID());
+    auto source_text = buf.getBuffer();
+    auto original_filename = current_filename.drop_back(ps_ctx.current_suffix.size());
+    auto output_path = llvm::formatv("{0}{1}", original_filename, ps_ctx.next_suffix).str();
+
+    auto unformatted = clang::tooling::applyAllReplacements(source_text, ps_ctx.replacements);
+    if (auto error = unformatted.takeError()) {
+      ps_ctx.end_src_file_action_error = CreateRuntimeError(
+          llvm::formatv("Failed to apply replacements INSIDE the pipeline: {0}\n    THIS SHOULD NEVER HAPPEN!",
+                        llvm::fmt_consume(std::move(error))));
+      return;
     }
+
+    // apply clang-format pass
+    auto style =
+        clang::format::getStyle("file", output_path, "LLVM", *unformatted, &sm.getFileManager().getVirtualFileSystem());
+    if (auto error = style.takeError()) {
+      ps_ctx.end_src_file_action_error = CreateRuntimeError(
+          llvm::formatv("clang-format style lookup failed: {0}\n", llvm::fmt_consume(std::move(error))));
+      return;
+    }
+
+    // no way to avoid the cast from unsigned long to unsigned int
+    llvm::SmallVector<clang::tooling::Range, 1> ranges{clang::tooling::Range(0, (unsigned)unformatted->size())};
+    auto format_replacements = clang::format::reformat(*style, *unformatted, ranges);
+    auto formatted = clang::tooling::applyAllReplacements(*unformatted, format_replacements);
+    if (auto error = formatted.takeError()) {
+      ps_ctx.end_src_file_action_error =
+          CreateRuntimeError(llvm::formatv("clang-format apply failed: {0}\n", llvm::fmt_consume(std::move(error))));
+      return;
+    }
+
+    std::error_code ec;
+    llvm::raw_fd_ostream out(output_path, ec, llvm::sys::fs::OF_None);
+    if (!ec) {
+      out << *formatted;
+      ps_ctx.file_modified = true;
+      PrintLogBegin(llvm::outs(), ps_ctx);
+      llvm::outs() << llvm::formatv("Applied {0} replacement{1}, output written to {2}\n", ps_ctx.replacements.size(),
+                                    ps_ctx.replacements.size() != 1 ? "s" : "", output_path);
+    } else {
+      ps_ctx.end_src_file_action_error =
+          CreateRuntimeError(llvm::formatv("Failed to open output file {0}: {1}", output_path, ec.message()));
     }
   }
 };
@@ -142,14 +138,14 @@ private:
     auto operator=(const AbstractFactory &) -> AbstractFactory & = delete;
     AbstractFactory(AbstractFactory &&) = delete;
     auto operator=(AbstractFactory &&) -> AbstractFactory & = delete;
-    virtual auto BetterCreate(PipelineActionCtx &ctx) -> std::unique_ptr<clang::FrontendAction> = 0;
+    virtual auto BetterCreate(PipelineStageCtx &ctx) -> std::unique_ptr<clang::FrontendAction> = 0;
   };
 
   template <typename T> struct FactoryFactory : public AbstractFactory {
     auto create() -> std::unique_ptr<clang::FrontendAction> override {
       llvm_unreachable("PipelineAction factories require a PipelineActionCtx, use BetterCreate instead");
     }
-    auto BetterCreate(PipelineActionCtx &ctx) -> std::unique_ptr<clang::FrontendAction> override {
+    auto BetterCreate(PipelineStageCtx &ctx) -> std::unique_ptr<clang::FrontendAction> override {
       return std::make_unique<T>(ctx);
     }
   };
@@ -160,7 +156,7 @@ private:
 public:
   explicit Pipeline(clang::tooling::CommonOptionsParser &options_parser) : options_parser(options_parser) {}
 
-  template <typename T> void AddPass() { factories.emplace_back(std::make_unique<FactoryFactory<T>>()); }
+  template <typename T> void AddStage() { factories.emplace_back(std::make_unique<FactoryFactory<T>>()); }
 
   auto Run() -> int;
 };

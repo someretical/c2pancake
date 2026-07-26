@@ -17,10 +17,10 @@
 #include <llvm/ADT/SmallVector.h>
 #include <llvm/Support/Casting.h>
 #include <llvm/Support/Error.h>
+#include <llvm/Support/FormatAdapters.h>
 #include <llvm/Support/FormatVariadic.h>
 #include <llvm/Support/raw_ostream.h>
 
-#include <cassert>
 #include <cstddef>
 #include <string>
 #include <utility>
@@ -32,8 +32,9 @@ namespace pancake::pass_normalise_if_statements {
 namespace {
 struct WorkerData {
   ASTContext &Ctx;
-  PipelineActionCtx &pa_ctx;
+  PipelineStageCtx &pa_ctx;
   llvm::SmallVector<Replacement, 64> &replacements;
+  llvm::Error error = llvm::Error::success();
   size_t if_cond_tmp_var_counter = 0;
 };
 
@@ -64,10 +65,10 @@ public:
     return false;
   }
 
-  auto ConvertIfStmt(IfStmt *if_stmt) -> void {
+  auto ConvertIfStmt(IfStmt *if_stmt) -> llvm::Error {
     auto &sm = data.Ctx.getSourceManager();
     if (if_stmt == nullptr || !sm.isInMainFile(sm.getSpellingLoc(if_stmt->getBeginLoc()))) {
-      return;
+      return llvm::Error::success();
     }
 
     const auto *cond = if_stmt->getCond()->IgnoreParenImpCasts();
@@ -98,13 +99,18 @@ public:
     }
 
     if (!needs_rewrite && !needs_cond_hoist) {
-      return;
+      return llvm::Error::success();
     }
 
     std::string replacement_text;
     llvm::raw_string_ostream os(replacement_text);
-    const std::string original_cond_text = GetSourceText(cond, data.Ctx);
-    const std::string cond_name = needs_cond_hoist ? GetIfCondTempVarName() : original_cond_text;
+    auto original_cond_text = GetSourceText(cond, data.Ctx);
+    if (auto error = original_cond_text.takeError()) {
+      return CreateRuntimeError(std::move(llvm::formatv(
+          "\n    at {0}\nFailed to get source text for IfStmt condition: {1}",
+          cond->getExprLoc().printToString(data.Ctx.getSourceManager()), llvm::fmt_consume(std::move(error)))));
+    }
+    const std::string cond_name = needs_cond_hoist ? GetIfCondTempVarName() : *original_cond_text;
 
     // if this if-statement is part of an else-if chain, we need to wrap it in a compound statement no matter what
     if (IsPartOfElseIfChain(if_stmt)) {
@@ -112,25 +118,43 @@ public:
     }
 
     if (needs_cond_hoist) {
-      os << llvm::formatv("{0} {1} = ({2});\n", GetWordTypeStr(data.Ctx), cond_name, original_cond_text);
+      os << llvm::formatv("{0} {1} = ({2});\n", GetWordTypeStr(data.Ctx), cond_name, *original_cond_text);
     }
 
     os << llvm::formatv("if ({0}) ", cond_name);
     if (const auto *then_compound_stmt = dyn_cast<CompoundStmt>(then_stmt)) {
-      PrintSourceText(os, then_compound_stmt, data.Ctx);
+      if (auto err = PrintSourceText(os, then_compound_stmt, data.Ctx)) {
+        return CreateRuntimeError(
+            std::move(llvm::formatv("\n    at {0}\nFailed to print source text for CompoundStmt: {1}",
+                                    then_compound_stmt->getBeginLoc().printToString(data.Ctx.getSourceManager()),
+                                    llvm::fmt_consume(std::move(err)))));
+      }
     } else {
       os << "{\n";
-      PrintSourceText(os, then_stmt, data.Ctx);
+      if (auto err = PrintSourceText(os, then_stmt, data.Ctx)) {
+        return CreateRuntimeError(std::move(llvm::formatv(
+            "\n    at {0}\nFailed to print source text for statement: {1}",
+            then_stmt->getBeginLoc().printToString(data.Ctx.getSourceManager()), llvm::fmt_consume(std::move(err)))));
+      }
       os << ";\n}";
     }
 
     if (else_stmt != nullptr) {
       os << " else ";
       if (const auto *else_compound_stmt = dyn_cast<CompoundStmt>(else_stmt)) {
-        PrintSourceText(os, else_compound_stmt, data.Ctx);
+        if (auto err = PrintSourceText(os, else_compound_stmt, data.Ctx)) {
+          return CreateRuntimeError(
+              std::move(llvm::formatv("\n    at {0}\nFailed to print source text for CompoundStmt: {1}",
+                                      else_compound_stmt->getBeginLoc().printToString(data.Ctx.getSourceManager()),
+                                      llvm::fmt_consume(std::move(err)))));
+        }
       } else {
         os << "{\n";
-        PrintSourceText(os, else_stmt, data.Ctx);
+        if (auto err = PrintSourceText(os, else_stmt, data.Ctx)) {
+          return CreateRuntimeError(std::move(llvm::formatv(
+              "\n    at {0}\nFailed to print source text for statement: {1}",
+              else_stmt->getBeginLoc().printToString(data.Ctx.getSourceManager()), llvm::fmt_consume(std::move(err)))));
+        }
         os << "\n}";
       }
     }
@@ -143,10 +167,19 @@ public:
     data.replacements.emplace_back(data.Ctx.getSourceManager(),
                                    CharSourceRange::getTokenRange(if_stmt->getSourceRange()), replacement_text,
                                    data.Ctx.getLangOpts());
+
+    return llvm::Error::success();
   }
 
   auto VisitIfStmt(IfStmt *ifStmt) -> bool {
-    ConvertIfStmt(ifStmt);
+    if (data.error) {
+      return false;
+    }
+
+    if (auto error = ConvertIfStmt(ifStmt)) {
+      data.error = std::move(error);
+      return false;
+    }
 
     return true;
   }
@@ -155,23 +188,32 @@ public:
 
 auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
   llvm::SmallVector<Replacement, 64> replacements;
-  WorkerData data{.Ctx = Ctx, .pa_ctx = pa_ctx, .replacements = replacements};
+  WorkerData data{.Ctx = Ctx, .pa_ctx = ps_ctx, .replacements = replacements};
   Worker w(data);
   w.TraverseDecl(Ctx.getTranslationUnitDecl());
 
-  bool add_error_occurred = false;
+  if (data.error) {
+    ps_ctx.error = std::move(data.error);
+    ps_ctx.whats_next = WhatsNext::MoveToNextFile;
+    return;
+  }
+
+  int errors = 0;
   for (const auto &r : replacements) {
-    if (auto err = pa_ctx.replacements.add(r)) {
+    if (auto err = ps_ctx.replacements.add(r)) {
       llvm::consumeError(std::move(err));
-      llvm::errs() << llvm::formatv("{0} Add replacement conflict, retrying next pass...\n", LogBegin(pa_ctx));
-      add_error_occurred = true;
+      errors++;
     }
   }
 
-  pa_ctx.run_result = RunResult::RepeatPass;
-  if (!add_error_occurred && replacements.empty()) {
-    // All edits successfully added; no need to repeat this pass
-    pa_ctx.run_result = RunResult::Success;
+  if (errors == 0 && replacements.empty()) {
+    ps_ctx.whats_next = WhatsNext::MoveToNextPass;
+    return;
   }
+  if (errors > 0) {
+    PrintLogBegin(llvm::outs(), ps_ctx);
+    llvm::outs() << llvm::formatv("Couldn't add {0} replacement{1}\n", errors, errors != 1 ? "s" : "");
+  }
+  ps_ctx.whats_next = WhatsNext::RepeatPass;
 }
 } // namespace pancake::pass_normalise_if_statements

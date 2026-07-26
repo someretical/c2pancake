@@ -21,13 +21,11 @@
 #include <clang/Tooling/Transformer/Stencil.h>
 #include <clang/Tooling/Transformer/Transformer.h>
 #include <llvm/Support/Error.h>
-#include <llvm/Support/ErrorHandling.h>
 #include <llvm/Support/FormatAdapters.h>
 #include <llvm/Support/FormatVariadic.h>
 #include <llvm/Support/raw_ostream.h>
 
 #include <algorithm>
-#include <cassert>
 #include <cstddef>
 #include <ranges>
 #include <string>
@@ -49,28 +47,36 @@ auto MakeRule() -> RewriteRule {
 
 auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
   llvm::SmallVector<AtomicChange, 64> changes;
-  auto t = Transformer(MakeRule(), [&changes](llvm::Expected<llvm::MutableArrayRef<AtomicChange>> c) -> void {
+  llvm::Error err = llvm::Error::success();
+  auto t = Transformer(MakeRule(), [&](llvm::Expected<llvm::MutableArrayRef<AtomicChange>> c) -> void {
     if (c)
       changes.insert(changes.end(), c->begin(), c->end());
     else
-      llvm::consumeError(c.takeError());
+      err = c.takeError();
   });
 
   MatchFinder finder;
   t.registerMatchers(&finder);
   finder.matchAST(Ctx);
 
+  if (err) {
+    ps_ctx.error =
+        CreateRuntimeError(llvm::formatv("Error during transformation: {0}", llvm::fmt_consume(std::move(err))));
+    ps_ctx.whats_next = WhatsNext::MoveToNextFile;
+    return;
+  }
+
   for (const auto &change : changes) {
     for (const auto &r : change.getReplacements()) {
-      if (auto err = pa_ctx.replacements.add(r)) {
-        llvm::reportFatalInternalError(
-            llvm::formatv("Failed to add replacement: {0}", llvm::fmt_consume(std::move(err))));
+      if (auto err = ps_ctx.replacements.add(r)) {
+        ps_ctx.error = CreateRuntimeError(llvm::formatv("Add replacement conflict: {0}", err));
+        ps_ctx.whats_next = WhatsNext::MoveToNextFile;
+        return;
       }
     }
   }
 
-  // this pass should only be executed once!
-  pa_ctx.run_result = RunResult::Success;
+  ps_ctx.whats_next = WhatsNext::MoveToNextPass;
 }
 } // namespace pancake::pass_add_switch_fallthrough
 
@@ -79,6 +85,7 @@ namespace {
 struct WorkerData {
   ASTContext &Ctx;
   llvm::SmallVector<Replacement, 64> &replacements;
+  llvm::Error error = llvm::Error::success();
 };
 
 class Worker : public RecursiveASTVisitor<Worker> {
@@ -146,10 +153,11 @@ public:
     return isa<BreakStmt>(stmt) || isa<ReturnStmt>(stmt) || isa<ContinueStmt>(stmt);
   }
 
-  auto RebuildSwitchStmt(SwitchStmt *switchStmt) -> void {
+  auto RebuildSwitchStmt(SwitchStmt *switchStmt) -> llvm::Error {
     auto *switch_body = dyn_cast<CompoundStmt>(switchStmt->getBody());
     if (switch_body == nullptr) {
-      return;
+      return CreateRuntimeError(llvm::formatv("\n    at {0}\nSwitchStmt body is not a CompoundStmt",
+                                              switchStmt->getBeginLoc().printToString(data.Ctx.getSourceManager())));
     }
 
     struct CaseInfo {
@@ -399,10 +407,20 @@ public:
 
         if (const auto *case_stmt = dyn_cast<CaseStmt>(label)) {
           const auto range = CharSourceRange::getTokenRange(case_stmt->getCaseLoc(), case_stmt->getColonLoc());
-          PrintSourceText(os, range, data.Ctx);
+          if (auto err = PrintSourceText(os, range, data.Ctx)) {
+            return CreateRuntimeError(
+                std::move(llvm::formatv("\n    at {0}\nFailed to print source text for case statement: {1}",
+                                        case_stmt->getBeginLoc().printToString(data.Ctx.getSourceManager()),
+                                        llvm::fmt_consume(std::move(err)))));
+          }
         } else if (const auto *default_stmt = dyn_cast<DefaultStmt>(label)) {
           const auto range = CharSourceRange::getTokenRange(default_stmt->getDefaultLoc(), default_stmt->getColonLoc());
-          PrintSourceText(os, range, data.Ctx);
+          if (auto err = PrintSourceText(os, range, data.Ctx)) {
+            return CreateRuntimeError(
+                std::move(llvm::formatv("\n    at {0}\nFailed to print source text for default statement: {1}",
+                                        default_stmt->getBeginLoc().printToString(data.Ctx.getSourceManager()),
+                                        llvm::fmt_consume(std::move(err)))));
+          }
         }
 
         if (case_info.body.empty() || index < case_info.labels.size() - 1) {
@@ -427,7 +445,11 @@ public:
         bool terminating_stmt_found = false;
         const auto body_it = case_info.body | std::views::reverse;
         for (const auto &stmt : body_it) {
-          PrintSourceText(os, stmt, data.Ctx);
+          if (auto err = PrintSourceText(os, stmt, data.Ctx)) {
+            return CreateRuntimeError(std::move(llvm::formatv(
+                "\n    at {0}\nFailed to print source text for statement: {1}",
+                stmt->getBeginLoc().printToString(data.Ctx.getSourceManager()), llvm::fmt_consume(std::move(err)))));
+          }
           if (isa<CompoundStmt>(stmt)) {
             os << "\n";
           } else {
@@ -450,9 +472,14 @@ public:
         CharSourceRange::getCharRange(switch_body->getLBracLoc().getLocWithOffset(1), switch_body->getRBracLoc());
     os.flush();
     data.replacements.emplace_back(data.Ctx.getSourceManager(), range, new_body, data.Ctx.getLangOpts());
+    return llvm::Error::success();
   }
 
   auto VisitSwitchStmt(SwitchStmt *switchStmt) -> bool {
+    if (data.error) {
+      return false;
+    }
+
     auto &sm = data.Ctx.getSourceManager();
     if (switchStmt == nullptr || !sm.isInMainFile(sm.getSpellingLoc(switchStmt->getBeginLoc()))) {
       return true;
@@ -462,7 +489,10 @@ public:
       return true; // continue traversing the AST if the switch statement is already valid
     }
 
-    RebuildSwitchStmt(switchStmt);
+    if (auto error = RebuildSwitchStmt(switchStmt)) {
+      data.error = std::move(error);
+      return false;
+    }
 
     // if there are any outer switch statements, their replacements will conflict so only the innermost switch
     // statement should be rewritten
@@ -477,20 +507,29 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
   Worker w(data);
   w.TraverseDecl(Ctx.getTranslationUnitDecl());
 
-  bool add_error_occurred = false;
+  if (data.error) {
+    ps_ctx.error = std::move(data.error);
+    ps_ctx.whats_next = WhatsNext::MoveToNextFile;
+    return;
+  }
+
+  int errors = 0;
   for (const auto &r : replacements) {
-    if (auto err = pa_ctx.replacements.add(r)) {
+    if (auto err = ps_ctx.replacements.add(r)) {
       llvm::consumeError(std::move(err));
-      llvm::errs() << llvm::formatv("{0} Add replacement conflict, retrying next pass...\n", LogBegin(pa_ctx));
-      add_error_occurred = true;
+      errors++;
     }
   }
 
-  pa_ctx.run_result = RunResult::RepeatPass;
-  if (!add_error_occurred && replacements.empty()) {
-    // All edits successfully added; no need to repeat this pass
-    pa_ctx.run_result = RunResult::Success;
+  if (errors == 0 && replacements.empty()) {
+    ps_ctx.whats_next = WhatsNext::MoveToNextPass;
+    return;
   }
+  if (errors > 0) {
+    PrintLogBegin(llvm::outs(), ps_ctx);
+    llvm::outs() << llvm::formatv("Couldn't add {0} replacement{1}\n", errors, errors != 1 ? "s" : "");
+  }
+  ps_ctx.whats_next = WhatsNext::RepeatPass;
 }
 } // namespace pancake::pass_normalise_switches
 
@@ -498,8 +537,9 @@ namespace pancake::pass_switch_to_if {
 namespace {
 struct WorkerData {
   ASTContext &Ctx;
-  PipelineActionCtx &pa_ctx;
+  PipelineStageCtx &pa_ctx;
   llvm::SmallVector<Replacement, 64> &replacements;
+  llvm::Error error = llvm::Error::success();
   size_t switch_cond_tmp_var_counter = 0;
 };
 
@@ -532,7 +572,7 @@ public:
     llvm::raw_string_ostream os(condition);
 
     if (contains_default_case) {
-      os << "true";
+      os << "1UL";
       return condition;
     }
 
@@ -555,11 +595,13 @@ public:
     return os.str();
   }
 
-  auto BuildIfBody(const CaseInfo &ci) const -> auto {
+  auto BuildIfBody(const CaseInfo &ci) const -> Expected<std::string> {
     std::string body;
     llvm::raw_string_ostream os(body);
 
-    assert(ci.body.size() == 1);
+    if (ci.body.size() != 1) {
+      return CreateRuntimeError(llvm::formatv("Case body has {0} statements, expected 1: {1}", ci.body.size()));
+    }
 
     if (const auto *body_stmt = dyn_cast<CompoundStmt>(ci.body.front())) {
       os << "{\n";
@@ -568,7 +610,11 @@ public:
         if (is_last && isa<BreakStmt>(stmt)) {
           // don't output the last break statement
         } else {
-          PrintSourceText(os, stmt, data.Ctx);
+          if (auto err = PrintSourceText(os, stmt, data.Ctx)) {
+            return CreateRuntimeError(std::move(llvm::formatv(
+                "\n    at {0}\nFailed to print source text for statement: {1}",
+                stmt->getBeginLoc().printToString(data.Ctx.getSourceManager()), llvm::fmt_consume(std::move(err)))));
+          }
           if (isa<CompoundStmt>(stmt)) {
             os << "\n";
           } else {
@@ -578,21 +624,24 @@ public:
       }
       os << "}\n";
     } else {
-      llvm_unreachable("Case body is not a compound statement");
+      return CreateRuntimeError(
+          llvm::formatv("Case body is not a compound statement: {0}",
+                        ci.body.front()->getBeginLoc().printToString(data.Ctx.getSourceManager())));
     }
 
-    return os.str();
+    os.flush();
+    return body;
   }
 
-  auto ConvertSwitchStmt(SwitchStmt *switchStmt) -> void {
+  auto ConvertSwitchStmt(SwitchStmt *switchStmt) -> llvm::Error {
     auto &sm = data.Ctx.getSourceManager();
     if (switchStmt == nullptr || !sm.isInMainFile(sm.getSpellingLoc(switchStmt->getBeginLoc()))) {
-      return;
+      return llvm::Error::success();
     }
 
     auto *switch_body = dyn_cast<CompoundStmt>(switchStmt->getBody());
     if (switch_body == nullptr) {
-      return;
+      return llvm::Error::success();
     }
 
     llvm::SmallVector<CaseInfo, 16> case_infos;
@@ -649,8 +698,11 @@ public:
     // first hoist the switch condition into a new tmp var
     auto *switch_cond = switchStmt->getCond();
     auto tmp_var_name = GetSwitchCondTempVarName();
-    os << llvm::formatv("{0} {1} = {2};\n", switch_cond->getType().getAsString(), tmp_var_name,
-                        GetSourceText(switch_cond, data.Ctx));
+    auto cond_source_text = GetSourceText(switch_cond, data.Ctx);
+    if (auto error = cond_source_text.takeError()) {
+      return error;
+    }
+    os << llvm::formatv("{0} {1} = {2};\n", switch_cond->getType().getAsString(), tmp_var_name, *cond_source_text);
 
     // first case gets turned into an "if"
     // subsequent cases get turned into "else if"
@@ -664,7 +716,11 @@ public:
       if (is_first) {
         if (has_default) {
           // just output the default case body by itself
-          os << BuildIfBody(ci);
+          auto result = BuildIfBody(ci);
+          if (auto error = result.takeError()) {
+            return error;
+          }
+          os << *result;
           break;
         }
 
@@ -672,7 +728,11 @@ public:
         os << "if (";
         os << BuildConditionExpr(ci, tmp_var_name, has_default);
         os << ") ";
-        os << BuildIfBody(ci);
+        auto result = BuildIfBody(ci);
+        if (auto error = result.takeError()) {
+          return error;
+        }
+        os << *result;
       }
       /* else if (is_last) {
         if (has_default) {
@@ -689,14 +749,22 @@ public:
       else {
         if (has_default) {
           os << "else ";
-          os << BuildIfBody(ci);
+          auto result = BuildIfBody(ci);
+          if (auto error = result.takeError()) {
+            return error;
+          }
+          os << *result;
           break;
         }
 
         os << "else if (";
         os << BuildConditionExpr(ci, tmp_var_name, has_default);
         os << ") ";
-        os << BuildIfBody(ci);
+        auto result = BuildIfBody(ci);
+        if (auto error = result.takeError()) {
+          return error;
+        }
+        os << *result;
       }
     }
 
@@ -704,10 +772,18 @@ public:
     data.replacements.emplace_back(data.Ctx.getSourceManager(),
                                    CharSourceRange::getTokenRange(switchStmt->getSourceRange()), converted,
                                    data.Ctx.getLangOpts());
+    return llvm::Error::success();
   }
 
   auto VisitSwitchStmt(SwitchStmt *switchStmt) -> bool {
-    ConvertSwitchStmt(switchStmt);
+    if (data.error) {
+      return false;
+    }
+
+    if (auto error = ConvertSwitchStmt(switchStmt)) {
+      data.error = std::move(error);
+      return false;
+    }
 
     return true;
   }
@@ -716,23 +792,32 @@ public:
 
 auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
   llvm::SmallVector<Replacement, 64> replacements;
-  WorkerData data{.Ctx = Ctx, .pa_ctx = pa_ctx, .replacements = replacements};
+  WorkerData data{.Ctx = Ctx, .pa_ctx = ps_ctx, .replacements = replacements};
   Worker w(data);
   w.TraverseDecl(Ctx.getTranslationUnitDecl());
 
-  bool add_error_occurred = false;
+  if (data.error) {
+    ps_ctx.error = std::move(data.error);
+    ps_ctx.whats_next = WhatsNext::MoveToNextFile;
+    return;
+  }
+
+  int errors = 0;
   for (const auto &r : replacements) {
-    if (auto err = pa_ctx.replacements.add(r)) {
+    if (auto err = ps_ctx.replacements.add(r)) {
       llvm::consumeError(std::move(err));
-      llvm::errs() << llvm::formatv("{0} Add replacement conflict, retrying next pass...\n", LogBegin(pa_ctx));
-      add_error_occurred = true;
+      errors++;
     }
   }
 
-  pa_ctx.run_result = RunResult::RepeatPass;
-  if (!add_error_occurred && replacements.empty()) {
-    // All edits successfully added; no need to repeat this pass
-    pa_ctx.run_result = RunResult::Success;
+  if (errors == 0 && replacements.empty()) {
+    ps_ctx.whats_next = WhatsNext::MoveToNextPass;
+    return;
   }
+  if (errors > 0) {
+    PrintLogBegin(llvm::outs(), ps_ctx);
+    llvm::outs() << llvm::formatv("Couldn't add {0} replacement{1}\n", errors, errors != 1 ? "s" : "");
+  }
+  ps_ctx.whats_next = WhatsNext::RepeatPass;
 }
 } // namespace pancake::pass_switch_to_if

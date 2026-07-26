@@ -28,10 +28,10 @@
 #include <llvm/ADT/StringRef.h>
 #include <llvm/Support/Error.h>
 #include <llvm/Support/ErrorHandling.h>
+#include <llvm/Support/FormatAdapters.h>
 #include <llvm/Support/FormatVariadic.h>
 #include <llvm/Support/raw_ostream.h>
 
-#include <cassert>
 #include <string>
 #include <utility>
 
@@ -44,86 +44,102 @@ using namespace clang::tooling;
 namespace pancake::pass_name_anon_records {
 namespace {
 auto MakeRule() -> RewriteRule {
-  return makeRule(recordDecl(isDefinition(), isExpansionInMainFile()).bind("record"),
-                  [](const MatchFinder::MatchResult &result) -> Expected<SmallVector<Edit, 1>> {
-                    const auto *rd = result.Nodes.getNodeAs<RecordDecl>("record");
+  return makeRule(
+      recordDecl(isDefinition(), isExpansionInMainFile()).bind("record"),
+      [](const MatchFinder::MatchResult &result) -> Expected<SmallVector<Edit, 1>> {
+        const auto *rd = result.Nodes.getNodeAs<RecordDecl>("record");
 
-                    /*
-                    Cases
+        /*
+        Cases
 
-                    DO name
-                    struct { int x; } a;
+        DO name
+        struct { int x; } a;
 
-                    DO name
-                    typedef struct { int x; } T;
+        DO name
+        typedef struct { int x; } T;
 
-                    DON'T name since x is injected as an IndirectFieldDecl into Outer
-                    struct Outer {
-                        struct {
-                            int x;
-                        };
-                    };
+        DON'T name since x is injected as an IndirectFieldDecl into Outer
+        struct Outer {
+            struct {
+                int x;
+            };
+        };
 
-                    DON'T name since x is injected as an IndirectFieldDecl into U
-                    union U {
-                        struct {
-                            int x;
-                            int y;
-                        };
-                        int z;
-                    };
-                    */
-                    if (!rd->getIdentifier() && !rd->isAnonymousStructOrUnion() &&
-                        result.Context->getSourceManager().isInMainFile(rd->getBeginLoc())) {
-                      FullSourceLoc const loc(rd->getBeginLoc(), *result.SourceManager);
-                      auto identifier = llvm::formatv("__c2pnk_anon_record_L{0}C{1}", loc.getSpellingLineNumber(),
-                                                      loc.getSpellingColumnNumber());
-                      std::string replacement_text;
-                      llvm::raw_string_ostream os(replacement_text);
-                      os << llvm::formatv("{0} {1} ", rd->isUnion() ? "union" : "struct", identifier);
+        DON'T name since x is injected as an IndirectFieldDecl into U
+        union U {
+            struct {
+                int x;
+                int y;
+            };
+            int z;
+        };
+        */
+        if (!rd->getIdentifier() && !rd->isAnonymousStructOrUnion() &&
+            result.Context->getSourceManager().isInMainFile(rd->getBeginLoc())) {
+          FullSourceLoc const loc(rd->getBeginLoc(), *result.SourceManager);
+          auto identifier =
+              llvm::formatv("__c2pnk_anon_record_L{0}C{1}", loc.getSpellingLineNumber(), loc.getSpellingColumnNumber());
+          std::string replacement_text;
+          llvm::raw_string_ostream os(replacement_text);
+          os << llvm::formatv("{0} {1} ", rd->isUnion() ? "union" : "struct", identifier);
 
-                      SourceLocation const l_brace = rd->getBraceRange().getBegin();
-                      SourceLocation const r_brace = rd->getBraceRange().getEnd();
-                      PrintSourceText(os, CharSourceRange::getTokenRange(l_brace, r_brace), *result.Context);
-                      os.flush();
+          SourceLocation const l_brace = rd->getBraceRange().getBegin();
+          SourceLocation const r_brace = rd->getBraceRange().getEnd();
+          if (auto err = PrintSourceText(os, CharSourceRange::getTokenRange(l_brace, r_brace), *result.Context)) {
+            return CreateRuntimeError(std::move(llvm::formatv(
+                "\n    at {0}\nFailed to print source text for RecordDecl: {1}",
+                rd->getBeginLoc().printToString(*result.SourceManager), llvm::fmt_consume(std::move(err)))));
+          }
+          os.flush();
 
-                      return edit(changeTo(node("record"), cat(replacement_text)))(result);
-                    }
+          return edit(changeTo(node("record"), cat(replacement_text)))(result);
+        }
 
-                    return noEdits()(result);
-                  });
+        return noEdits()(result);
+      });
 }
 } // namespace
 
 auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
   llvm::SmallVector<AtomicChange, 64> changes;
-  auto t = Transformer(MakeRule(), [&changes](llvm::Expected<llvm::MutableArrayRef<AtomicChange>> c) -> void {
+  llvm::Error err = llvm::Error::success();
+  auto t = Transformer(MakeRule(), [&](llvm::Expected<llvm::MutableArrayRef<AtomicChange>> c) -> void {
     if (c)
       changes.insert(changes.end(), c->begin(), c->end());
     else
-      llvm::consumeError(c.takeError());
+      err = c.takeError();
   });
 
   MatchFinder finder;
   t.registerMatchers(&finder);
   finder.matchAST(Ctx);
 
-  bool add_error_occurred = false;
+  if (err) {
+    ps_ctx.error =
+        CreateRuntimeError(llvm::formatv("Error during transformation: {0}", llvm::fmt_consume(std::move(err))));
+    ps_ctx.whats_next = WhatsNext::MoveToNextFile;
+    return;
+  }
+
+  int errors = 0;
   for (const auto &change : changes) {
     for (const auto &r : change.getReplacements()) {
-      if (auto err = pa_ctx.replacements.add(r)) {
+      if (auto err = ps_ctx.replacements.add(r)) {
         llvm::consumeError(std::move(err));
-        llvm::errs() << llvm::formatv("{0} Add replacement conflict, retrying next pass...\n", LogBegin(pa_ctx));
-        add_error_occurred = true;
+        errors++;
       }
     }
   }
 
-  pa_ctx.run_result = RunResult::RepeatPass;
-  if (!add_error_occurred && changes.empty()) {
-    // All edits successfully added; no need to repeat this pass
-    pa_ctx.run_result = RunResult::Success;
+  if (errors == 0 && changes.empty()) {
+    ps_ctx.whats_next = WhatsNext::MoveToNextPass;
+    return;
   }
+  if (errors > 0) {
+    PrintLogBegin(llvm::outs(), ps_ctx);
+    llvm::outs() << llvm::formatv("Couldn't add {0} replacement{1}\n", errors, errors != 1 ? "s" : "");
+  }
+  ps_ctx.whats_next = WhatsNext::RepeatPass;
 }
 }; // namespace pancake::pass_name_anon_records
 
@@ -137,7 +153,10 @@ auto MakeRule() -> RewriteRule {
                     const auto *rd = result.Nodes.getNodeAs<RecordDecl>("record");
 
                     auto name = rd->getName();
-                    assert(!name.empty() && "RecordDecl should have a name at this point");
+                    if (name.empty()) {
+                      return CreateRuntimeError(llvm::formatv("RecordDecl has no name: {0}",
+                                                              rd->getBeginLoc().printToString(*result.SourceManager)));
+                    }
                     const char *prefix = "__c2pnk_promoted_record";
                     if (name.starts_with(prefix))
                       return noEdits()(result);
@@ -202,33 +221,44 @@ auto MakeRule() -> RewriteRule {
 
 auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
   llvm::SmallVector<AtomicChange, 64> changes;
-  auto t = Transformer(MakeRule(), [&changes](llvm::Expected<llvm::MutableArrayRef<AtomicChange>> c) -> void {
+  llvm::Error err = llvm::Error::success();
+  auto t = Transformer(MakeRule(), [&](llvm::Expected<llvm::MutableArrayRef<AtomicChange>> c) -> void {
     if (c)
       changes.insert(changes.end(), c->begin(), c->end());
     else
-      llvm::consumeError(c.takeError());
+      err = c.takeError();
   });
 
   MatchFinder finder;
   t.registerMatchers(&finder);
   finder.matchAST(Ctx);
 
-  bool add_error_occurred = false;
+  if (err) {
+    ps_ctx.error =
+        CreateRuntimeError(llvm::formatv("Error during transformation: {0}", llvm::fmt_consume(std::move(err))));
+    ps_ctx.whats_next = WhatsNext::MoveToNextFile;
+    return;
+  }
+
+  int errors = 0;
   for (const auto &change : changes) {
     for (const auto &r : change.getReplacements()) {
-      if (auto err = pa_ctx.replacements.add(r)) {
+      if (auto err = ps_ctx.replacements.add(r)) {
         llvm::consumeError(std::move(err));
-        llvm::errs() << llvm::formatv("{0} Add replacement conflict, retrying next pass...\n", LogBegin(pa_ctx));
-        add_error_occurred = true;
+        errors++;
       }
     }
   }
 
-  pa_ctx.run_result = RunResult::RepeatPass;
-  if (!add_error_occurred && changes.empty()) {
-    // All edits successfully added; no need to repeat this pass
-    pa_ctx.run_result = RunResult::Success;
+  if (errors == 0 && changes.empty()) {
+    ps_ctx.whats_next = WhatsNext::MoveToNextPass;
+    return;
   }
+  if (errors > 0) {
+    PrintLogBegin(llvm::outs(), ps_ctx);
+    llvm::outs() << llvm::formatv("Couldn't add {0} replacement{1}\n", errors, errors != 1 ? "s" : "");
+  }
+  ps_ctx.whats_next = WhatsNext::RepeatPass;
 }
 } // namespace pancake::pass_rename_to_be_promoted_records
 
@@ -236,8 +266,9 @@ namespace pancake::pass_promote_records {
 namespace {
 struct WorkerData {
   ASTContext &Ctx;
-  PipelineActionCtx &pa_ctx;
+  PipelineStageCtx &pa_ctx;
   llvm::SmallVector<Replacement, 64> &replacements;
+  llvm::Error error = llvm::Error::success();
   FunctionDecl *current_function_decl = nullptr;
   RecordDecl *current_record_decl = nullptr;
   llvm::DenseMap<FunctionDecl *, llvm::SmallVector<RecordDecl *, 16>> function_to_record_decls;
@@ -253,6 +284,10 @@ public:
   static auto shouldTraversePostOrder() -> bool { return false; }
 
   auto TraverseFunctionDecl(FunctionDecl *func_decl) -> bool {
+    if (data.error) {
+      return false;
+    }
+
     auto *tmp = data.current_function_decl;
     data.current_function_decl = func_decl;
     auto res = RecursiveASTVisitor::TraverseFunctionDecl(func_decl);
@@ -263,7 +298,13 @@ public:
       llvm::raw_string_ostream os(replacement_text);
       os << "\n/* c2pancake: promoted record declarations for function " << func_decl->getName() << " BEGIN */\n";
       for (const auto *record_decl : it->second) {
-        PrintSourceText(os, record_decl, data.Ctx);
+        if (auto err = PrintSourceText(os, record_decl, data.Ctx)) {
+          data.error = CreateRuntimeError(
+              std::move(llvm::formatv("\n    at {0}\nFailed to print source text for RecordDecl: {1}",
+                                      record_decl->getBeginLoc().printToString(data.Ctx.getSourceManager()),
+                                      llvm::fmt_consume(std::move(err)))));
+          return false;
+        }
         os << ";\n";
       }
       os << "/* c2pancake: promoted record declarations for function " << func_decl->getName() << " END */\n";
@@ -277,6 +318,10 @@ public:
   }
 
   auto TraverseRecordDecl(RecordDecl *record_decl) -> bool {
+    if (data.error) {
+      return false;
+    }
+
     auto *tmp = data.current_record_decl;
     data.current_record_decl = record_decl;
     auto res = RecursiveASTVisitor::TraverseRecordDecl(record_decl);
@@ -285,17 +330,30 @@ public:
   }
 
   auto TraverseDeclStmt(DeclStmt *declStmt) -> bool {
+    if (data.error) {
+      return false;
+    }
+
     auto &sm = data.Ctx.getSourceManager();
     if (declStmt == nullptr || !sm.isInMainFile(sm.getSpellingLoc(declStmt->getBeginLoc())) ||
         data.current_function_decl == nullptr || data.current_record_decl != nullptr) {
       return true;
     }
 
-    assert(declStmt->isSingleDecl() && "DeclStmt should only have a single decl at this point");
+    if (!declStmt->isSingleDecl()) {
+      data.error = CreateRuntimeError(
+          llvm::formatv("DeclStmt has multiple decls at {0}", declStmt->getBeginLoc().printToString(sm)));
+      return false;
+    }
+
     if (auto *record_decl = dyn_cast<RecordDecl>(declStmt->getSingleDecl())) {
       if (record_decl->isThisDeclarationADefinition()) {
         auto name = record_decl->getName();
-        assert(name.starts_with("__c2pnk_promoted_record") && "RecordDecl should have a promoted name at this point");
+        if (!name.starts_with("__c2pnk_promoted_record")) {
+          data.error = CreateRuntimeError(llvm::formatv("RecordDecl {0} is not a promoted record at {1}", name,
+                                                        record_decl->getBeginLoc().printToString(sm)));
+          return false;
+        }
 
         // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
         data.function_to_record_decls[data.current_function_decl].push_back(record_decl);
@@ -313,7 +371,7 @@ public:
 auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
   llvm::SmallVector<Replacement, 64> replacements;
   WorkerData data{.Ctx = Ctx,
-                  .pa_ctx = pa_ctx,
+                  .pa_ctx = ps_ctx,
                   .replacements = replacements,
                   .current_function_decl = nullptr,
                   .current_record_decl = nullptr,
@@ -321,19 +379,20 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
   Worker w(data);
   w.TraverseDecl(Ctx.getTranslationUnitDecl());
 
-  bool add_error_occurred = false;
+  if (data.error) {
+    ps_ctx.error = std::move(data.error);
+    ps_ctx.whats_next = WhatsNext::MoveToNextFile;
+    return;
+  }
+
   for (const auto &r : replacements) {
-    if (auto err = pa_ctx.replacements.add(r)) {
-      llvm::consumeError(std::move(err));
-      llvm::errs() << llvm::formatv("{0} Add replacement conflict, retrying next pass...\n", LogBegin(pa_ctx));
-      add_error_occurred = true;
+    if (auto err = ps_ctx.replacements.add(r)) {
+      ps_ctx.error = CreateRuntimeError(llvm::formatv("Add replacement conflict: {0}", err));
+      ps_ctx.whats_next = WhatsNext::MoveToNextFile;
+      return;
     }
   }
 
-  pa_ctx.run_result = RunResult::Success;
-  if (!add_error_occurred && replacements.empty()) {
-    // All edits successfully added; no need to repeat this pass
-    pa_ctx.run_result = RunResult::Success;
-  }
+  ps_ctx.whats_next = WhatsNext::MoveToNextPass;
 }
 } // namespace pancake::pass_promote_records

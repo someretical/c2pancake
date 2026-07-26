@@ -10,13 +10,9 @@ public:
   void HandleTranslationUnit(clang::ASTContext &Ctx) override;
 };
 
-class Action : public PipelineAction<Consumer> {
+class Action : public PipelineStage<Consumer> {
 public:
-  explicit Action(PipelineActionCtx &ctx) : PipelineAction<Consumer>(ctx) {
-    ctx.action_name = "NameAnonymousRecords";
-    ctx.failure_behaviour = FailureBehaviour::RepeatPass;
-    ctx.action_type = PipelineActionType::Rewriter;
-  }
+  explicit Action(PipelineStageCtx &ctx) : PipelineStage<Consumer>(ctx) { ctx.action_name = "NameAnonymousRecords"; }
 };
 } // namespace pancake::pass_name_anon_records
 
@@ -27,12 +23,10 @@ public:
   void HandleTranslationUnit(clang::ASTContext &Ctx) override;
 };
 
-class Action : public PipelineAction<Consumer> {
+class Action : public PipelineStage<Consumer> {
 public:
-  explicit Action(PipelineActionCtx &ctx) : PipelineAction<Consumer>(ctx) {
+  explicit Action(PipelineStageCtx &ctx) : PipelineStage<Consumer>(ctx) {
     ctx.action_name = "RenameToBePromotedRecords";
-    ctx.failure_behaviour = FailureBehaviour::RepeatPass;
-    ctx.action_type = PipelineActionType::Rewriter;
   }
 };
 } // namespace pancake::pass_rename_to_be_promoted_records
@@ -46,13 +40,9 @@ public:
   void HandleTranslationUnit(clang::ASTContext &Ctx) override;
 };
 
-class Action : public PipelineAction<Consumer> {
+class Action : public PipelineStage<Consumer> {
 public:
-  explicit Action(PipelineActionCtx &ctx) : PipelineAction<Consumer>(ctx) {
-    ctx.action_name = "PromoteRecords";
-    ctx.failure_behaviour = FailureBehaviour::RepeatPass;
-    ctx.action_type = PipelineActionType::Rewriter;
-  }
+  explicit Action(PipelineStageCtx &ctx) : PipelineStage<Consumer>(ctx) { ctx.action_name = "PromoteRecords"; }
 };
 } // namespace pancake::pass_promote_records
 
