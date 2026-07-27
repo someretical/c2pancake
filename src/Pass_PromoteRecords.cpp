@@ -24,6 +24,7 @@
 #include <clang/Tooling/Transformer/Stencil.h>
 #include <clang/Tooling/Transformer/Transformer.h>
 #include <llvm/ADT/DenseMap.h>
+#include <llvm/ADT/ScopeExit.h>
 #include <llvm/ADT/SmallVector.h>
 #include <llvm/ADT/StringRef.h>
 #include <llvm/Support/Error.h>
@@ -290,6 +291,8 @@ public:
 
     auto *tmp = data.current_function_decl;
     data.current_function_decl = func_decl;
+    auto cleanup = llvm::scope_exit([&] -> void { data.current_function_decl = tmp; });
+
     auto res = RecursiveASTVisitor::TraverseFunctionDecl(func_decl);
 
     auto it = data.function_to_record_decls.find(func_decl);
@@ -313,7 +316,6 @@ public:
       data.replacements.emplace_back(data.Ctx.getSourceManager(), func_decl->getBeginLoc(), 0, replacement_text);
     }
 
-    data.current_function_decl = tmp;
     return res;
   }
 

@@ -3,10 +3,10 @@
 
 #include <clang/Tooling/Core/Replacement.h>
 #include <clang/Tooling/Tooling.h>
-#include <llvm-22/llvm/Support/Error.h>
 #include <llvm/ADT/SmallVector.h>
 #include <llvm/ADT/StringExtras.h>
 #include <llvm/Support/CommandLine.h>
+#include <llvm/Support/Error.h>
 #include <llvm/Support/ErrorHandling.h>
 #include <llvm/Support/FileSystem.h>
 #include <llvm/Support/FormatVariadic.h>

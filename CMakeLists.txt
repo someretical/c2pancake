@@ -42,6 +42,7 @@ add_executable(
   src/Utils.cpp
   src/Pipeline.cpp
   src/Pass_InjectHeaders.cpp
+  src/Pass_FunctionCalling.cpp
   src/Pass_LowerBitfieldOps.cpp
   src/Pass_IntegerConversion.cpp
   src/Pass_TransformLogicalExpressions.cpp

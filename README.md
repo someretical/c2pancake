@@ -54,14 +54,9 @@ c2pancake tests/arith.c --
 1. Make those static symbols global, and move the non-zero initialising statements to the start of the entry point of the program. Since this transpiler doesn't act as a linker, you'll have to do this manually. 
 1. Rewrite any switch statements with loops inside them. This is problematic because the loops can have case statements inside them which cannot be correctly transpiled.
 1. Switch statement cases should be rewritten so they don't contain any `break;`s in the middle. Automatically rewriting this requires gotos (or advanced control flow analysis which is really annoying) which are not supported in Pancake. Also, case statements are only allowed at the top level scope in the switch statement since it's too complicated to parse otherwise.
+1. Static inline functions in headers should be placed in a special header file. Then run the preprocessor with args `-nostdinc -I/path/to/header` to ONLY process the special header file. This will ensure the functions are inlined and thus processed by c2pancake.  
 
 ### Other restrictions
-
-All existing structs and unions will be rewritten to use ONLY (u)int32_t/(u)int64_t (same as word size). Bitfields will be promoted to full width types. Warnings will be generated if any field is downsized. Struct definitions outside the global scope will be hoisted to global scope with name mangling.
-
-The only exception are structs which are only accessed through a pointer (e.g. memory mapped regions). They will not be rewritten.
-
-Any externally defined symbol will also be rewritten to the word size and a warning generated if necessary.
 
 All arrays in functions are considered "static" (but not shareable across threads) so no recursion is allowed. They will be hoisted into the global scope with name mangling.
 
