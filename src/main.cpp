@@ -91,6 +91,7 @@ auto main(int argc, const char **argv) -> int {
   pipeline.AddStage<pass_name_anon_records::Action>();
   pipeline.AddStage<pass_rename_to_be_promoted_records::Action>();
   pipeline.AddStage<pass_promote_records::Action>();
+  pipeline.AddStage<pass_inject_memcpy_polyfill::Action>();
   pipeline.AddStage<pass_function_calling::Action>();
   pipeline.AddStage<pass_normalise_while_loops::Action>();
   pipeline.AddStage<pass_process_continue_in_for_loops::Action>();

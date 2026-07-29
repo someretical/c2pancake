@@ -62,20 +62,22 @@ const char *non_volatile_bitfield_helpers =
 #include <stdint.h>
 static inline uint{0}_t __c2pnk_get_bit_u{0}(uint{0}_t value, uint{0}_t bit) {{ return ((value >> bit) & 1UL) != 0UL; }
 
-static inline void __c2pnk_set_bit(uint8_t *byte, uint{0}_t bit) {{
+static inline uint{0}_t __c2pnk_set_bit(uint8_t *byte, uint{0}_t bit) {{
   uint{0}_t val = (uint{0}_t)*byte;
   // truncation
   *byte = (uint8_t)(val | (uint{0}_t)(1UL << bit));
+  return 0UL;
 }
 
-static inline void __c2pnk_clear_bit(uint8_t *byte, uint{0}_t bit) {{
+static inline uint{0}_t __c2pnk_clear_bit(uint8_t *byte, uint{0}_t bit) {{
   uint{0}_t val = (uint{0}_t)*byte;
   // truncation
   *byte = (uint8_t)(val & ~(1UL << bit));
+  return 0UL;
 }
 
 /* [lhs_bit, rhs_bit) */
-static void __c2pnk_set_bitfield_u{0}(uint{0}_t value, uint8_t *field, uint{0}_t lhs_bit, uint{0}_t rhs_bit) {{
+static uint{0}_t __c2pnk_set_bitfield_u{0}(uint{0}_t value, uint8_t *field, uint{0}_t lhs_bit, uint{0}_t rhs_bit) {{
   uint{0}_t width = rhs_bit - lhs_bit;
 
   uint{0}_t i = 0UL;
@@ -86,13 +88,15 @@ static void __c2pnk_set_bitfield_u{0}(uint{0}_t value, uint8_t *field, uint{0}_t
     uint{0}_t cond = __c2pnk_get_bit_u{0}(value, i);
     uint{0}_t index = bit_index & 7UL; // % 8
     if (cond) {{
-      __c2pnk_set_bit(byte, index);
+      (void)__c2pnk_set_bit(byte, index);
     } else {{
-      __c2pnk_clear_bit(byte, index);
+      (void)__c2pnk_clear_bit(byte, index);
     }
 
     i = i + 1UL;
   }
+
+  return 0UL;
 }
 
 /* [lhs_bit, rhs_bit) */
@@ -134,8 +138,9 @@ static int{0}_t __c2pnk_get_bitfield_i{0}(const uint8_t *field, uint{0}_t lhs_bi
 }
 
 /* [lhs_bit, rhs_bit) */
-static void __c2pnk_set_bitfield_i{0}(int{0}_t value, uint8_t *field, uint{0}_t lhs_bit, uint{0}_t rhs_bit) {{
-  __c2pnk_set_bitfield_u{0}((uint{0}_t)value, field, lhs_bit, rhs_bit);
+static inline uint{0}_t __c2pnk_set_bitfield_i{0}(int{0}_t value, uint8_t *field, uint{0}_t lhs_bit, uint{0}_t rhs_bit) {{
+  (void)__c2pnk_set_bitfield_u{0}((uint{0}_t)value, field, lhs_bit, rhs_bit);
+  return 0UL;
 }
 /* c2pancake generated code end: helpers for non-volatile bitfield operations */
 

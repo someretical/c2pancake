@@ -43,6 +43,33 @@ using namespace clang::tooling;
 using namespace clang::transformer;
 using namespace clang::ast_matchers;
 
+namespace pancake::pass_inject_memcpy_polyfill {
+namespace {
+const char *memcpy_polyfill_code = R"(
+#include <stdint.h>
+static inline uint{0}_t __cp2nk_memcpy(uint8_t *dest, uint8_t *src, uint{0}_t len) {{
+  while (len > 0UL) {{
+    *dest = *src;
+    dest = dest + 1UL;
+    src = src + 1UL;
+    len = len - 1UL;
+  }
+  return 0UL;
+}
+)";
+}
+
+auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
+  const auto &sm = Ctx.getSourceManager();
+  if (auto err = ps_ctx.replacements.add({sm, sm.getLocForStartOfFile(sm.getMainFileID()), 0, memcpy_polyfill_code})) {
+    ps_ctx.error = CreateRuntimeError(llvm::formatv("Add replacement conflict: {0}", err));
+    ps_ctx.whats_next = WhatsNext::MoveToNextFile;
+    return;
+  }
+  ps_ctx.whats_next = WhatsNext::MoveToNextPass;
+}
+} // namespace pancake::pass_inject_memcpy_polyfill
+
 namespace pancake::pass_function_calling {
 namespace {
 using NonFFIFunctionDefRewrites = llvm::DenseMap<FunctionDecl *, Replacement>; // non-ffi function definition rewrites.
@@ -536,7 +563,8 @@ public:
 
       gets turned into
 
-      int __cp2nk_memcpy(uint8_t *dest, uint8_t *src, uint64/32_t len) {
+      #include <stdint.h>
+      uint64/32_t __cp2nk_memcpy(uint8_t *dest, uint8_t *src, uint64/32_t len) {
         while (len > 0UL) {
           *dest = *src;
           dest = dest + 1UL;
