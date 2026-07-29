@@ -1,3 +1,4 @@
+#include "Pass_FunctionCalling.h"
 #include "Pass_InjectHeaders.h"
 #include "Pass_IntegerConversion.h"
 #include "Pass_LoopsToWhile.h"
@@ -46,6 +47,16 @@ llvm::cl::opt<size_t> max_pass_retries( // NOLINT(misc-use-internal-linkage)
     llvm::cl::desc("Maximum number of retries for a pass before moving to the next pass (default: 10)"),
     llvm::cl::cat(c2_pancake_options), llvm::cl::init(10));
 
+llvm::cl::opt<std::string> start_at_pass( // NOLINT(misc-use-internal-linkage)
+    "start", llvm::cl::desc("Start the pipeline at this pass (default: empty, meaning start at beginning)"),
+    llvm::cl::cat(c2_pancake_options), llvm::cl::init(""));
+
+llvm::cl::opt<std::string> end_at_pass( // NOLINT(misc-use-internal-linkage)
+    "end",
+    llvm::cl::desc(
+        "End the pipeline after this pass (including retries) (default: empty, meaning end after last pass)"),
+    llvm::cl::cat(c2_pancake_options), llvm::cl::init(""));
+
 auto main(int argc, const char **argv) -> int {
   llvm::cl::SetVersionPrinter(PrintVersion);
   auto parser =
@@ -79,6 +90,8 @@ auto main(int argc, const char **argv) -> int {
   pipeline.AddStage<pass_inject_headers::Action>();
   pipeline.AddStage<pass_name_anon_records::Action>();
   pipeline.AddStage<pass_rename_to_be_promoted_records::Action>();
+  pipeline.AddStage<pass_promote_records::Action>();
+  pipeline.AddStage<pass_function_calling::Action>();
   pipeline.AddStage<pass_normalise_while_loops::Action>();
   pipeline.AddStage<pass_process_continue_in_for_loops::Action>();
   pipeline.AddStage<pass_for_to_while::Action>();
@@ -95,7 +108,6 @@ auto main(int argc, const char **argv) -> int {
   pipeline.AddStage<pass_simplify_double_negation::Action>();
   pipeline.AddStage<pass_lower_bitfield_ops::Action>();
   pipeline.AddStage<pass_simplify_addrof_deref::Action>();
-  pipeline.AddStage<pass_promote_records::Action>();
   pipeline.AddStage<pass_implicit_to_explicit_casts::Action>();
   pipeline.AddStage<pass_integer_conversion::Action>();
   // deliberately repeated. Those final explicit casts are just to make the C compiler happy, they have no effect when

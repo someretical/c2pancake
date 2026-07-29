@@ -1,6 +1,6 @@
 # c2pancake
 
-Original version developed at https://github.com/zhewenshen/c2pancake. Enhanced version developed by Yankai Zhu.
+C to [Pancake](https://cakeml.org/pancake.html) transpiler. Pancake is a new 'thin' language constructed with the aims of (1) ease of source-level verification, (2) user-controlled small memory footprint, and (3) simple transportation of correctness results from source to executable binary code.
 
 ```
 USAGE: c2pancake [options] <source0> [... <sourceN>]
@@ -15,10 +15,12 @@ Generic Options:
 
 c2pancake options:
 
+  --end=<string>              - End the pipeline after this pass (including retries) (default: empty, meaning end after last pass)
   --extra-arg=<string>        - Additional argument to append to the compiler command line
   --extra-arg-before=<string> - Additional argument to prepend to the compiler command line
   --max-pass-retries=<ulong>  - Maximum number of retries for a pass before moving to the next pass (default: 10)
   -p <string>                 - Build path
+  --start=<string>            - Start the pipeline at this pass (default: empty, meaning start at beginning)
 
 -p <build-path> is used to read a compile command database.
 
@@ -50,21 +52,17 @@ c2pancake tests/arith.c --
 
 ### Before running the tool
 
-1. Find any static symbols within functions that have non-zero initialisers. 
-1. Make those static symbols global, and move the non-zero initialising statements to the start of the entry point of the program. Since this transpiler doesn't act as a linker, you'll have to do this manually. 
+1. Remove any static symbols within functions.
 1. Rewrite any switch statements with loops inside them. This is problematic because the loops can have case statements inside them which cannot be correctly transpiled.
 1. Switch statement cases should be rewritten so they don't contain any `break;`s in the middle. Automatically rewriting this requires gotos (or advanced control flow analysis which is really annoying) which are not supported in Pancake. Also, case statements are only allowed at the top level scope in the switch statement since it's too complicated to parse otherwise.
 1. Static inline functions in headers should be placed in a special header file. Then run the preprocessor with args `-nostdinc -I/path/to/header` to ONLY process the special header file. This will ensure the functions are inlined and thus processed by c2pancake.  
 
 ### Other restrictions
 
-All arrays in functions are considered "static" (but not shareable across threads) so no recursion is allowed. They will be hoisted into the global scope with name mangling.
-
-Any stack variable which has its address taken will also be hoisted into the global scope with name mangling.
-
-Floating point types are not supported and will be promoted into ints.
-
-The insertion of `#include <stdint.h>` at the top of a file may fail if there are complex processor directives present.
+1. All arrays in functions are considered "static" (but not shareable across threads) so no recursion is allowed. They will be hoisted into the global scope with name mangling.
+1. Any stack variable which has its address taken will also be hoisted into the global scope with name mangling.
+1. Floating point types are not supported at all.
+1. Function argument evaluation order will NOT be preserved. Complicated args requiring hoisting of variables will be evaluated first while simpler expressions will be left as-is.
 
 ## Development
 
@@ -74,6 +72,8 @@ At a high level
 - LLVM 22.1.8 (use later versions at risk of breaking compatibility...)
 - GCC 16 and libstdc++16 (clang's libc++ doesn't support enough modern C++(26) features)
 - Python 3.12.3 (for fetching clang internal headers from GitHub)
+- at LEAST 24GB of RAM if using WSL + VSCode and building locally 💀
+  - for those at Trustworthy Systems working on this project, message Yankai for the script to build on dedicated infrastructure :-)
 
 ### Install LLVM + libstdc++ + other build tools
 

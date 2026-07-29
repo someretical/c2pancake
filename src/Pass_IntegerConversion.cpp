@@ -813,7 +813,7 @@ public:
 
     } else if (auto *_ = dyn_cast<FloatingLiteral>(expr)) {
       return CreateRuntimeError(
-          std::move(llvm::formatv("Floating point literals are not allowed: {1}",
+          std::move(llvm::formatv("\n    at {0}\nFloating point literals are not allowed",
                                   expr->getExprLoc().printToString(data.Ctx.getSourceManager()))));
     } else if (auto *character_literal = dyn_cast<CharacterLiteral>(expr)) {
       data.need_int_helpers = true;

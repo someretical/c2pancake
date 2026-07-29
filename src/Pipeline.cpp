@@ -22,6 +22,8 @@
 using namespace pancake;
 
 extern llvm::cl::opt<size_t> max_pass_retries;
+extern llvm::cl::opt<std::string> start_at_pass;
+extern llvm::cl::opt<std::string> end_at_pass;
 
 auto Pipeline::Run() -> int {
   const auto &initial_files = options_parser.getSourcePathList();
@@ -31,11 +33,12 @@ auto Pipeline::Run() -> int {
 
     PrintLogBeginShort(llvm::outs(), initial_file);
     llvm::outs() << "Starting processing\n";
+    bool start_at_pass_found = start_at_pass.empty();
 
-    for (size_t j = 0; j < factories.size(); ++j) {
-      auto &factory = factories.at(j);
-      for (size_t k = 0; k < max_pass_retries; ++k) {
-        std::string next_suffix = llvm::formatv(".{0}-{1}-c2pnk.c", j, k);
+    for (size_t pass_num = 0; pass_num < factories.size(); ++pass_num) {
+      auto &factory = factories.at(pass_num);
+      for (size_t pass_retry = 0; pass_retry < max_pass_retries; ++pass_retry) {
+        std::string next_suffix = llvm::formatv(".{0}-{1}-c2pnk.c", pass_num, pass_retry);
         const StagedCompilationDatabase db(options_parser.getCompilations(), current_suffix);
         const std::string current_file = llvm::formatv("{0}{1}", initial_file, current_suffix);
         const std::string next_file = llvm::formatv("{0}{1}", initial_file, next_suffix);
@@ -53,7 +56,7 @@ auto Pipeline::Run() -> int {
 
         const auto &command = commands.at(0);
         clang::tooling::Replacements replacements;
-        PipelineStageCtx ctx(j, k, replacements, current_file, current_suffix, next_file, next_suffix);
+        PipelineStageCtx ctx(pass_num, pass_retry, replacements, current_file, current_suffix, next_file, next_suffix);
         auto action = factory->BetterCreate(ctx);
         if (!ctx.action_name.has_value()) {
           PrintLogBegin(llvm::errs(), ctx);
@@ -62,6 +65,17 @@ auto Pipeline::Run() -> int {
         }
 
         clang::tooling::ToolInvocation invocation(command.CommandLine, std::move(action), &tool.getFiles());
+
+        if (!start_at_pass_found) {
+          if (*ctx.action_name == start_at_pass) {
+            start_at_pass_found = true;
+          } else {
+            PrintLogBegin(llvm::outs(), ctx);
+            llvm::outs() << "Skipping pass because name didn't match \"start\" option\n";
+            goto move_to_next_pass;
+          }
+        }
+
         if (!invocation.run()) {
           // abnormal failure
           PrintLogBegin(llvm::errs(), ctx);
@@ -116,7 +130,7 @@ auto Pipeline::Run() -> int {
 
           current_suffix = next_suffix;
 
-          if (k + 1 >= max_pass_retries) {
+          if (pass_retry + 1 >= max_pass_retries) {
             PrintLogBegin(llvm::errs(), ctx);
             llvm::errs() << llvm::formatv(
                 "WARNING: Maximum number of passes ({0}) reached, consider increasing the limit\n", max_pass_retries);
@@ -139,6 +153,11 @@ auto Pipeline::Run() -> int {
         // NOLINTNEXTLINE(readability-simplify-boolean-expr)
         if (false) {
         move_to_next_pass:
+          if (!end_at_pass.empty() && *ctx.action_name == end_at_pass) {
+            PrintLogBeginShort(llvm::outs(), initial_file);
+            llvm::outs() << llvm::formatv("End at pass requested due to \"end\" option\n");
+            goto move_to_next_file;
+          }
           break;
         }
       }

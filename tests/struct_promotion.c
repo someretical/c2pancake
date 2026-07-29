@@ -31,7 +31,6 @@ union U {
 struct GlobalPoint {
   int x;
   int y;
-  float z;
 };
 
 /* Pointer-only struct (must be IGNORED) */
@@ -49,7 +48,6 @@ struct BitfieldFlags {
 /* Mixed struct (array and pointer fields left alone) */
 struct MixedStruct {
   short count;     /* scalar  - promoted                   */
-  char name[64];   /* array   - left alone                 */
   int *ptr;        /* pointer - left alone                 */
   unsigned int id; /* scalar  - promoted                   */
   char grid[4][8]; /* 2-D array - left alone               */
@@ -60,7 +58,6 @@ struct Nested {
   int tag; /* scalar - promoted                   */
   union {  /* anonymous union - rendered inline   */
     int as_int;
-    float as_float;
   };
   struct { /* anonymous struct - rendered inline  */
     short lo;
@@ -87,7 +84,7 @@ void use_bitfield(void) {
 }
 
 void use_mixed(void) {
-  struct MixedStruct m = {3, "hello", 0, 42u};
+  struct MixedStruct m = {3, 0, 42u};
   (void)m;
 }
 
@@ -101,7 +98,7 @@ void use_local_rect(void) {
   struct LocalRect {
     short width;
     short height;
-  } r = {100, 200};
+  } r[10] = {100, 200};
   (void)r;
 
   struct MixedStruct2 {
@@ -120,7 +117,6 @@ void use_local_rect(void) {
     int tag;
     union {
       int as_int;
-      float as_float;
     };
     struct {
       short lo;

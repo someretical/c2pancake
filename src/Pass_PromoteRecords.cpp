@@ -342,26 +342,52 @@ public:
       return true;
     }
 
-    if (!declStmt->isSingleDecl()) {
-      data.error = CreateRuntimeError(
-          llvm::formatv("DeclStmt has multiple decls at {0}", declStmt->getBeginLoc().printToString(sm)));
-      return false;
+    if (declStmt->isSingleDecl()) {
+      if (auto *record_decl = dyn_cast<RecordDecl>(declStmt->getSingleDecl())) {
+        if (record_decl->isThisDeclarationADefinition()) {
+          auto name = record_decl->getName();
+          if (!name.starts_with("__c2pnk_promoted_record")) {
+            data.error = CreateRuntimeError(llvm::formatv("\n    at {0}\nRecordDecl {1} is not a promoted record",
+                                                          record_decl->getBeginLoc().printToString(sm), name));
+            return false;
+          }
+
+          // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
+          data.function_to_record_decls[data.current_function_decl].push_back(record_decl);
+          data.replacements.emplace_back(data.Ctx.getSourceManager(),
+                                         CharSourceRange::getTokenRange(declStmt->getSourceRange()), "",
+                                         data.Ctx.getLangOpts());
+          return RecursiveASTVisitor::TraverseDeclStmt(declStmt);
+        }
+      }
     }
 
-    if (auto *record_decl = dyn_cast<RecordDecl>(declStmt->getSingleDecl())) {
+    std::string replacement_text;
+    llvm::raw_string_ostream os(replacement_text);
+
+    auto *first_decl = *declStmt->decl_begin();
+    if (auto *record_decl = dyn_cast<RecordDecl>(first_decl)) {
       if (record_decl->isThisDeclarationADefinition()) {
         auto name = record_decl->getName();
         if (!name.starts_with("__c2pnk_promoted_record")) {
-          data.error = CreateRuntimeError(llvm::formatv("RecordDecl {0} is not a promoted record at {1}", name,
-                                                        record_decl->getBeginLoc().printToString(sm)));
+          data.error = CreateRuntimeError(llvm::formatv("\n    at {0}\nRecordDecl {1} is not a promoted record at {1}",
+                                                        record_decl->getBeginLoc().printToString(sm), name));
           return false;
         }
 
         // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
         data.function_to_record_decls[data.current_function_decl].push_back(record_decl);
+        data.replacements.emplace_back(
+            data.Ctx.getSourceManager(), CharSourceRange::getTokenRange(record_decl->getSourceRange()),
+            llvm::formatv("{0} {1}", record_decl->getKindName(), record_decl->getName()).str(), data.Ctx.getLangOpts());
+      }
+
+      os.flush();
+      if (!replacement_text.empty()) {
         data.replacements.emplace_back(data.Ctx.getSourceManager(),
-                                       CharSourceRange::getTokenRange(declStmt->getSourceRange()), "",
+                                       CharSourceRange::getTokenRange(declStmt->getSourceRange()), replacement_text,
                                        data.Ctx.getLangOpts());
+        return true;
       }
     }
 

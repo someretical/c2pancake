@@ -814,7 +814,9 @@ public:
         // don't add anything to os
       } else {
         std::string tmp_var_name = GetTempVarName("GNUStmtExprResult");
-        os2 << llvm::formatv("{0};\n", PrintType(last_stmt_as_expr->getType(), tmp_var_name));
+        if (!last_stmt_as_expr->getType()->isVoidType()) {
+          os2 << llvm::formatv("{0};\n", PrintType(last_stmt_as_expr->getType(), tmp_var_name));
+        }
         os2 << "{\n";
         for (auto *stmt : compound_stmt->body()) {
           if (stmt == last) {
@@ -831,7 +833,11 @@ public:
             os2 << llvm::join(last_expr_built_expr->pre_stmts | std::views::reverse, "\n");
 
             // assign the result of the last expression to the temporary variable
-            os2 << llvm::formatv("\n{0} = {1};", tmp_var_name, last_expr_built_expr->final_expr);
+            if (!last_stmt_as_expr->getType()->isVoidType()) {
+              os2 << llvm::formatv("\n{0} = {1};", tmp_var_name, last_expr_built_expr->final_expr);
+            } else {
+              os2 << llvm::formatv("\n(void){0};", last_expr_built_expr->final_expr);
+            }
           } else {
             if (auto err = PrintSourceText(os2, stmt, data.Ctx)) {
               return CreateRuntimeError(std::move(llvm::formatv(

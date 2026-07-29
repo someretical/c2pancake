@@ -10,6 +10,7 @@
             "name": "Debug c2pancake with current file",
             "program": "${command:cmake.getLaunchTargetPath}",
             "args": [
+                "--end=RewriteFunctionCalling",
                 "${file}",
                 "--",
                 // "--target=aarch64-linux-gnu",
