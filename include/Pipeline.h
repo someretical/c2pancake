@@ -69,7 +69,7 @@ public:
   auto EndSourceFileAction() -> void override {
     if (ps_ctx.error) {
       PrintLogBegin(llvm::errs(), ps_ctx);
-      llvm::errs() << "Not writing output file due to error";
+      llvm::errs() << "Not writing output file due to error\n";
       return;
     }
 

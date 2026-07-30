@@ -115,10 +115,19 @@ struct BuildExprCtx {
       std::pair<std::reference_wrapper<const std::string>, std::reference_wrapper<const clang::QualType>>;
   std::optional<AssignedToPair> assigned_to; // if this expression is being assigned to a variable, this is the name and
                                              // type of that variable. This is only relevant for init list expressions
+
+  enum class StringLiteralUsageKind : uint8_t {
+    AsArray,  // used as an array (e.g. char arr[] = "abc";)
+    AsPointer // used as a pointer (e.g. char *p = "abc";)
+  };
+  std::optional<StringLiteralUsageKind> string_literal_usage_kind; // if this expression is a string literal, this is
+                                                                   // how it is being used. This is only relevant for
+                                                                   // init list expressions
   explicit BuildExprCtx(clang::Expr *expr, Usage usage_kind, bool deref_force_extract,
-                        std::optional<AssignedToPair> assigned_to)
+                        std::optional<AssignedToPair> assigned_to,
+                        std::optional<StringLiteralUsageKind> string_literal_usage_kind)
       : expr(expr), usage_kind(usage_kind), deref_force_extract(deref_force_extract),
-        assigned_to(std::move(assigned_to)) {}
+        assigned_to(std::move(assigned_to)), string_literal_usage_kind(string_literal_usage_kind) {}
 };
 
 auto GetUsage(const clang::ASTContext &ctx, const clang::Expr *expr) -> llvm::Expected<Usage>;

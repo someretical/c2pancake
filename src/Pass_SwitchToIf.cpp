@@ -402,7 +402,7 @@ public:
     llvm::raw_string_ostream os(new_body);
     for (const auto &case_info : valid_case_infos) {
       auto reverse_labels = case_info.labels | std::views::reverse;
-      for (const auto [index, label] : std::views::enumerate(reverse_labels)) {
+      for (const auto [index, label] : reverse_labels | std::views::enumerate) {
         os << "\n";
 
         if (const auto *case_stmt = dyn_cast<CaseStmt>(label)) {
@@ -707,7 +707,7 @@ public:
     // first case gets turned into an "if"
     // subsequent cases get turned into "else if"
     // if any set of cases has a default, it becomes the last one and is turned into an "else"
-    for (const auto &[i, ci] : std::views::enumerate(valid_case_infos)) {
+    for (const auto &[i, ci] : valid_case_infos | std::views::enumerate) {
       bool const is_first = (i == 0);
       // bool const is_last = (i + 1 == valid_case_infos.size());
       bool const has_default =

@@ -49,7 +49,7 @@ auto Pipeline::Run() -> int {
           PrintLogBeginShort(llvm::errs(), current_file);
           llvm::errs() << llvm::formatv("WARNING: {0} (>1) compile commands found, only executing the first one\n",
                                         commands.size());
-          for (const auto [i, cmd] : std::views::enumerate(commands)) {
+          for (const auto [i, cmd] : commands | std::views::enumerate) {
             llvm::errs() << llvm::formatv("    {0}: {1}\n", i, llvm::join(cmd.CommandLine, " "));
           }
         }

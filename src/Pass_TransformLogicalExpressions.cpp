@@ -522,11 +522,50 @@ public:
                                     llvm::fmt_consume(std::move(err)))));
       }
     } else if (auto *string_literal = dyn_cast<StringLiteral>(expr)) {
-      if (auto err = PrintSourceText(os, string_literal, data.Ctx)) {
-        return CreateRuntimeError(
-            std::move(llvm::formatv("\n    at {0}\nFailed to print source text for StringLiteral: {1}",
-                                    string_literal->getExprLoc().printToString(data.Ctx.getSourceManager()),
-                                    llvm::fmt_consume(std::move(err)))));
+      if (ctx.string_literal_usage_kind.has_value()) {
+        auto usage_kind = ctx.string_literal_usage_kind.value();
+        std::string expanded;
+        llvm::raw_string_ostream os2(expanded);
+        os2 << "{ ";
+        for (auto c : string_literal->getString()) {
+          os2 << "'" << c << "', ";
+        }
+        os2 << "'\\0' }";
+        os2.flush();
+
+        switch (usage_kind) {
+        case BuildExprCtx::StringLiteralUsageKind::AsArray: {
+          // expand to { 'char1', 'char2' ... 'charN', '\0' } and repeat the pass
+          // note there's an edge case here where we can have char a[3] = "abc"; and there is no null terminator but I
+          // can't be bothered dealing with this edge case
+          os << expanded;
+          break;
+        }
+        case BuildExprCtx::StringLiteralUsageKind::AsPointer: {
+          // create new char array variable and return the pointer to the zero-th element of the array,
+          //
+          // e.g. "char __c2pnk_str_0[] = { 'char1', 'char2', ..., 'charN', '\0' };" and return "__c2pnk_str_0"
+          std::string tmp_var_name = GetTempVarName("StringLiteral");
+          pre_stmts.emplace_back(
+              llvm::formatv("{0} = {1};", PrintType(string_literal->getType(), tmp_var_name), expanded));
+          os << tmp_var_name;
+          break;
+        }
+        default: {
+          return CreateRuntimeError(
+              std::move(llvm::formatv("\n    at {0}\nUnhandled StringLiteralUsageKind: {1}",
+                                      string_literal->getExprLoc().printToString(data.Ctx.getSourceManager()),
+                                      std::to_underlying(usage_kind))));
+        }
+        }
+        data.ps_ctx.whats_next = WhatsNext::RepeatPass;
+      } else {
+        if (auto err = PrintSourceText(os, string_literal, data.Ctx)) {
+          return CreateRuntimeError(
+              std::move(llvm::formatv("\n    at {0}\nFailed to print source text for StringLiteral: {1}",
+                                      string_literal->getExprLoc().printToString(data.Ctx.getSourceManager()),
+                                      llvm::fmt_consume(std::move(err)))));
+        }
       }
     } else if (auto *implicit_value_init_expr = dyn_cast<ImplicitValueInitExpr>(expr)) {
       return CreateRuntimeError(
@@ -538,7 +577,8 @@ public:
       if (auto error = usage.takeError()) {
         return std::move(error);
       }
-      auto res = BuildExpr(BuildExprCtx(sub_expr, *usage, ctx.deref_force_extract, ctx.assigned_to));
+      auto res = BuildExpr(
+          BuildExprCtx(sub_expr, *usage, ctx.deref_force_extract, ctx.assigned_to, ctx.string_literal_usage_kind));
       if (auto error = res.takeError()) {
         return std::move(error);
       }
@@ -599,7 +639,8 @@ public:
           if (auto error = usage.takeError()) {
             return std::move(error);
           }
-          auto res = BuildExpr(BuildExprCtx(init_expr, *usage, true, std::make_pair(element_var_name, element_type)));
+          auto res = BuildExpr(BuildExprCtx(init_expr, *usage, true, std::make_pair(element_var_name, element_type),
+                                            ctx.string_literal_usage_kind));
           if (auto error = res.takeError()) {
             return std::move(error);
           }
@@ -640,12 +681,25 @@ public:
             var_name = llvm::formatv("({0}).{1}", var_name, field_decl->getNameAsString());
           }
 
+          // edge case for string literals initializing char arrays, we need to generate a series of assignments instead
+          // of a single assignment. need to do it in reverse order here
+          if (auto *string_literal = dyn_cast<StringLiteral>(init_expr)) {
+            if (field_decl->getType()->isArrayType()) {
+              pre_stmts.emplace_back(llvm::formatv("*({0} + {1}UL) = '\\0';", var_name, string_literal->getLength()));
+              for (auto [i, c] : string_literal->getString() | std::views::enumerate | std::views::reverse) {
+                pre_stmts.emplace_back(llvm::formatv("*({0} + {1}UL) = '{2}';", var_name, i, c));
+              }
+              goto build_expr_end;
+            }
+          }
+
           auto usage = GetUsage(data.Ctx, init_expr);
           if (auto error = usage.takeError()) {
             return std::move(error);
           }
-          auto res = BuildExpr(BuildExprCtx(init_expr, *usage, ctx.deref_force_extract,
-                                            std::make_pair(var_name, field_decl->getType())));
+          auto res =
+              BuildExpr(BuildExprCtx(init_expr, *usage, ctx.deref_force_extract,
+                                     std::make_pair(var_name, field_decl->getType()), ctx.string_literal_usage_kind));
           if (auto error = res.takeError()) {
             return std::move(error);
           }
@@ -678,7 +732,6 @@ public:
           }
 
           auto *init_expr = init_list_expr->getInit(i);
-
           if (auto *_ = dyn_cast<ImplicitValueInitExpr>(init_expr)) {
             /*
   struct A {
@@ -706,6 +759,7 @@ public:
             ++i;
             continue;
           }
+          init_expr = init_expr->IgnoreParenImpCasts();
 
           auto i_var_name = var_name;
           if (field_decl->isAnonymousStructOrUnion()) {
@@ -724,8 +778,23 @@ public:
           if (auto error = usage.takeError()) {
             return std::move(error);
           }
-          auto res = BuildExpr(BuildExprCtx(init_expr, *usage, ctx.deref_force_extract,
-                                            std::make_pair(i_var_name, field_decl->getType())));
+
+          // edge case for string literals initializing char arrays, we need to generate a series of assignments instead
+          // of a single assignment
+          if (auto *string_literal = dyn_cast<StringLiteral>(init_expr)) {
+            if (field_decl->getType()->isArrayType()) {
+              for (auto [i, c] : string_literal->getString() | std::views::enumerate) {
+                tmp_stmts.emplace_back(llvm::formatv("*({0} + {1}UL) = '{2}';", i_var_name, i, c));
+              }
+              tmp_stmts.emplace_back(llvm::formatv("*({0} + {1}UL) = '\\0';", i_var_name, string_literal->getLength()));
+              i++;
+              continue;
+            }
+          }
+
+          auto res =
+              BuildExpr(BuildExprCtx(init_expr, *usage, ctx.deref_force_extract,
+                                     std::make_pair(i_var_name, field_decl->getType()), ctx.string_literal_usage_kind));
           if (auto error = res.takeError()) {
             return std::move(error);
           }
@@ -824,8 +893,8 @@ public:
             if (auto error = usage.takeError()) {
               return std::move(error);
             }
-            auto last_expr_built_expr =
-                BuildExpr(BuildExprCtx(last_stmt_as_expr, *usage, ctx.deref_force_extract, ctx.assigned_to));
+            auto last_expr_built_expr = BuildExpr(BuildExprCtx(last_stmt_as_expr, *usage, ctx.deref_force_extract,
+                                                               ctx.assigned_to, ctx.string_literal_usage_kind));
             if (auto error = last_expr_built_expr.takeError()) {
               return std::move(error);
             }
@@ -871,7 +940,8 @@ public:
       if (auto error = rhs_usage.takeError()) {
         return std::move(error);
       }
-      auto rhs_res = BuildExpr(BuildExprCtx(rhs, *rhs_usage, ctx.deref_force_extract, ctx.assigned_to));
+      auto rhs_res = BuildExpr(
+          BuildExprCtx(rhs, *rhs_usage, ctx.deref_force_extract, ctx.assigned_to, ctx.string_literal_usage_kind));
       if (auto error = rhs_res.takeError()) {
         return std::move(error);
       }
@@ -879,7 +949,8 @@ public:
       if (auto error = lhs_usage.takeError()) {
         return std::move(error);
       }
-      auto lhs_res = BuildExpr(BuildExprCtx(lhs, *lhs_usage, ctx.deref_force_extract, ctx.assigned_to));
+      auto lhs_res = BuildExpr(
+          BuildExprCtx(lhs, *lhs_usage, ctx.deref_force_extract, ctx.assigned_to, ctx.string_literal_usage_kind));
       if (auto error = lhs_res.takeError()) {
         return std::move(error);
       }
@@ -926,7 +997,8 @@ public:
       if (auto error = cond_usage.takeError()) {
         return std::move(error);
       }
-      auto cond_res = BuildExpr(BuildExprCtx(cond, *cond_usage, ctx.deref_force_extract, ctx.assigned_to));
+      auto cond_res = BuildExpr(
+          BuildExprCtx(cond, *cond_usage, ctx.deref_force_extract, ctx.assigned_to, ctx.string_literal_usage_kind));
       if (auto error = cond_res.takeError()) {
         return std::move(error);
       }
@@ -934,7 +1006,8 @@ public:
       if (auto error = lhs_usage.takeError()) {
         return std::move(error);
       }
-      auto lhs_res = BuildExpr(BuildExprCtx(lhs, *lhs_usage, ctx.deref_force_extract, ctx.assigned_to));
+      auto lhs_res = BuildExpr(
+          BuildExprCtx(lhs, *lhs_usage, ctx.deref_force_extract, ctx.assigned_to, ctx.string_literal_usage_kind));
       if (auto error = lhs_res.takeError()) {
         return std::move(error);
       }
@@ -942,7 +1015,8 @@ public:
       if (auto error = rhs_usage.takeError()) {
         return std::move(error);
       }
-      auto rhs_res = BuildExpr(BuildExprCtx(rhs, *rhs_usage, ctx.deref_force_extract, ctx.assigned_to));
+      auto rhs_res = BuildExpr(
+          BuildExprCtx(rhs, *rhs_usage, ctx.deref_force_extract, ctx.assigned_to, ctx.string_literal_usage_kind));
       if (auto error = rhs_res.takeError()) {
         return std::move(error);
       }
@@ -991,7 +1065,8 @@ if ({4}) {
         if (auto error = lhs_usage.takeError()) {
           return error;
         }
-        auto lhs_res = BuildExpr(BuildExprCtx(lhs, *lhs_usage, ctx.deref_force_extract, ctx.assigned_to));
+        auto lhs_res = BuildExpr(
+            BuildExprCtx(lhs, *lhs_usage, ctx.deref_force_extract, ctx.assigned_to, ctx.string_literal_usage_kind));
         if (auto error = lhs_res.takeError()) {
           return error;
         }
@@ -999,7 +1074,8 @@ if ({4}) {
         if (auto error = rhs_usage.takeError()) {
           return error;
         }
-        auto rhs_res = BuildExpr(BuildExprCtx(rhs, *rhs_usage, ctx.deref_force_extract, ctx.assigned_to));
+        auto rhs_res = BuildExpr(
+            BuildExprCtx(rhs, *rhs_usage, ctx.deref_force_extract, ctx.assigned_to, ctx.string_literal_usage_kind));
         if (auto error = rhs_res.takeError()) {
           return error;
         }
@@ -1045,7 +1121,8 @@ if (!({4})) {
         if (auto error = lhs_usage.takeError()) {
           return std::move(error);
         }
-        auto lhs_res = BuildExpr(BuildExprCtx(lhs, *lhs_usage, ctx.deref_force_extract, ctx.assigned_to));
+        auto lhs_res = BuildExpr(
+            BuildExprCtx(lhs, *lhs_usage, ctx.deref_force_extract, ctx.assigned_to, ctx.string_literal_usage_kind));
         if (auto error = lhs_res.takeError()) {
           return std::move(error);
         }
@@ -1053,7 +1130,8 @@ if (!({4})) {
         if (auto error = rhs_usage.takeError()) {
           return std::move(error);
         }
-        auto rhs_res = BuildExpr(BuildExprCtx(rhs, *rhs_usage, ctx.deref_force_extract, ctx.assigned_to));
+        auto rhs_res = BuildExpr(
+            BuildExprCtx(rhs, *rhs_usage, ctx.deref_force_extract, ctx.assigned_to, ctx.string_literal_usage_kind));
         if (auto error = rhs_res.takeError()) {
           return std::move(error);
         }
@@ -1098,7 +1176,8 @@ if ({4}) {
         if (auto error = rhs_usage.takeError()) {
           return std::move(error);
         }
-        auto rhs_res = BuildExpr(BuildExprCtx(rhs, *rhs_usage, ctx.deref_force_extract, ctx.assigned_to));
+        auto rhs_res = BuildExpr(
+            BuildExprCtx(rhs, *rhs_usage, ctx.deref_force_extract, ctx.assigned_to, ctx.string_literal_usage_kind));
         if (auto error = rhs_res.takeError()) {
           return std::move(error);
         }
@@ -1106,7 +1185,8 @@ if ({4}) {
         if (auto error = lhs_usage.takeError()) {
           return std::move(error);
         }
-        auto lhs_res = BuildExpr(BuildExprCtx(lhs, *lhs_usage, ctx.deref_force_extract, ctx.assigned_to));
+        auto lhs_res = BuildExpr(
+            BuildExprCtx(lhs, *lhs_usage, ctx.deref_force_extract, ctx.assigned_to, ctx.string_literal_usage_kind));
         if (auto error = lhs_res.takeError()) {
           return std::move(error);
         }
@@ -1135,7 +1215,8 @@ if ({4}) {
         if (auto error = rhs_usage.takeError()) {
           return std::move(error);
         }
-        auto rhs_res = BuildExpr(BuildExprCtx(rhs, *rhs_usage, ctx.deref_force_extract, ctx.assigned_to));
+        auto rhs_res = BuildExpr(
+            BuildExprCtx(rhs, *rhs_usage, ctx.deref_force_extract, ctx.assigned_to, ctx.string_literal_usage_kind));
         if (auto error = rhs_res.takeError()) {
           return std::move(error);
         }
@@ -1143,7 +1224,8 @@ if ({4}) {
         if (auto error = lhs_usage.takeError()) {
           return std::move(error);
         }
-        auto lhs_res = BuildExpr(BuildExprCtx(lhs, *lhs_usage, ctx.deref_force_extract, ctx.assigned_to));
+        auto lhs_res = BuildExpr(
+            BuildExprCtx(lhs, *lhs_usage, ctx.deref_force_extract, ctx.assigned_to, ctx.string_literal_usage_kind));
         if (auto error = lhs_res.takeError()) {
           return std::move(error);
         }
@@ -1190,7 +1272,8 @@ if ({4}) {
         if (auto error = rhs_usage.takeError()) {
           return std::move(error);
         }
-        auto rhs_res = BuildExpr(BuildExprCtx(rhs, *rhs_usage, ctx.deref_force_extract, ctx.assigned_to));
+        auto rhs_res = BuildExpr(
+            BuildExprCtx(rhs, *rhs_usage, ctx.deref_force_extract, ctx.assigned_to, ctx.string_literal_usage_kind));
         if (auto error = rhs_res.takeError()) {
           return std::move(error);
         }
@@ -1198,7 +1281,8 @@ if ({4}) {
         if (auto error = lhs_usage.takeError()) {
           return std::move(error);
         }
-        auto lhs_res = BuildExpr(BuildExprCtx(lhs, *lhs_usage, ctx.deref_force_extract, ctx.assigned_to));
+        auto lhs_res = BuildExpr(
+            BuildExprCtx(lhs, *lhs_usage, ctx.deref_force_extract, ctx.assigned_to, ctx.string_literal_usage_kind));
         if (auto error = lhs_res.takeError()) {
           return std::move(error);
         }
@@ -1240,7 +1324,8 @@ if ({4}) {
                                       unary_operator->getExprLoc().printToString(data.Ctx.getSourceManager()))));
         }
 
-        auto res = BuildExpr(BuildExprCtx(sub_expr, Usage::Place, ctx.deref_force_extract, ctx.assigned_to));
+        auto res = BuildExpr(BuildExprCtx(sub_expr, Usage::Place, ctx.deref_force_extract, ctx.assigned_to,
+                                          ctx.string_literal_usage_kind));
         if (auto error = res.takeError()) {
           return error;
         }
@@ -1284,7 +1369,8 @@ if ({4}) {
                             unary_operator->getExprLoc().printToString(data.Ctx.getSourceManager()))));
         }
 
-        auto res = BuildExpr(BuildExprCtx(sub_expr, Usage::Place, ctx.deref_force_extract, ctx.assigned_to));
+        auto res = BuildExpr(BuildExprCtx(sub_expr, Usage::Place, ctx.deref_force_extract, ctx.assigned_to,
+                                          ctx.string_literal_usage_kind));
         if (auto error = res.takeError()) {
           return error;
         }
@@ -1325,7 +1411,8 @@ if ({4}) {
         if (auto error = sub_expr_usage.takeError()) {
           return std::move(error);
         }
-        auto res = BuildExpr(BuildExprCtx(sub_expr, *sub_expr_usage, true, ctx.assigned_to));
+        auto res =
+            BuildExpr(BuildExprCtx(sub_expr, *sub_expr_usage, true, ctx.assigned_to, ctx.string_literal_usage_kind));
         if (auto error = res.takeError()) {
           return std::move(error);
         }
@@ -1369,7 +1456,8 @@ if ({4}) {
         if (auto error = sub_expr_usage.takeError()) {
           return std::move(error);
         }
-        auto res = BuildExpr(BuildExprCtx(sub_expr, *sub_expr_usage, ctx.deref_force_extract, ctx.assigned_to));
+        auto res = BuildExpr(BuildExprCtx(sub_expr, *sub_expr_usage, ctx.deref_force_extract, ctx.assigned_to,
+                                          ctx.string_literal_usage_kind));
         if (auto error = res.takeError()) {
           return std::move(error);
         }
@@ -1390,8 +1478,8 @@ if ({4}) {
     } else if (auto *call_expr = dyn_cast<CallExpr>(expr)) {
       llvm::SmallVector<BuiltExpr, 4> arg_built_exprs;
       for (auto *arg : call_expr->arguments()) {
-        auto res =
-            BuildExpr(BuildExprCtx(arg->IgnoreParenImpCasts(), Usage::Value, ctx.deref_force_extract, ctx.assigned_to));
+        auto res = BuildExpr(BuildExprCtx(arg->IgnoreParenImpCasts(), Usage::Value, ctx.deref_force_extract,
+                                          ctx.assigned_to, ctx.string_literal_usage_kind));
         if (auto error = res.takeError()) {
           return error;
         }
@@ -1420,7 +1508,7 @@ if ({4}) {
       }
 
       auto res = BuildExpr(BuildExprCtx(member_expr->getBase()->IgnoreParenImpCasts(), Usage::Place,
-                                        ctx.deref_force_extract, ctx.assigned_to));
+                                        ctx.deref_force_extract, ctx.assigned_to, ctx.string_literal_usage_kind));
       if (auto error = res.takeError()) {
         return error;
       }
@@ -1483,9 +1571,28 @@ if ({4}) {
             data.error = std::move(error);
             return false;
           }
+
+          std::optional<BuildExprCtx::StringLiteralUsageKind> string_literal_usage_kind = std::nullopt;
+          if (auto *_ = dyn_cast<StringLiteral>(init_expr)) {
+            auto var_decl_type = var_decl->getType();
+            if (const auto *_ = dyn_cast<PointerType>(var_decl_type.getTypePtr())) {
+              string_literal_usage_kind = BuildExprCtx::StringLiteralUsageKind::AsPointer;
+            } else if (const auto *array_type = dyn_cast<ArrayType>(var_decl_type.getTypePtr())) {
+              auto element = array_type->getElementType();
+              if (!element->isCharType()) {
+                data.error = CreateRuntimeError(std::move(llvm::formatv(
+                    "\n    at {0}\nString literal cannot be assigned to non-char array type: {1}",
+                    init_expr->getBeginLoc().printToString(data.Ctx.getSourceManager()), var_decl_type.getAsString())));
+                return false;
+              }
+              string_literal_usage_kind = BuildExprCtx::StringLiteralUsageKind::AsArray;
+            }
+          }
+
           auto res = BuildExpr(BuildExprCtx(
               init_expr, *usage, false,
-              std::make_optional(std::make_pair(var_decl->getNameAsString(), var_decl->getType().getCanonicalType()))));
+              std::make_optional(std::make_pair(var_decl->getNameAsString(), var_decl->getType().getCanonicalType())),
+              string_literal_usage_kind));
           if (auto error = res.takeError()) {
             data.error = std::move(error);
             return false;
@@ -1534,7 +1641,7 @@ if ({4}) {
 
       std::string replacement_text;
       llvm::raw_string_ostream os(replacement_text);
-      auto res = BuildExpr(BuildExprCtx(expr, Usage::Effect, false, std::nullopt));
+      auto res = BuildExpr(BuildExprCtx(expr, Usage::Effect, false, std::nullopt, std::nullopt));
       if (auto error = res.takeError()) {
         data.error = std::move(error);
         return false;

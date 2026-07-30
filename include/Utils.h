@@ -17,6 +17,12 @@
 
 #include <source_location>
 #include <string>
+#include <utility>
+
+namespace pancake {
+enum class PointerWidth : uint8_t { None = 0, W32 = 32, W64 = 64 };
+}
+extern llvm::cl::opt<pancake::PointerWidth> pointer_bits;
 
 namespace pancake {
 class StagedCompilationDatabase : public clang::tooling::CompilationDatabase {
@@ -137,7 +143,10 @@ inline auto GetPointerWidth(const clang::ASTContext &ctx) -> uint64_t {
   return width;
 }
 
-inline auto GetWordTypeStr(const clang::ASTContext &ctx) { return llvm::formatv("uint{0}_t", GetPointerWidth(ctx)); }
+inline auto GetWordTypeStr(const clang::ASTContext &ctx) {
+  return llvm::formatv("uint{0}_t", pointer_bits != PointerWidth::None ? std::to_underlying(pointer_bits.getValue())
+                                                                       : GetPointerWidth(ctx));
+}
 
 auto StmtNeedsSemi(const clang::Stmt *s) -> bool;
 } // namespace pancake

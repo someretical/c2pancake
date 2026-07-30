@@ -259,8 +259,8 @@ public:
     QualType const ft = member_expr->getType();
 
     // Build the base object subexpression (e.g. "s" for s.field, or the pointer expression for p->field)
-    auto base_built_expr =
-        BuildExpr(BuildExprCtx(member_expr->getBase(), Usage::Place, ctx.deref_force_extract, ctx.assigned_to));
+    auto base_built_expr = BuildExpr(BuildExprCtx(member_expr->getBase(), Usage::Place, ctx.deref_force_extract,
+                                                  ctx.assigned_to, ctx.string_literal_usage_kind));
     if (auto error = base_built_expr.takeError()) {
       return error;
     }
@@ -377,12 +377,13 @@ public:
     const QualType ft = member_expr->getType();
 
     // Build the base object subexpression (e.g. "s" for s.field, or the pointer expression for p->field)
-    auto base_built_expr =
-        BuildExpr(BuildExprCtx(member_expr->getBase(), Usage::Place, ctx.deref_force_extract, ctx.assigned_to));
+    auto base_built_expr = BuildExpr(BuildExprCtx(member_expr->getBase(), Usage::Place, ctx.deref_force_extract,
+                                                  ctx.assigned_to, ctx.string_literal_usage_kind));
     if (auto error = base_built_expr.takeError()) {
       return error;
     }
-    auto src_built_expr = BuildExpr(BuildExprCtx(src_expr, Usage::Value, ctx.deref_force_extract, ctx.assigned_to));
+    auto src_built_expr = BuildExpr(
+        BuildExprCtx(src_expr, Usage::Value, ctx.deref_force_extract, ctx.assigned_to, ctx.string_literal_usage_kind));
     if (auto error = src_built_expr.takeError()) {
       return error;
     }
@@ -537,7 +538,8 @@ public:
       if (auto error = sub_expr_usage.takeError()) {
         return std::move(error);
       }
-      auto res = BuildExpr(BuildExprCtx(sub_expr, *sub_expr_usage, ctx.deref_force_extract, ctx.assigned_to));
+      auto res = BuildExpr(BuildExprCtx(sub_expr, *sub_expr_usage, ctx.deref_force_extract, ctx.assigned_to,
+                                        ctx.string_literal_usage_kind));
       if (auto error = res.takeError()) {
         return std::move(error);
       }
@@ -582,14 +584,17 @@ public:
               }
 
               if (use_volatile) {
-                auto built_expr = BuildStoreThroughBitFieldLValue(
-                    BuildExprCtx(member_expr, Usage::Effect, ctx.deref_force_extract, ctx.assigned_to), rhs);
+                auto built_expr =
+                    BuildStoreThroughBitFieldLValue(BuildExprCtx(member_expr, Usage::Effect, ctx.deref_force_extract,
+                                                                 ctx.assigned_to, ctx.string_literal_usage_kind),
+                                                    rhs);
                 os << built_expr->final_expr;
                 pre_stmts.insert(pre_stmts.end(), built_expr->pre_stmts.begin(), built_expr->pre_stmts.end());
               } else {
                 // otherwise we can use the non-volatile helpers to do the bitfield store
-                auto base_built_expr = BuildExpr(
-                    BuildExprCtx(member_expr->getBase(), Usage::Place, ctx.deref_force_extract, ctx.assigned_to));
+                auto base_built_expr =
+                    BuildExpr(BuildExprCtx(member_expr->getBase(), Usage::Place, ctx.deref_force_extract,
+                                           ctx.assigned_to, ctx.string_literal_usage_kind));
                 if (auto error = base_built_expr.takeError()) {
                   return std::move(error);
                 }
@@ -597,8 +602,8 @@ public:
                 if (auto error = rhs_usage.takeError()) {
                   return std::move(error);
                 }
-                auto rhs_built_expr =
-                    BuildExpr(BuildExprCtx(rhs, *rhs_usage, ctx.deref_force_extract, ctx.assigned_to));
+                auto rhs_built_expr = BuildExpr(BuildExprCtx(rhs, *rhs_usage, ctx.deref_force_extract, ctx.assigned_to,
+                                                             ctx.string_literal_usage_kind));
                 if (auto error = rhs_built_expr.takeError()) {
                   return std::move(error);
                 }
@@ -626,7 +631,8 @@ public:
         if (auto error = rhs_usage.takeError()) {
           return std::move(error);
         }
-        auto rhs_res = BuildExpr(BuildExprCtx(rhs, *rhs_usage, ctx.deref_force_extract, ctx.assigned_to));
+        auto rhs_res = BuildExpr(
+            BuildExprCtx(rhs, *rhs_usage, ctx.deref_force_extract, ctx.assigned_to, ctx.string_literal_usage_kind));
         if (auto error = rhs_res.takeError()) {
           return std::move(error);
         }
@@ -634,7 +640,8 @@ public:
         if (auto error = lhs_usage.takeError()) {
           return std::move(error);
         }
-        auto lhs_res = BuildExpr(BuildExprCtx(lhs, *lhs_usage, ctx.deref_force_extract, ctx.assigned_to));
+        auto lhs_res = BuildExpr(
+            BuildExprCtx(lhs, *lhs_usage, ctx.deref_force_extract, ctx.assigned_to, ctx.string_literal_usage_kind));
         if (auto error = lhs_res.takeError()) {
           return std::move(error);
         }
@@ -691,7 +698,8 @@ public:
         if (auto error = rhs_usage.takeError()) {
           return std::move(error);
         }
-        auto rhs_res = BuildExpr(BuildExprCtx(rhs, *rhs_usage, ctx.deref_force_extract, ctx.assigned_to));
+        auto rhs_res = BuildExpr(
+            BuildExprCtx(rhs, *rhs_usage, ctx.deref_force_extract, ctx.assigned_to, ctx.string_literal_usage_kind));
         if (auto error = rhs_res.takeError()) {
           return std::move(error);
         }
@@ -699,7 +707,8 @@ public:
         if (auto error = lhs_usage.takeError()) {
           return std::move(error);
         }
-        auto lhs_res = BuildExpr(BuildExprCtx(lhs, *lhs_usage, ctx.deref_force_extract, ctx.assigned_to));
+        auto lhs_res = BuildExpr(
+            BuildExprCtx(lhs, *lhs_usage, ctx.deref_force_extract, ctx.assigned_to, ctx.string_literal_usage_kind));
         if (auto error = lhs_res.takeError()) {
           return std::move(error);
         }
@@ -737,7 +746,8 @@ public:
         if (auto error = sub_expr_usage.takeError()) {
           return std::move(error);
         }
-        auto res = BuildExpr(BuildExprCtx(sub_expr, *sub_expr_usage, true, ctx.assigned_to));
+        auto res =
+            BuildExpr(BuildExprCtx(sub_expr, *sub_expr_usage, true, ctx.assigned_to, ctx.string_literal_usage_kind));
         if (auto error = res.takeError()) {
           return std::move(error);
         }
@@ -781,7 +791,8 @@ public:
         if (auto error = sub_expr_usage.takeError()) {
           return std::move(error);
         }
-        auto res = BuildExpr(BuildExprCtx(sub_expr, *sub_expr_usage, ctx.deref_force_extract, ctx.assigned_to));
+        auto res = BuildExpr(BuildExprCtx(sub_expr, *sub_expr_usage, ctx.deref_force_extract, ctx.assigned_to,
+                                          ctx.string_literal_usage_kind));
         if (auto error = res.takeError()) {
           return std::move(error);
         }
@@ -805,7 +816,8 @@ public:
         if (auto error = arg_usage.takeError()) {
           return std::move(error);
         }
-        auto res = BuildExpr(BuildExprCtx(arg, *arg_usage, ctx.deref_force_extract, ctx.assigned_to));
+        auto res = BuildExpr(
+            BuildExprCtx(arg, *arg_usage, ctx.deref_force_extract, ctx.assigned_to, ctx.string_literal_usage_kind));
         if (auto error = res.takeError()) {
           return std::move(error);
         }
@@ -850,8 +862,9 @@ public:
               if (auto error = member_expr_usage.takeError()) {
                 return std::move(error);
               }
-              auto res = BuildLoadOfBitFieldLValue(
-                  BuildExprCtx(member_expr, *member_expr_usage, ctx.deref_force_extract, ctx.assigned_to));
+              auto res =
+                  BuildLoadOfBitFieldLValue(BuildExprCtx(member_expr, *member_expr_usage, ctx.deref_force_extract,
+                                                         ctx.assigned_to, ctx.string_literal_usage_kind));
               if (auto error = res.takeError()) {
                 return std::move(error);
               }
@@ -865,8 +878,9 @@ public:
               if (auto error = base_usage.takeError()) {
                 return std::move(error);
               }
-              auto base_built_expr = BuildExpr(
-                  BuildExprCtx(member_expr->getBase(), *base_usage, ctx.deref_force_extract, ctx.assigned_to));
+              auto base_built_expr =
+                  BuildExpr(BuildExprCtx(member_expr->getBase(), *base_usage, ctx.deref_force_extract, ctx.assigned_to,
+                                         ctx.string_literal_usage_kind));
               if (auto error = base_built_expr.takeError()) {
                 return std::move(error);
               }
@@ -928,7 +942,8 @@ public:
           }
           auto res = BuildExpr(BuildExprCtx(
               init_expr, *init_expr_usage, false,
-              std::make_optional(std::make_pair(var_decl->getNameAsString(), var_decl->getType().getCanonicalType()))));
+              std::make_optional(std::make_pair(var_decl->getNameAsString(), var_decl->getType().getCanonicalType())),
+              std::nullopt));
           if (auto error = res.takeError()) {
             data.error = std::move(error);
             return false;
@@ -977,7 +992,7 @@ public:
 
       std::string replacement_text;
       llvm::raw_string_ostream os(replacement_text);
-      auto res = BuildExpr(BuildExprCtx(expr, Usage::Effect, false, std::nullopt));
+      auto res = BuildExpr(BuildExprCtx(expr, Usage::Effect, false, std::nullopt, std::nullopt));
       if (auto error = res.takeError()) {
         data.error = std::move(error);
         return false;

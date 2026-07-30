@@ -854,7 +854,8 @@ public:
       }
     } else if (auto *c_style_cast_expr = dyn_cast<CStyleCastExpr>(expr)) {
       auto *sub_expr = c_style_cast_expr->getSubExpr();
-      auto res = BuildExpr(BuildExprCtx(sub_expr, Usage::Value, ctx.deref_force_extract, ctx.assigned_to));
+      auto res = BuildExpr(BuildExprCtx(sub_expr, Usage::Value, ctx.deref_force_extract, ctx.assigned_to,
+                                        ctx.string_literal_usage_kind));
       if (auto error = res.takeError()) {
         return error;
       }
@@ -900,11 +901,13 @@ public:
       auto *lhs = binary_operator->getLHS()->IgnoreParenImpCasts();
       auto *rhs = binary_operator->getRHS()->IgnoreParenImpCasts();
 
-      auto rhs_res = BuildExpr(BuildExprCtx(rhs, Usage::Value, ctx.deref_force_extract, ctx.assigned_to));
+      auto rhs_res = BuildExpr(
+          BuildExprCtx(rhs, Usage::Value, ctx.deref_force_extract, ctx.assigned_to, ctx.string_literal_usage_kind));
       if (auto error = rhs_res.takeError()) {
         return error;
       }
-      auto lhs_res = BuildExpr(BuildExprCtx(lhs, Usage::Value, ctx.deref_force_extract, ctx.assigned_to));
+      auto lhs_res = BuildExpr(
+          BuildExprCtx(lhs, Usage::Value, ctx.deref_force_extract, ctx.assigned_to, ctx.string_literal_usage_kind));
       if (auto error = lhs_res.takeError()) {
         return error;
       }
@@ -948,7 +951,8 @@ public:
         // so there's nothing to do...
 
         // we want to build with the LHS as a place expression, and the RHS as a value expression
-        lhs_res = BuildExpr(BuildExprCtx(lhs, Usage::Place, ctx.deref_force_extract, ctx.assigned_to));
+        lhs_res = BuildExpr(
+            BuildExprCtx(lhs, Usage::Place, ctx.deref_force_extract, ctx.assigned_to, ctx.string_literal_usage_kind));
         if (auto error = lhs_res.takeError()) {
           return error;
         }
@@ -1067,7 +1071,8 @@ public:
 
       switch (unary_operator->getOpcode()) {
       case UO_Deref: {
-        auto res = BuildExpr(BuildExprCtx(sub_expr, Usage::Value, true, ctx.assigned_to));
+        auto res =
+            BuildExpr(BuildExprCtx(sub_expr, Usage::Value, true, ctx.assigned_to, ctx.string_literal_usage_kind));
         if (auto error = res.takeError()) {
           return error;
         }
@@ -1077,7 +1082,8 @@ public:
       }
 
       case UO_AddrOf: {
-        auto res = BuildExpr(BuildExprCtx(sub_expr, Usage::Place, ctx.deref_force_extract, ctx.assigned_to));
+        auto res = BuildExpr(BuildExprCtx(sub_expr, Usage::Place, ctx.deref_force_extract, ctx.assigned_to,
+                                          ctx.string_literal_usage_kind));
         if (auto error = res.takeError()) {
           return error;
         }
@@ -1093,7 +1099,8 @@ public:
         auto type = sub_expr->getType();
         if (type->isIntegerType()) {
           data.need_int_helpers = true;
-          auto res = BuildExpr(BuildExprCtx(sub_expr, Usage::Value, ctx.deref_force_extract, ctx.assigned_to));
+          auto res = BuildExpr(BuildExprCtx(sub_expr, Usage::Value, ctx.deref_force_extract, ctx.assigned_to,
+                                            ctx.string_literal_usage_kind));
           if (auto error = res.takeError()) {
             return error;
           }
@@ -1129,7 +1136,8 @@ public:
         [[fallthrough]];
       case UO_Extension: {
       unary_operator_general_case:
-        auto res = BuildExpr(BuildExprCtx(sub_expr, Usage::Value, ctx.deref_force_extract, ctx.assigned_to));
+        auto res = BuildExpr(BuildExprCtx(sub_expr, Usage::Value, ctx.deref_force_extract, ctx.assigned_to,
+                                          ctx.string_literal_usage_kind));
         if (auto error = res.takeError()) {
           return error;
         }
@@ -1147,8 +1155,8 @@ public:
     } else if (auto *call_expr = dyn_cast<CallExpr>(expr)) {
       llvm::SmallVector<BuiltExpr, 4> arg_built_exprs;
       for (auto *arg : call_expr->arguments()) {
-        auto res =
-            BuildExpr(BuildExprCtx(arg->IgnoreParenImpCasts(), Usage::Value, ctx.deref_force_extract, ctx.assigned_to));
+        auto res = BuildExpr(BuildExprCtx(arg->IgnoreParenImpCasts(), Usage::Value, ctx.deref_force_extract,
+                                          ctx.assigned_to, ctx.string_literal_usage_kind));
         if (auto error = res.takeError()) {
           return error;
         }
@@ -1182,7 +1190,7 @@ public:
                                     member_expr->getExprLoc().printToString(data.Ctx.getSourceManager()))));
       }
       auto res = BuildExpr(BuildExprCtx(member_expr->getBase()->IgnoreParenImpCasts(), Usage::Place,
-                                        ctx.deref_force_extract, ctx.assigned_to));
+                                        ctx.deref_force_extract, ctx.assigned_to, ctx.string_literal_usage_kind));
       if (auto error = res.takeError()) {
         return error;
       }
@@ -1255,7 +1263,8 @@ public:
           init_expr = init_expr->IgnoreParenImpCasts();
           auto res = BuildExpr(BuildExprCtx(
               init_expr, Usage::Value, false,
-              std::make_optional(std::make_pair(var_decl->getNameAsString(), var_decl->getType().getCanonicalType()))));
+              std::make_optional(std::make_pair(var_decl->getNameAsString(), var_decl->getType().getCanonicalType())),
+              std::nullopt));
           if (auto error = res.takeError()) {
             data.error = std::move(error);
             return false;
@@ -1305,7 +1314,7 @@ public:
 
       std::string replacement_text;
       llvm::raw_string_ostream os(replacement_text);
-      auto res = BuildExpr(BuildExprCtx(expr, Usage::Effect, false, std::nullopt));
+      auto res = BuildExpr(BuildExprCtx(expr, Usage::Effect, false, std::nullopt, std::nullopt));
       if (auto error = res.takeError()) {
         data.error = std::move(error);
         return false;

@@ -42,20 +42,29 @@ void PrintVersion(llvm::raw_ostream &os) {
 }
 } // namespace
 
-llvm::cl::opt<size_t> max_pass_retries( // NOLINT(misc-use-internal-linkage)
+// NOLINTBEGIN(misc-use-internal-linkage)
+llvm::cl::opt<PointerWidth> pointer_bits("pointer-bits", llvm::cl::desc("Override pointer width"),
+                                         llvm::cl::cat(c2_pancake_options),
+                                         llvm::cl::values(clEnumValN(PointerWidth::W32, "32", "32-bit"),
+                                                          clEnumValN(PointerWidth::W64, "64", "64-bit")),
+                                         llvm::cl::init(PointerWidth::None));
+
+llvm::cl::opt<size_t> max_pass_retries(
     "max-pass-retries",
-    llvm::cl::desc("Maximum number of retries for a pass before moving to the next pass (default: 10)"),
-    llvm::cl::cat(c2_pancake_options), llvm::cl::init(10));
+    llvm::cl::desc("Maximum number of retries for a pass before moving to the next pass (default: 20)"),
+    llvm::cl::cat(c2_pancake_options), llvm::cl::init(20));
 
-llvm::cl::opt<std::string> start_at_pass( // NOLINT(misc-use-internal-linkage)
-    "start", llvm::cl::desc("Start the pipeline at this pass (default: empty, meaning start at beginning)"),
-    llvm::cl::cat(c2_pancake_options), llvm::cl::init(""));
+llvm::cl::opt<std::string>
+    start_at_pass("start",
+                  llvm::cl::desc("Start the pipeline at this pass (default: empty, meaning start at beginning)"),
+                  llvm::cl::cat(c2_pancake_options), llvm::cl::init(""));
 
-llvm::cl::opt<std::string> end_at_pass( // NOLINT(misc-use-internal-linkage)
+llvm::cl::opt<std::string> end_at_pass(
     "end",
     llvm::cl::desc(
         "End the pipeline after this pass (including retries) (default: empty, meaning end after last pass)"),
     llvm::cl::cat(c2_pancake_options), llvm::cl::init(""));
+// NOLINTEND(misc-use-internal-linkage)
 
 auto main(int argc, const char **argv) -> int {
   llvm::cl::SetVersionPrinter(PrintVersion);

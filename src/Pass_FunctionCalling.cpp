@@ -47,7 +47,7 @@ namespace pancake::pass_inject_memcpy_polyfill {
 namespace {
 const char *memcpy_polyfill_code = R"(
 #include <stdint.h>
-static inline uint{0}_t __cp2nk_memcpy(uint8_t *dest, uint8_t *src, uint{0}_t len) {{
+static inline uint{0}_t __c2pnk_memcpy(uint8_t *dest, uint8_t *src, uint{0}_t len) {{
   while (len > 0UL) {{
     *dest = *src;
     dest = dest + 1UL;
@@ -56,12 +56,14 @@ static inline uint{0}_t __cp2nk_memcpy(uint8_t *dest, uint8_t *src, uint{0}_t le
   }
   return 0UL;
 }
+
 )";
 }
 
 auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
   const auto &sm = Ctx.getSourceManager();
-  if (auto err = ps_ctx.replacements.add({sm, sm.getLocForStartOfFile(sm.getMainFileID()), 0, memcpy_polyfill_code})) {
+  if (auto err = ps_ctx.replacements.add({sm, sm.getLocForStartOfFile(sm.getMainFileID()), 0,
+                                          llvm::formatv(memcpy_polyfill_code, GetPointerWidth(Ctx)).str()})) {
     ps_ctx.error = CreateRuntimeError(llvm::formatv("Add replacement conflict: {0}", err));
     ps_ctx.whats_next = WhatsNext::MoveToNextFile;
     return;
@@ -106,9 +108,11 @@ struct WorkerData {
     std::optional<ReturnInfo> return_info;
     llvm::SmallVector<ParamInfo, 16> param_infos;
     bool needs_rewriting = false;
+    bool turn_return_from_void_to_uint = false;
     explicit FunctionInfo(std::optional<ReturnInfo> return_info, llvm::SmallVector<ParamInfo, 16> param_infos,
-                          bool needs_rewriting)
-        : return_info(std::move(return_info)), param_infos(std::move(param_infos)), needs_rewriting(needs_rewriting) {}
+                          bool needs_rewriting, bool turn_return_from_void_to_uint)
+        : return_info(std::move(return_info)), param_infos(std::move(param_infos)), needs_rewriting(needs_rewriting),
+          turn_return_from_void_to_uint(turn_return_from_void_to_uint) {}
   };
   using FunctionMap = llvm::DenseMap<FunctionDecl *, FunctionInfo>;
   FunctionMap &function_map;
@@ -162,16 +166,23 @@ public:
       }
 
       bool needs_rewriting = false;
-      auto return_info = WorkerData::ReturnInfo(return_type);
+      std::optional<WorkerData::ReturnInfo> return_info = std::nullopt;
       if (!return_type->isIntegerType() && !return_type->isPointerType() && !return_type->isVoidType()) {
         // hoist the return type
-        auto hoisted_name = llvm::SmallString<32>(llvm::formatv("{0}_return", func_decl->getName()));
-        return_info.hoisted_name = std::move(hoisted_name);
+        auto hoisted_name = llvm::SmallString<32>(llvm::formatv("__c2pnk_{0}_return", func_decl->getName()));
+        return_info = WorkerData::ReturnInfo(return_type);
+        return_info.value().hoisted_name = std::move(hoisted_name);
         needs_rewriting = true;
       }
 
+      bool turn_return_from_void_to_uint = false;
+      if (return_type->isVoidType()) {
+        // function needs to return 0UL as per pancake rules
+        turn_return_from_void_to_uint = true;
+      }
+
       llvm::SmallVector<WorkerData::ParamInfo, 16> param_infos;
-      for (const auto [i, param_decl] : std::views::enumerate(func_decl->parameters())) {
+      for (const auto [i, param_decl] : func_decl->parameters() | std::views::enumerate) {
         auto param_type = param_decl->getType();
         if ((param_type->isIntegerType() || param_type->isPointerType()) &&
             data.Ctx.getTypeSize(param_type) > GetPointerWidth(data.Ctx)) {
@@ -186,16 +197,16 @@ public:
         std::optional<llvm::SmallString<32>> hoisted_name = std::nullopt;
         if (!param_type->isIntegerType() && !param_type->isPointerType() && !param_type->isVoidType()) {
           // hoist the parameter type
-          hoisted_name =
-              llvm::SmallString<32>(llvm::formatv("{0}_param{1}_{2}", func_decl->getName(), i, param_decl->getName()));
+          hoisted_name = llvm::SmallString<32>(
+              llvm::formatv("__c2pnk_{0}_param{1}_{2}", func_decl->getName(), i, param_decl->getName()));
           needs_rewriting = true;
         }
         param_info.hoisted_name = std::move(hoisted_name);
         param_infos.push_back(std::move(param_info));
       }
 
-      data.function_map.insert(
-          {func_decl, WorkerData::FunctionInfo(std::move(return_info), std::move(param_infos), needs_rewriting)});
+      data.function_map.insert({func_decl, WorkerData::FunctionInfo(std::move(return_info), std::move(param_infos),
+                                                                    needs_rewriting, turn_return_from_void_to_uint)});
     }
 
     return true;
@@ -288,22 +299,45 @@ public:
     }
 
     auto &sm = data.Ctx.getSourceManager();
-    if (!sm.isInMainFile(sm.getSpellingLoc(func_decl->getBeginLoc())) || !func_decl->isThisDeclarationADefinition()) {
+    if (!sm.isInMainFile(sm.getSpellingLoc(func_decl->getBeginLoc()))) {
       return true;
     }
 
     auto it = data.function_map.find(func_decl);
-    if (it == data.function_map.end()) {
-      data.error = CreateRuntimeError(llvm::formatv("\n    at {0}\nFunctionDecl {1} not found in function_map",
-                                                    func_decl->getBeginLoc().printToString(data.Ctx.getSourceManager()),
-                                                    func_decl->getName()));
-      return false;
+    if (func_decl->isThisDeclarationADefinition()) {
+      if (it == data.function_map.end()) {
+        data.error = CreateRuntimeError(
+            llvm::formatv("\n    at {0}\nFunctionDecl {1} not found in function_map",
+                          func_decl->getBeginLoc().printToString(data.Ctx.getSourceManager()), func_decl->getName()));
+        return false;
+      }
+    } else {
+      // get def of the function decl
+      auto *def_decl = func_decl->getDefinition();
+      if (def_decl == nullptr) {
+        // probably an ffi function
+        return true;
+      }
+
+      it = data.function_map.find(def_decl);
+      if (it == data.function_map.end()) {
+        data.error = CreateRuntimeError(
+            llvm::formatv("\n    at {0}\nFunctionDecl real def {1} not found in function_map",
+                          func_decl->getBeginLoc().printToString(data.Ctx.getSourceManager()), func_decl->getName()));
+        return false;
+      }
     }
 
     auto *tmp_function_decl = data.current_function_decl;
     data.current_function_decl = func_decl;
     auto cleanup =
         llvm::scope_exit([this, tmp_function_decl] -> void { data.current_function_decl = tmp_function_decl; });
+
+    auto function_name = func_decl->getName();
+    if (function_name.starts_with("__c2pnk_") || function_name == "main") {
+      // don't rewrite calls to pancake helper functions
+      return RecursiveASTVisitor<Worker>::TraverseFunctionDecl(func_decl);
+    }
 
     for (const auto *attribute : func_decl->attrs()) {
       if (const auto *annotation_attr = llvm::dyn_cast<clang::AnnotateAttr>(attribute)) {
@@ -314,7 +348,10 @@ public:
     }
 
     auto &function_info = it->second;
-    auto function_name = func_decl->getName();
+    if (!function_info.needs_rewriting && !function_info.turn_return_from_void_to_uint) {
+      return RecursiveASTVisitor<Worker>::TraverseFunctionDecl(func_decl);
+    }
+
     std::string replacement_text;
     llvm::raw_string_ostream os(replacement_text);
 
@@ -342,6 +379,9 @@ public:
 
       // function specifiers
       os << GetStorageClassSpecifierString(func_decl->getStorageClass()) << " ";
+      if (func_decl->isInlineSpecified()) {
+        os << "inline ";
+      }
 
       // return type
       if (function_info.return_info.has_value()) {
@@ -401,11 +441,27 @@ public:
         return false;
       }
       os.flush();
+
+      if (function_info.turn_return_from_void_to_uint) {
+        // insert a return 0UL at the end of the function right before the closing brace
+        auto r_brace = func_decl->getBody()->getEndLoc(); // location of '}'
+        auto range = CharSourceRange::getCharRange(r_brace, r_brace);
+        if (auto error = data.non_ffi_function_def_return_rewrites[func_decl].add(
+                Replacement(sm, range, "return 0UL;\n", data.Ctx.getLangOpts()))) {
+          data.error = CreateRuntimeError(
+              llvm::formatv("\n    at {0}\nNon-ffi function definition {1} already has a return rewrite",
+                            func_decl->getBeginLoc().printToString(data.Ctx.getSourceManager()), func_decl->getName()));
+          return false;
+        }
+      }
     } else {
       // non-ffi function decl
 
       // function specifiers
       os << GetStorageClassSpecifierString(func_decl->getStorageClass()) << " ";
+      if (func_decl->isInlineSpecified()) {
+        os << "inline ";
+      }
 
       // return type
       if (function_info.return_info.has_value()) {
@@ -438,7 +494,8 @@ public:
       os << ")";
 
       os.flush();
-      if (auto error = data.non_ffi_function_decl_rewrites[func_decl].add(
+      // add the replacement under the func definition's decl!
+      if (auto error = data.non_ffi_function_decl_rewrites[func_decl->getDefinition()].add(
               {data.Ctx.getSourceManager(), CharSourceRange::getTokenRange(func_decl->getSourceRange()),
                replacement_text, data.Ctx.getLangOpts()})) {
         data.error = CreateRuntimeError(
@@ -472,9 +529,17 @@ public:
     }
 
     auto callee_name = callee_decl->getName();
-    if (callee_name.starts_with("__c2pnk_")) {
+    if (callee_name.starts_with("__c2pnk_") || callee_name == "main") {
       // don't rewrite calls to pancake helper functions
-      return true;
+      return RecursiveASTVisitor<Worker>::TraverseCallExpr(call_expr);
+    }
+
+    if (data.current_function_decl != nullptr) {
+      auto current_function_name = data.current_function_decl->getName();
+      if (current_function_name.starts_with("__c2pnk_")) {
+        // don't rewrite calls to pancake helper functions
+        return RecursiveASTVisitor<Worker>::TraverseCallExpr(call_expr);
+      }
     }
 
     for (const auto *attribute : callee_decl->attrs()) {
@@ -490,10 +555,43 @@ public:
       // non-ffi function call
 
       auto &function_info = it->second;
-      if (function_info.needs_rewriting) {
+      if (!function_info.needs_rewriting && function_info.turn_return_from_void_to_uint) {
+        // optimization to prevent a gnu statement expression from being generated if only the return type changes
+        // from void -> uint32/64_t
+        std::string expanded;
+        llvm::raw_string_ostream os(expanded);
+        os << "(void)" << callee_name << "(";
+        for (const auto &[i, param_info] : function_info.param_infos | std::views::enumerate) {
+          auto *arg_i = call_expr->getArg((unsigned)i);
+          auto arg_i_src = GetSourceText(arg_i, data.Ctx);
+          if (auto error = arg_i_src.takeError()) {
+            data.error = CreateRuntimeError(
+                llvm::formatv("\n    at {0}\nFailed to get source text for argument {1} of CallExpr: {2}",
+                              arg_i->getBeginLoc().printToString(data.Ctx.getSourceManager()), i,
+                              llvm::fmt_consume(std::move(error))));
+            return false;
+          }
+          os << *arg_i_src << ", ";
+        }
+        os.flush();
+        if (expanded.ends_with(", ")) {
+          expanded.resize(expanded.size() - 2);
+        }
+        os << ")";
+        os.flush();
+        if (auto error = data.non_ffi_function_call_rewrites[callee_decl].add(
+                {data.Ctx.getSourceManager(), CharSourceRange::getTokenRange(call_expr->getSourceRange()), expanded,
+                 data.Ctx.getLangOpts()})) {
+          data.error = CreateRuntimeError(
+              llvm::formatv("\n    at {0}\nFailed to add rewrite for non-FFI function call: {1}\n    Did you "
+                            "recursively call this function? If so, c2pancake does not support that yet.",
+                            call_expr->getBeginLoc().printToString(data.Ctx.getSourceManager()),
+                            llvm::fmt_consume(std::move(error))));
+        }
+      } else if (function_info.needs_rewriting) {
         // replace with a gnu statement expression that loads the hoisted parameters and return value
-        std::string hoisted_parameters;
-        llvm::raw_string_ostream os(hoisted_parameters);
+        std::string expanded;
+        llvm::raw_string_ostream os(expanded);
         os << "({\n";
 
         std::string func_call;
@@ -511,7 +609,7 @@ public:
 
         os2 << callee_name << "(";
 
-        for (const auto &[i, param_info] : std::views::enumerate(function_info.param_infos)) {
+        for (const auto &[i, param_info] : function_info.param_infos | std::views::enumerate) {
           auto *arg_i = call_expr->getArg((unsigned)i);
           auto arg_i_src = GetSourceText(arg_i, data.Ctx);
           if (auto error = arg_i_src.takeError()) {
@@ -546,8 +644,8 @@ public:
         os.flush();
 
         if (auto error = data.non_ffi_function_call_rewrites[callee_decl].add(
-                {data.Ctx.getSourceManager(), CharSourceRange::getTokenRange(call_expr->getSourceRange()),
-                 hoisted_parameters, data.Ctx.getLangOpts()})) {
+                {data.Ctx.getSourceManager(), CharSourceRange::getTokenRange(call_expr->getSourceRange()), expanded,
+                 data.Ctx.getLangOpts()})) {
           data.error = CreateRuntimeError(
               llvm::formatv("\n    at {0}\nFailed to add rewrite for non-FFI function call: {1}\n    Did you "
                             "recursively call this function? If so, c2pancake does not support that yet.",
@@ -571,7 +669,7 @@ public:
           src = src + 1UL;
           len = len - 1UL;
         }
-        return 0;
+        return 0UL;
       }
 
       static uint8_t __c2pnk_ffi_example_func_input_buf[CALCULATED_SIZE];
@@ -579,17 +677,17 @@ public:
 
       // actual call expression gets rewritten to the following. note all the args have to be located on the heap!
       __c2pnk_memcpy(__c2pnk_ffi_example_func_input_buf, &arg1, sizeof(arg1));
-      __c2pnk_memcpy(__c2pnk_ffi_example_func_input_buf + CALCULATED_OFFSET, &arg2, sizeof(arg2));
-      __c2pnk_memcpy(__c2pnk_ffi_example_func_input_buf + CALCULATED_OFFSET, &arg3, sizeof(arg3));
-      __c2pnk_memcpy(__c2pnk_ffi_example_func_input_buf + CALCULATED_OFFSET, &arg4, sizeof(arg4));
-      __c2pnk_memcpy(__c2pnk_ffi_example_func_input_buf + CALCULATED_OFFSET, &arg5, sizeof(arg5));
+      __c2pnk_memcpy(__c2pnk_ffi_example_func_input_buf + CALCULATED_OFFSET, (uint8_t *)&arg2, sizeof(arg2));
+      __c2pnk_memcpy(__c2pnk_ffi_example_func_input_buf + CALCULATED_OFFSET, (uint8_t *)&arg3, sizeof(arg3));
+      __c2pnk_memcpy(__c2pnk_ffi_example_func_input_buf + CALCULATED_OFFSET, (uint8_t *)&arg4, sizeof(arg4));
+      __c2pnk_memcpy(__c2pnk_ffi_example_func_input_buf + CALCULATED_OFFSET, (uint8_t *)&arg5, sizeof(arg5));
       // actual function call
       __c2pnk_ffi_example_func(__c2pnk_ffi_example_func_input_buf, sizeof(__c2pnk_ffi_example_func_input_buf),
       __c2pnk_ffi_example_func_output_buf, sizeof(__c2pnk_ffi_example_func_output_buf));
       __c2pnk_memcpy(&ret_val, __c2pnk_ffi_example_func_output_buf, sizeof(ret_val));
 
       // the function below will be located in the ffi_stubs file!!!
-      int __c2pnk_ffi_example_func(uint8_t *input_buf, uint64/32_t input_buf_len, uint8_t *output_buf, uint64/32_t
+      uint64_t __c2pnk_ffi_example_func(uint8_t *input_buf, uint64_t input_buf_len, uint8_t *output_buf, uint64_t
       output_buf_len) {
         arg1;
         memcpy(&input_buf[0], &arg1, sizeof(arg1));
@@ -603,11 +701,12 @@ public:
         memcpy(&input_buf[CALCULATED_OFFSET], &arg5, sizeof(arg5));
         ret_val = example_func(arg1, arg2, arg3, arg4, arg5);
         memcpy(&ret_val, &output_buf[0], sizeof(ret_val));
-        return 0;
+        return 0UL;
       }
       */
       auto it = data.ffi_rewrites.find(callee_decl);
       if (callee_decl->isVariadic()) {
+        // TODO variadic functions...
         // create a new name mangled variadic version of the function every time...
       } else if (it == data.ffi_rewrites.end()) {
         // create ffi "stub" for this function
@@ -670,7 +769,8 @@ public:
               callee_decl->getBeginLoc().printToString(data.Ctx.getSourceManager()), callee_decl->getName()));
           return false;
         }
-        os << llvm::formatv("#include <{0}>\n", file_entry->getName());
+        auto &file_manager = sm.getFileManager();
+        os << llvm::formatv("#include <{0}>\n", file_manager.getCanonicalName(*file_entry));
 
         // add global buffers
         os << llvm::formatv("#include <stdint.h>\n#include <string.h>\n");
@@ -687,12 +787,12 @@ public:
                             GetWordTypeStr(data.Ctx), func_name);
 
         // create and init local vars to pass to actual function
-        for (const auto &[i, param_info] : std::views::enumerate(callee_decl->parameters())) {
+        for (const auto &[i, param_info] : callee_decl->parameters() | std::views::enumerate) {
           auto param_type = param_info->getType();
           auto [offset, size] = param_offsets_sizes.at(param_info);
 
           os << PrintType(param_type, param_info->getName()) << ";\n";
-          os << llvm::formatv("memcpy(&{0}, &input_buf[{1}], {2});\n", param_info->getName(), offset, size);
+          os << llvm::formatv("memcpy(&{0}, &input_buf[{1}], {2}UL);\n", param_info->getName(), offset, size);
         }
 
         if (!return_type->isVoidType()) {
@@ -717,9 +817,9 @@ public:
 
         // copy return value to output buffer
         if (!return_type->isVoidType()) {
-          os << llvm::formatv("memcpy(&output_buf[0], &__c2pnk_ret_val, {0});\n", output_buf_size);
+          os << llvm::formatv("memcpy(&output_buf[0], &__c2pnk_ret_val, {0}UL);\n", output_buf_size);
         }
-        os << "return 0;\n";
+        os << "return 0UL;\n";
         os << "}\n";
         os.flush();
 
@@ -733,7 +833,7 @@ public:
       os << "({\n";
 
       // copy all the args to the input buffer
-      for (const auto &[i, param_info] : std::views::enumerate(callee_decl->parameters())) {
+      for (const auto &[i, param_info] : callee_decl->parameters() | std::views::enumerate) {
         auto param_type = param_info->getType();
         auto *arg_i = call_expr->getArg((unsigned)i)->IgnoreParenImpCasts();
         auto arg_i_src = GetSourceText(arg_i, data.Ctx);
@@ -749,11 +849,11 @@ public:
             // requires tmp var to hold the value of the argument so we can take the address of it
             std::string tmp_var_name = GetTempVarName(llvm::formatv("arg_{0}", i));
             os << llvm::formatv("{0} = {1};\n", PrintType(param_type, tmp_var_name), *arg_i_src);
-            os << llvm::formatv("__c2pnk_memcpy(__c2pnk_ffi_input_buf_{0} + {1}, &{2}, {3});\n", callee_name, offset,
-                                tmp_var_name, size);
+            os << llvm::formatv("__c2pnk_memcpy(__c2pnk_ffi_input_buf_{0} + {1}UL, (uint8_t *)&{2}, {3}UL);\n",
+                                callee_name, offset, tmp_var_name, size);
           } else {
-            os << llvm::formatv("__c2pnk_memcpy(__c2pnk_ffi_input_buf_{0} + {1}, &{2}, {3});\n", callee_name, offset,
-                                *arg_i_src, size);
+            os << llvm::formatv("__c2pnk_memcpy(__c2pnk_ffi_input_buf_{0} + {1}UL, (uint8_t *)&{2}, {3}UL);\n",
+                                callee_name, offset, *arg_i_src, size);
           }
         } else {
           // TODO variadic functions...
@@ -771,8 +871,9 @@ public:
 
       if (!callee_decl->getReturnType()->isVoidType()) {
         os << PrintType(callee_decl->getReturnType(), "__c2pnk_ret_val") << ";\n";
-        os << llvm::formatv(
-            "memcpy(&__c2pnk_ret_val, __c2pnk_ffi_output_buf_{0}, sizeof(__c2pnk_ffi_output_buf_{0}));\n", callee_name);
+        os << llvm::formatv("__c2pnk_memcpy((uint8_t *)&__c2pnk_ret_val, __c2pnk_ffi_output_buf_{0}, "
+                            "sizeof(__c2pnk_ffi_output_buf_{0}));\n",
+                            callee_name);
         os << "__c2pnk_ret_val;\n";
       }
 
@@ -851,6 +952,19 @@ public:
           return false;
         };
       }
+    } else {
+      // rewrite the return statement to return 0UL instead as per pancake rules
+      std::string replacement_text;
+      llvm::raw_string_ostream os(replacement_text);
+      os << "return 0UL";
+      os.flush();
+
+      if (auto error = data.non_ffi_function_def_return_rewrites[data.current_function_decl].add(
+              {data.Ctx.getSourceManager(), CharSourceRange::getTokenRange(return_stmt->getSourceRange()),
+               replacement_text, data.Ctx.getLangOpts()})) {
+        data.error = std::move(error);
+        return false;
+      };
     }
 
     return RecursiveASTVisitor<Worker>::TraverseReturnStmt(return_stmt);
