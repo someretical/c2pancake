@@ -32,6 +32,7 @@
 #include <llvm/Support/FormatVariadic.h>
 #include <llvm/Support/raw_ostream.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <optional>
 #include <ranges>
@@ -74,18 +75,20 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
 
 namespace pancake::pass_function_calling {
 namespace {
-using NonFFIFunctionDefRewrites = llvm::DenseMap<FunctionDecl *, Replacement>; // non-ffi function definition rewrites.
-using NonFFIFunctionDefReturnRewrites =
-    llvm::DenseMap<FunctionDecl *, Replacements>; // non-ffi function definition return rewrites.
-using NonFFIFunctionDeclRewrites =
-    llvm::DenseMap<FunctionDecl *, Replacements>; // non-ffi function declaration rewrites.
-using NonFFIFunctionCallRewrites = llvm::DenseMap<FunctionDecl *, Replacements>; // non-ffi function call rewrites.
+// all rewrites for a non-ffi function
+// contains definition rewrites, return rewrites, declaration rewrites, and call expr rewrites
+// also captures the more invasive rewrites done for external entry points
+// needs to preserve insertion order because we apply the innermost rewrites first
+using NonFFIFunctionRewrites = llvm::MapVector<FunctionDecl *, Replacements>;
 
-using FFIFunctionWrapperRewrites =
-    llvm::DenseMap<FunctionDecl *, Replacement>; // ffi function wrapper rewrites. should be 1 per FFI function. They
-                                                 // are appended to the top of the source file.
-using FFIFunctionCallRewrites = llvm::DenseMap<FunctionDecl *, Replacements>; // ffi function call rewrites. should be 1
-                                                                              // per FFI function call site.
+// ffi function rewrites
+// contains the ffi wrappers, and call expression rewrites
+// needs to preserve insertion order because we apply the innermost rewrites first
+using FFIFunctionRewrites = llvm::MapVector<FunctionDecl *, Replacements>;
+
+// ffi variadic function rewrites
+// these are keyed be the call expr * to provide something unique every pass
+using FFIVariadicFunctionRewrites = llvm::MapVector<CallExpr *, Replacements>;
 
 namespace CollectFunctionInfo {
 struct WorkerData {
@@ -231,12 +234,9 @@ struct WorkerData {
   ASTContext &Ctx;
   PipelineStageCtx &pa_ctx;
   FunctionMap &function_map;
-  NonFFIFunctionDefRewrites &non_ffi_function_def_rewrites;
-  NonFFIFunctionDefReturnRewrites &non_ffi_function_def_return_rewrites;
-  NonFFIFunctionDeclRewrites &non_ffi_function_decl_rewrites;
-  NonFFIFunctionCallRewrites &non_ffi_function_call_rewrites;
-  FFIFunctionWrapperRewrites &ffi_rewrites;
-  FFIFunctionCallRewrites &ffi_call_rewrites;
+  NonFFIFunctionRewrites &non_ffi_rewrites;
+  FFIFunctionRewrites &ffi_rewrites;
+  FFIVariadicFunctionRewrites &ffi_variadic_rewrites;
 
   struct FFIFunctionInfo {
     size_t input_buf_size = 0;
@@ -250,17 +250,10 @@ struct WorkerData {
   FunctionDecl *current_function_decl = nullptr;
 
   explicit WorkerData(ASTContext &Ctx, PipelineStageCtx &pa_ctx, FunctionMap &function_map,
-                      NonFFIFunctionDefRewrites &non_ffi_function_def_rewrites,
-                      NonFFIFunctionDefReturnRewrites &non_ffi_function_def_return_rewrites,
-                      NonFFIFunctionDeclRewrites &non_ffi_function_decl_rewrites,
-                      NonFFIFunctionCallRewrites &non_ffi_function_call_rewrites,
-                      FFIFunctionWrapperRewrites &ffi_rewrites, FFIFunctionCallRewrites &ffi_call_rewrites)
-      : Ctx(Ctx), pa_ctx(pa_ctx), function_map(function_map),
-        non_ffi_function_def_rewrites(non_ffi_function_def_rewrites),
-        non_ffi_function_def_return_rewrites(non_ffi_function_def_return_rewrites),
-        non_ffi_function_decl_rewrites(non_ffi_function_decl_rewrites),
-        non_ffi_function_call_rewrites(non_ffi_function_call_rewrites), ffi_rewrites(ffi_rewrites),
-        ffi_call_rewrites(ffi_call_rewrites) {}
+                      NonFFIFunctionRewrites &non_ffi_rewrites, FFIFunctionRewrites &ffi_rewrites,
+                      FFIVariadicFunctionRewrites &ffi_variadic_rewrites)
+      : Ctx(Ctx), pa_ctx(pa_ctx), function_map(function_map), non_ffi_rewrites(non_ffi_rewrites),
+        ffi_rewrites(ffi_rewrites), ffi_variadic_rewrites(ffi_variadic_rewrites) {}
 };
 
 class Worker : public RecursiveASTVisitor<Worker> {
@@ -303,6 +296,15 @@ public:
   }
 
   auto TraverseFunctionDecl(FunctionDecl *func_decl) -> bool {
+    auto *tmp_function_decl = data.current_function_decl;
+    data.current_function_decl = func_decl;
+    auto cleanup =
+        llvm::scope_exit([this, tmp_function_decl] -> void { data.current_function_decl = tmp_function_decl; });
+
+    if (!RecursiveASTVisitor<Worker>::TraverseFunctionDecl(func_decl)) {
+      return false;
+    }
+
     if (data.error) {
       return false;
     }
@@ -337,22 +339,17 @@ public:
       }
     }
 
-    auto *tmp_function_decl = data.current_function_decl;
-    data.current_function_decl = func_decl;
-    auto cleanup =
-        llvm::scope_exit([this, tmp_function_decl] -> void { data.current_function_decl = tmp_function_decl; });
-
     auto function_name = func_decl->getName();
     if (function_name.starts_with("__c2pnk_") || function_name == "main") {
       // don't rewrite calls to pancake helper functions
-      return RecursiveASTVisitor<Worker>::TraverseFunctionDecl(func_decl);
+      return true;
     }
 
     bool is_external_entry_point = false;
     for (const auto *attribute : func_decl->attrs()) {
       if (const auto *annotation_attr = llvm::dyn_cast<clang::AnnotateAttr>(attribute)) {
         if (annotation_attr->getAnnotation() == "__c2pnk_rewritten_non_ffi_function") {
-          return RecursiveASTVisitor<Worker>::TraverseFunctionDecl(func_decl);
+          return true;
         }
 
         if (annotation_attr->getAnnotation() == "__c2pnk_external_entry_point") {
@@ -363,7 +360,7 @@ public:
 
     auto &function_info = it->second;
     if (!function_info.needs_rewriting && !function_info.turn_return_from_void_to_uint) {
-      return RecursiveASTVisitor<Worker>::TraverseFunctionDecl(func_decl);
+      return true;
     }
 
     std::string replacement_text;
@@ -463,11 +460,10 @@ public:
       auto l_brace = func_decl->getBody()->getBeginLoc(); // points at '{'
       auto after_l_brace = Lexer::getLocForEndOfToken(l_brace, 0, sm, data.Ctx.getLangOpts());
       auto range = CharSourceRange::getCharRange(begin_loc, after_l_brace);
-      auto [_, inserted] = data.non_ffi_function_def_rewrites.insert(
-          {func_decl, Replacement(sm, range, replacement_text, data.Ctx.getLangOpts())});
-      if (!inserted) {
+      if (auto error =
+              data.non_ffi_rewrites[func_decl].add(Replacement(sm, range, replacement_text, data.Ctx.getLangOpts()))) {
         data.error = CreateRuntimeError(
-            llvm::formatv("\n    at {0}\nNon-ffi function definition rewrite for function {1} ALREADY EXISTS",
+            llvm::formatv("\n    at {0}\nNon-ffi function definition rewrite for function {1} FAILED",
                           func_decl->getBeginLoc().printToString(data.Ctx.getSourceManager()), func_decl->getName()));
         return false;
       }
@@ -533,8 +529,7 @@ public:
         auto after_r_brace =
             Lexer::getLocForEndOfToken(func_decl->getBody()->getEndLoc(), 0, sm, data.Ctx.getLangOpts());
         // bit of a hack putting it in the return rewrites...
-        if (auto error = data.non_ffi_function_def_return_rewrites[func_decl].add(
-                Replacement(sm, after_r_brace, 0, new_func_text))) {
+        if (auto error = data.non_ffi_rewrites[func_decl].add(Replacement(sm, after_r_brace, 0, new_func_text))) {
           data.error = CreateRuntimeError(
               llvm::formatv("\n    at {0}\nFailed to add non-ffi function definition rewrite for function {1}: {2}",
                             func_decl->getBeginLoc().printToString(data.Ctx.getSourceManager()), func_decl->getName(),
@@ -547,8 +542,8 @@ public:
         // insert a return 0UL at the end of the function right before the closing brace
         auto r_brace = func_decl->getBody()->getEndLoc(); // location of '}'
         auto range = CharSourceRange::getCharRange(r_brace, r_brace);
-        if (auto error = data.non_ffi_function_def_return_rewrites[func_decl].add(
-                Replacement(sm, range, "return 0UL;\n", data.Ctx.getLangOpts()))) {
+        if (auto error =
+                data.non_ffi_rewrites[func_decl].add(Replacement(sm, range, "return 0UL;\n", data.Ctx.getLangOpts()))) {
           data.error = CreateRuntimeError(
               llvm::formatv("\n    at {0}\nNon-ffi function definition {1} already has a return rewrite",
                             func_decl->getBeginLoc().printToString(data.Ctx.getSourceManager()), func_decl->getName()));
@@ -607,7 +602,7 @@ public:
 
       os.flush();
       // add the replacement under the func definition's decl!
-      if (auto error = data.non_ffi_function_decl_rewrites[func_decl->getDefinition()].add(
+      if (auto error = data.non_ffi_rewrites[func_decl->getDefinition()].add(
               {data.Ctx.getSourceManager(), CharSourceRange::getTokenRange(func_decl->getSourceRange()),
                replacement_text, data.Ctx.getLangOpts()})) {
         data.error = CreateRuntimeError(
@@ -618,10 +613,14 @@ public:
       };
     }
 
-    return RecursiveASTVisitor<Worker>::TraverseFunctionDecl(func_decl);
+    return true;
   }
 
   auto TraverseCallExpr(CallExpr *call_expr) -> bool {
+    if (!RecursiveASTVisitor<Worker>::TraverseCallExpr(call_expr)) {
+      return false;
+    }
+
     if (data.error) {
       return false;
     }
@@ -643,21 +642,21 @@ public:
     auto callee_name = callee_decl->getName();
     if (callee_name.starts_with("__c2pnk_") || callee_name == "main") {
       // don't rewrite calls to pancake helper functions
-      return RecursiveASTVisitor<Worker>::TraverseCallExpr(call_expr);
+      return true;
     }
 
     if (data.current_function_decl != nullptr) {
       auto current_function_name = data.current_function_decl->getName();
       if (current_function_name.starts_with("__c2pnk_")) {
         // don't rewrite calls to pancake helper functions
-        return RecursiveASTVisitor<Worker>::TraverseCallExpr(call_expr);
+        return true;
       }
     }
 
     for (const auto *attribute : callee_decl->attrs()) {
       if (const auto *annotation_attr = llvm::dyn_cast<clang::AnnotateAttr>(attribute)) {
         if (annotation_attr->getAnnotation() == "__c2pnk_rewritten_non_ffi_function") {
-          return RecursiveASTVisitor<Worker>::TraverseCallExpr(call_expr);
+          return true;
         }
       }
     }
@@ -691,7 +690,7 @@ public:
         }
         os << ")";
         os.flush();
-        if (auto error = data.non_ffi_function_call_rewrites[callee_decl].add(
+        if (auto error = data.non_ffi_rewrites[callee_decl].add(
                 {data.Ctx.getSourceManager(), CharSourceRange::getTokenRange(call_expr->getSourceRange()), expanded,
                  data.Ctx.getLangOpts()})) {
           data.error = CreateRuntimeError(
@@ -699,6 +698,7 @@ public:
                             "recursively call this function? If so, c2pancake does not support that yet.",
                             call_expr->getBeginLoc().printToString(data.Ctx.getSourceManager()),
                             llvm::fmt_consume(std::move(error))));
+          return false;
         }
       } else if (function_info.needs_rewriting) {
         // replace with a gnu statement expression that loads the hoisted parameters and return value
@@ -755,7 +755,7 @@ public:
         os << "})";
         os.flush();
 
-        if (auto error = data.non_ffi_function_call_rewrites[callee_decl].add(
+        if (auto error = data.non_ffi_rewrites[callee_decl].add(
                 {data.Ctx.getSourceManager(), CharSourceRange::getTokenRange(call_expr->getSourceRange()), expanded,
                  data.Ctx.getLangOpts()})) {
           data.error = CreateRuntimeError(
@@ -816,7 +816,7 @@ public:
         return 0UL;
       }
       */
-      auto it = data.ffi_rewrites.find(callee_decl);
+      auto *it = data.ffi_rewrites.find(callee_decl);
       if (callee_decl->isVariadic()) {
         // TODO variadic functions...
         // create a new name mangled variadic version of the function every time...
@@ -935,8 +935,15 @@ public:
         os << "}\n";
         os.flush();
 
-        data.ffi_rewrites.insert(
-            {callee_decl, Replacement(sm, sm.getLocForStartOfFile(sm.getMainFileID()), 0, replacement_text)});
+        // add to the top of the main source file
+        if (auto error = data.ffi_rewrites[callee_decl].add(
+                {data.Ctx.getSourceManager(), sm.getLocForStartOfFile(sm.getMainFileID()), 0, replacement_text})) {
+          data.error =
+              CreateRuntimeError(llvm::formatv("\n    at {0}\nFailed to add rewrite for FFI function wrapper: {1}",
+                                               callee_decl->getBeginLoc().printToString(data.Ctx.getSourceManager()),
+                                               llvm::fmt_consume(std::move(error))));
+          return false;
+        }
       }
 
       // now rewrite the call expr using a gnu statement expression
@@ -992,9 +999,9 @@ public:
       os << "})";
       os.flush();
 
-      if (auto error = data.ffi_call_rewrites[callee_decl].add(
-              {data.Ctx.getSourceManager(), CharSourceRange::getTokenRange(call_expr->getSourceRange()),
-               replacement_text, data.Ctx.getLangOpts()})) {
+      if (auto error = data.ffi_rewrites[callee_decl].add({data.Ctx.getSourceManager(),
+                                                           CharSourceRange::getTokenRange(call_expr->getSourceRange()),
+                                                           replacement_text, data.Ctx.getLangOpts()})) {
         data.error = CreateRuntimeError(llvm::formatv(
             "\n    at {0}\nFailed to add rewrite for FFI function call: {1}\n    Did you "
             "recursively call this function? If so, c2pancake does not support that yet.",
@@ -1003,10 +1010,14 @@ public:
       }
     }
 
-    return RecursiveASTVisitor<Worker>::TraverseCallExpr(call_expr);
+    return true;
   };
 
   auto TraverseReturnStmt(ReturnStmt *return_stmt) -> bool {
+    if (!RecursiveASTVisitor<Worker>::TraverseReturnStmt(return_stmt)) {
+      return false;
+    }
+
     if (data.error) {
       return false;
     }
@@ -1057,7 +1068,7 @@ public:
         os << "}";
         os.flush();
 
-        if (auto error = data.non_ffi_function_def_return_rewrites[data.current_function_decl].add(
+        if (auto error = data.non_ffi_rewrites[data.current_function_decl].add(
                 {data.Ctx.getSourceManager(), CharSourceRange::getTokenRange(return_stmt->getSourceRange()),
                  replacement_text, data.Ctx.getLangOpts()})) {
           data.error = std::move(error);
@@ -1071,7 +1082,7 @@ public:
       os << "return 0UL";
       os.flush();
 
-      if (auto error = data.non_ffi_function_def_return_rewrites[data.current_function_decl].add(
+      if (auto error = data.non_ffi_rewrites[data.current_function_decl].add(
               {data.Ctx.getSourceManager(), CharSourceRange::getTokenRange(return_stmt->getSourceRange()),
                replacement_text, data.Ctx.getLangOpts()})) {
         data.error = std::move(error);
@@ -1079,7 +1090,7 @@ public:
       };
     }
 
-    return RecursiveASTVisitor<Worker>::TraverseReturnStmt(return_stmt);
+    return true;
   }
 };
 } // namespace RewriteFunctions
@@ -1099,16 +1110,11 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
     }
   }
 
-  NonFFIFunctionDefRewrites non_ffi_function_def_rewrites;
-  NonFFIFunctionDefReturnRewrites non_ffi_function_def_return_rewrites;
-  NonFFIFunctionDeclRewrites non_ffi_function_decl_rewrites;
-  NonFFIFunctionCallRewrites non_ffi_function_call_rewrites;
-  FFIFunctionWrapperRewrites ffi_rewrites;
-  FFIFunctionCallRewrites ffi_call_rewrites;
+  NonFFIFunctionRewrites non_ffi_rewrites;
+  FFIFunctionRewrites ffi_rewrites;
+  FFIVariadicFunctionRewrites ffi_variadic_rewrites;
   {
-    RewriteFunctions::WorkerData data(Ctx, ps_ctx, function_map, non_ffi_function_def_rewrites,
-                                      non_ffi_function_def_return_rewrites, non_ffi_function_decl_rewrites,
-                                      non_ffi_function_call_rewrites, ffi_rewrites, ffi_call_rewrites);
+    RewriteFunctions::WorkerData data(Ctx, ps_ctx, function_map, non_ffi_rewrites, ffi_rewrites, ffi_variadic_rewrites);
     RewriteFunctions::Worker w(data);
     w.TraverseDecl(Ctx.getTranslationUnitDecl());
 
@@ -1119,121 +1125,51 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
     }
   }
 
-  /*
-  note that for a given FunctionDecl * in non_ffi_function_def_rewrites, all replacements in
-  non_ffi_function_def_return_rewrites, non_ffi_function_decl_rewrites and non_ffi_function_call_rewrites with the same
-  FunctionDecl * PLUS the replacement in non_ffi_function_def_rewrites need to be atomically applied together.
-  Otherwise, continue and try and apply the next FunctionDecl * and then ultimately repeat the pass.
-
-  The reasoning is that if we can't atomically apply all related replacements for a given FunctionDecl *,
-  then the file is left in an inconsistent state and we won't able to properly parse it in the next pass.
-  This "error" might happen if the user has nested function calls and the inner function call is rewritten first
-  and then the outer function call is rewritten next but the 2 replacements are not order-independent.
-
-  The only truly irrecoverable case is if the user recursively calls the same function.
-
-  side comment: cock and balls because llvm hides the function mergeIfOrderIndependent as private but that's
-  the exact function I want to use here!!!
-  */
-  Replacements all_rewrites;
-  bool has_conflict = false;
-  for (const auto &[func_decl, def_replacement] : non_ffi_function_def_rewrites) {
-    Replacements tmp_replacements = all_rewrites; // this is an O(n^2) algorithm :skull:
-    bool has_internal_conflict = false;
-    if (auto error = tmp_replacements.add(def_replacement)) {
-      ps_ctx.error = CreateRuntimeError(llvm::formatv("Unexpected add replacement conflict: {0}", error));
-      ps_ctx.whats_next = WhatsNext::MoveToNextFile;
-      return;
-    }
-
-    if (!has_internal_conflict) {
-      auto ret_it = non_ffi_function_def_return_rewrites.find(func_decl);
-      if (ret_it != non_ffi_function_def_return_rewrites.end()) {
-        for (const auto &ret_replacement : ret_it->second) {
-          if (tmp_replacements.add(ret_replacement)) {
-            has_conflict = true;
-            has_internal_conflict = true;
-            break;
-          }
-        }
-      }
-    }
-
-    if (!has_internal_conflict) {
-      auto decl_it = non_ffi_function_decl_rewrites.find(func_decl);
-      if (decl_it != non_ffi_function_decl_rewrites.end()) {
-        for (const auto &decl_replacement : decl_it->second) {
-          if (tmp_replacements.add(decl_replacement)) {
-            has_conflict = true;
-            has_internal_conflict = true;
-            break;
-          }
-        }
-      }
-    }
-
-    if (!has_internal_conflict) {
-      auto call_it = non_ffi_function_call_rewrites.find(func_decl);
-      if (call_it != non_ffi_function_call_rewrites.end()) {
-        for (const auto &call_replacement : call_it->second) {
-          if (tmp_replacements.add(call_replacement)) {
-            has_conflict = true;
-            has_internal_conflict = true;
-            break;
-          }
-        }
-      }
-    }
-
-    if (!has_internal_conflict) {
-      all_rewrites = std::move(tmp_replacements);
-    }
-  }
-
-  // now do ffi functions
-  for (const auto &[func_decl, ffi_replacement] : ffi_rewrites) {
-    Replacements tmp_replacements = all_rewrites; // this is an O(n^2) algorithm :skull:
-    bool has_internal_conflict = false;
-    if (auto error = tmp_replacements.add(ffi_replacement)) {
-      // unfortunately, all the ffi rewrites are added to the top of the file with [0,0) range
-      // this means they'll all collide with each other...
-      // so if there are ffi rewrites, only one can be done per pass
-      has_conflict = true;
-      has_internal_conflict = true;
-      break;
-    }
-
-    if (!has_internal_conflict) {
-      auto call_it = ffi_call_rewrites.find(func_decl);
-      if (call_it != ffi_call_rewrites.end()) {
-        for (const auto &call_replacement : call_it->second) {
-          if (tmp_replacements.add(call_replacement)) {
-            has_conflict = true;
-            has_internal_conflict = true;
-            break;
-          }
-        }
-      }
-    }
-
-    if (!has_internal_conflict) {
-      all_rewrites = std::move(tmp_replacements);
-    }
-  }
-
-  for (const auto &r : all_rewrites) {
-    llvm::outs() << "===\n";
-    llvm::outs() << "File path: " << r.getFilePath() << "\n";
-    llvm::outs() << "Offset: " << r.getOffset() << "\n";
-    llvm::outs() << "Length: " << r.getLength() << "\n";
-    llvm::outs() << "Text: " << r.getReplacementText() << "\n";
-  }
-
-  ps_ctx.replacements = std::move(all_rewrites);
-  if (has_conflict) {
-    ps_ctx.whats_next = WhatsNext::RepeatPass;
+  llvm::SmallVector<Replacements> merged_groups;
+  merged_groups.reserve(non_ffi_rewrites.size() + ffi_rewrites.size() + ffi_variadic_rewrites.size());
+  auto append_values = [&merged_groups](auto &map) -> auto {
+    auto values = llvm::make_second_range(map);
+    merged_groups.insert(merged_groups.end(), values.begin(), values.end());
+  };
+  append_values(ffi_rewrites);
+  append_values(ffi_variadic_rewrites);
+  if (merged_groups.empty()) {
+    append_values(non_ffi_rewrites);
   } else {
-    ps_ctx.whats_next = WhatsNext::MoveToNextPass;
+    // we want to apply ALL ffi rewrites first, AND THEN apply the non-ffi rewrites,
+    // otherwise the non-ffi rewrites might obscure the conditions required to apply ffi rewrites.
+    ps_ctx.whats_next = WhatsNext::RepeatPass;
+  }
+
+  std::ranges::sort(merged_groups, [](const auto &a, const auto &b) -> auto {
+    return a.begin()->getOffset() < b.begin()->getOffset();
+  });
+
+  Replacements merged_output;
+  auto all_ok = true;
+  for (const auto &group : merged_groups) {
+    auto ok = true;
+    auto attempt = merged_output;
+    for (const auto &r : group) {
+      if (auto error = attempt.add(r)) {
+        llvm::consumeError(std::move(error));
+        ok = false;
+        all_ok = false;
+        break;
+      }
+    }
+    if (ok) {
+      merged_output = std::move(attempt); // commit the whole group}
+    }
+  }
+
+  ps_ctx.replacements = std::move(merged_output);
+  if (!ps_ctx.whats_next.has_value()) {
+    if (all_ok) {
+      ps_ctx.whats_next = WhatsNext::MoveToNextPass;
+    } else {
+      ps_ctx.whats_next = WhatsNext::RepeatPass;
+    }
   }
 }
 } // namespace pancake::pass_function_calling

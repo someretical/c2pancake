@@ -29,6 +29,8 @@
             "program": "${command:cmake.getLaunchTargetPath}",
             "args": [
                 "/home/one/sddf/drivers/serial/imx/uart.c",
+                "--max-pass-retries=20",
+                "--end=RewriteFunctionCalling",
                 "--",
                 "-ffreestanding",
                 "--target=aarch64-linux-gnu",
