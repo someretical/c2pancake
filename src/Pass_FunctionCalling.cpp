@@ -214,6 +214,15 @@ public:
 };
 } // namespace CollectFunctionInfo
 
+/*
+Annotation types:
+[[clang::annotate("__c2pnk_rewritten_non_ffi_function")]]: marks a function signature as being rewritten due to passing
+structs by value.
+[[clang::annotate("__c2pnk_external_entry_point")]]: marks a function as being an external entry point for the pancake
+runtime. Function definitions with this signature will not be touched. However, their body will be replaced with a call
+to a new function which does the same thing but adheres to pancake calling convention. During the final translation
+stage, the function marked with this annotation will be removed entirely.
+ */
 namespace RewriteFunctions {
 using FunctionInfo = CollectFunctionInfo::WorkerData::FunctionInfo;
 using FunctionMap = CollectFunctionInfo::WorkerData::FunctionMap;
@@ -339,10 +348,15 @@ public:
       return RecursiveASTVisitor<Worker>::TraverseFunctionDecl(func_decl);
     }
 
+    bool is_external_entry_point = false;
     for (const auto *attribute : func_decl->attrs()) {
       if (const auto *annotation_attr = llvm::dyn_cast<clang::AnnotateAttr>(attribute)) {
         if (annotation_attr->getAnnotation() == "__c2pnk_rewritten_non_ffi_function") {
           return RecursiveASTVisitor<Worker>::TraverseFunctionDecl(func_decl);
+        }
+
+        if (annotation_attr->getAnnotation() == "__c2pnk_external_entry_point") {
+          is_external_entry_point = true;
         }
       }
     }
@@ -375,7 +389,19 @@ public:
 
       // now do the function signature
 
+      // add annotations
       os << "[[clang::annotate(\"__c2pnk_rewritten_non_ffi_function\")]]\n";
+      for (const auto *attribute : func_decl->attrs()) {
+        if (const auto *annotation_attr = llvm::dyn_cast<clang::AnnotateAttr>(attribute)) {
+          if (annotation_attr->getAnnotation() == "__c2pnk_external_entry_point") {
+            // DON'T print it for this function because the name has been changed
+            // we instead print it for the new "wrapper" function inserted AFTER this modified function definition!
+            continue;
+          }
+        }
+        attribute->printPretty(os, data.Ctx.getPrintingPolicy());
+        os << "\n";
+      }
 
       // function specifiers
       os << GetStorageClassSpecifierString(func_decl->getStorageClass()) << " ";
@@ -399,6 +425,9 @@ public:
       }
 
       // name
+      if (is_external_entry_point) {
+        os << "__c2pnk_external_entry_point_";
+      }
       os << function_name;
 
       // args
@@ -428,6 +457,8 @@ public:
       os.flush();
 
       // replace only "ret_type func_name(param_type1 param1, param_type2 param2, ...) {"
+      // note begin loc DOESn't include the attributes so the external entry point annotation will be duplicated.
+      // the real way is to use the name of the func to decide during the final pass
       auto begin_loc = func_decl->getBeginLoc();
       auto l_brace = func_decl->getBody()->getBeginLoc(); // points at '{'
       auto after_l_brace = Lexer::getLocForEndOfToken(l_brace, 0, sm, data.Ctx.getLangOpts());
@@ -441,6 +472,76 @@ public:
         return false;
       }
       os.flush();
+
+      if (is_external_entry_point) {
+        // we renamed the function earlier to prepend __c2pnk_external_entry_point_ to the name
+        //
+        // Now we want to add a new function with the original name that calls the renamed function.
+
+        std::string new_func_text;
+        llvm::raw_string_ostream new_func_os(new_func_text);
+
+        // add annotations
+        new_func_os << "\n\n[[clang::annotate(\"__c2pnk_external_entry_point\")]]\n";
+        new_func_os << "[[clang::annotate(\"__c2pnk_rewritten_non_ffi_function\")]]\n";
+
+        // grab the signature part of the original definition
+        auto before_l_brace = l_brace.getLocWithOffset(-1);
+        auto func_sig =
+            Lexer::getSourceText(CharSourceRange::getCharRange(begin_loc, before_l_brace), sm, data.Ctx.getLangOpts());
+        new_func_os << func_sig << " {\n";
+
+        // add a call to the renamed function
+        std::string call_text;
+        llvm::raw_string_ostream call_os(call_text);
+        call_os << "__c2pnk_external_entry_point_" << function_name << "(";
+
+        // forward the args
+        for (const auto &param_info : function_info.param_infos) {
+          if (param_info.hoisted_name.has_value()) {
+            // this is funadmentally incompatible!
+            data.error = CreateRuntimeError(llvm::formatv(
+                "\n    at {0}\nExternal entry point function {1} needs a hoisted parameter {2}, which is not supported",
+                func_decl->getBeginLoc().printToString(data.Ctx.getSourceManager()), func_decl->getName(),
+                param_info.param_decl->getName()));
+            return false;
+          }
+
+          if (!param_info.param_decl->getType()->isVoidType()) {
+            call_os << param_info.param_decl->getName() << ", ";
+          }
+        }
+        call_os.flush();
+        if (call_text.ends_with(", ")) {
+          call_text.resize(call_text.size() - 2);
+        }
+        call_os << ")";
+        call_os.flush();
+
+        if (function_info.turn_return_from_void_to_uint) {
+          // don't add a return value since the original function returns void
+          new_func_os << call_text << ";\n";
+        } else {
+          new_func_os << "  return " << call_text << ";\n";
+        }
+
+        // end the function
+        new_func_os << "}\n";
+        new_func_os.flush();
+
+        // add the new function AFTER the original function definition
+        auto after_r_brace =
+            Lexer::getLocForEndOfToken(func_decl->getBody()->getEndLoc(), 0, sm, data.Ctx.getLangOpts());
+        // bit of a hack putting it in the return rewrites...
+        if (auto error = data.non_ffi_function_def_return_rewrites[func_decl].add(
+                Replacement(sm, after_r_brace, 0, new_func_text))) {
+          data.error = CreateRuntimeError(
+              llvm::formatv("\n    at {0}\nFailed to add non-ffi function definition rewrite for function {1}: {2}",
+                            func_decl->getBeginLoc().printToString(data.Ctx.getSourceManager()), func_decl->getName(),
+                            llvm::fmt_consume(std::move(error))));
+          return false;
+        }
+      }
 
       if (function_info.turn_return_from_void_to_uint) {
         // insert a return 0UL at the end of the function right before the closing brace
@@ -456,6 +557,17 @@ public:
       }
     } else {
       // non-ffi function decl
+
+      // don't touch the function signature at all.
+      if (is_external_entry_point) {
+        return RecursiveASTVisitor<Worker>::TraverseFunctionDecl(func_decl);
+      }
+
+      // attributes
+      for (const auto *attribute : func_decl->attrs()) {
+        attribute->printPretty(os, data.Ctx.getPrintingPolicy());
+        os << "\n";
+      }
 
       // function specifiers
       os << GetStorageClassSpecifierString(func_decl->getStorageClass()) << " ";

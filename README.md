@@ -51,18 +51,22 @@ c2pancake options:
 c2pancake tests/arith.c --
 ```
 
+Note if see a warning in the output like `WARNING: Maximum number of passes (X) reached, consider increasing the limit`, use `--max-pass-retries=` option as described above!
+
 ## Restrictions
 
 ### Before running the tool
 
 1. Remove any static symbols within functions.
 1. Rewrite any switch statements with loops inside them. This is problematic because the loops can have case statements inside them which cannot be correctly transpiled.
-1. Switch statement cases should be rewritten so they don't contain any `break;`s in the middle. Automatically rewriting this requires gotos (or advanced control flow analysis which is really annoying) which are not supported in Pancake. Also, case statements are only allowed at the top level scope in the switch statement since it's too complicated to parse otherwise.
-1. Static inline functions in headers should be placed in a special header file. Then run the preprocessor with args `-nostdinc -I/path/to/header` to ONLY process the special header file. This will ensure the functions are inlined into the source file and thus processed by c2pancake. Don't include anything that shouldn't be converted (e.g. C library functions and #defines)
+1. Switch statement cases should be rewritten so they don't contain any `break;`s in the middle of cases (i.e. `break`'s should only appear at the end of a case statement). Also, case statements are only allowed at the top level scope in the switch statement (i.e. don't nest them inside of `{}`'s).
+1. Static inline functions in headers should be placed in a special header file. Then run the preprocessor with args `-nostdinc -I/path/to/header` to ONLY process the special header file. This will ensure the functions are inlined into the source file and thus processed by c2pancake. Don't include anything that shouldn't be converted (e.g. C library functions and #defines).
+1. Remove all variadic functions defined within the source file along with calls to them.
+1. Remove all variable length arrays include incomplete array members within records (structs/unions).
 1. If there are any function declarations that should not be rewritten to follow Pancake's calling convention, move them into header files.
-1. If there are any function definitions that should not be rewritten to follow Pancake's calling convention, move them into a translation unit which won't be processed by c2pancake.
-    - E.g. the [`init`](https://github.com/seL4/microkit/blob/main/docs/manual.md#entry-points) function in [sDDF](https://github.com/au-ts/sDDF) has the signature `void init(void)` and applications are expected to implement it. However, Pancake requires all functions to return a `uint64/32_t` equivalent type. Therefore, the contents of `init` should be moved to a new `int main(void)` function in the source file. Then from the [Pancake FFI file](https://github.com/CakeML/cakeml/blob/pan_howto/basis/basis_ffi.c), implement the `init` function and have it call the `main` function in the Pancake FFI file which sets up the Pancake runtime to run the original source file.
-1. Global variables shared across threads should be marked with the annotation `[[clang::annotate("__c2pnk_shared_global")]]`.
+1. If there are any function definitions that should not be rewritten to follow Pancake's calling convention, annotate them with `[[clang::annotate("__c2pnk_external_entry_point")]]`.
+    - E.g. the [`init`](https://github.com/seL4/microkit/blob/main/docs/manual.md#entry-points) function in [sDDF](https://github.com/au-ts/sDDF) has the signature `void init(void)` and applications are expected to implement it.
+1. Global variables shared across threads should be annotated with `[[clang::annotate("__c2pnk_shared_global")]]`.
 1. Macros like `assert()` cannot be converted properly so they should be expanded beforehand or replaced with a function.
 
 ### Other restrictions
