@@ -18,7 +18,7 @@ void inc_via_ptr(void) {
   int counter = 0; /* hoisted: address taken below */
   int *p = &counter;
   (*p)++;
-  printf("counter = %d\n", counter);
+  // printf("counter = %d\n", counter);
 }
 
 /*  Case 3: mix – auto array + auto address-taken scalar + plain local
@@ -29,10 +29,10 @@ void mixed(void) {
   int plain = 7;  /* NOT hoisted: plain auto local     */
   int *vp = &value;
 
-  snprintf(msg, sizeof(msg), "value=%d plain=%d", value, plain);
+  // snprintf(msg, sizeof(msg), "value=%d plain=%d", value, plain);
   puts(msg);
   (*vp) += plain;
-  printf("after: %d\n", value);
+  // printf("after: %d\n", value);
 }
 
 /*  Case 4: static local array */
@@ -43,7 +43,7 @@ void static_array(void) {
   int *cp = &call_count;
   call_log[*cp % 16] = *cp;
   (*cp)++;
-  printf("call #%d\n", call_count);
+  // printf("call #%d\n", call_count);
 }
 
 /*  Case 5: static local with constant initialiser  */
@@ -53,7 +53,8 @@ void static_const_init(void) {
   static int base = 100;                      /* hoisted: static, address taken, const init */
   int *bp = &base;
   for (int i = 0; i < 4; i++)
-    printf("%d ", threshold[i] + *bp);
+    ;
+  // printf("%d ", threshold[i] + *bp);
   puts("");
 }
 
@@ -63,7 +64,7 @@ void use_extern(void) {
      The local extern decl is removed; uses are renamed to the bare symbol. */
   extern int g_external_counter; /* hoisted: extern redecl → removed */
   g_external_counter++;
-  printf("extern counter = %d\n", g_external_counter);
+  // printf("extern counter = %d\n", g_external_counter);
 }
 
 /*  Case 7: nested scopes with a static local */
@@ -74,27 +75,27 @@ void nested(int n) {
     int *vp = &visits;
     buf[0] = i;
     (*vp)++;
-    printf("iter %d visits %d buf[0]=%d\n", i, visits, buf[0]);
+    // printf("iter %d visits %d buf[0]=%d\n", i, visits, buf[0]);
   }
 }
 
 /*  Case 8: multi-dimensional array */
 void matrix(void) {
   long mat[3][3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}};
-  printf("%ld\n", mat[1][1]);
+  // printf("%ld\n", mat[1][1]);
 }
 
 /*  Case 9: address taken through cast  */
 void byte_alias(void) {
   unsigned int word = 0xDEADBEEF; /* hoisted: address taken via cast */
   unsigned char *bp = (unsigned char *)&word;
-  printf("%02x\n", bp[0]);
+  // printf("%02x\n", bp[0]);
 }
 
 /* Case 10: multiple init on one line */
 void multiple_init(void) {
   int a[3][4], b[5], c = 15;
-  printf("a = %p, b = %p, c = %d\n", (void *)a, (void *)b, c);
+  // printf("a = %p, b = %p, c = %d\n", (void *)a, (void *)b, c);
 }
 
 void struct_test(void) {
@@ -102,7 +103,7 @@ void struct_test(void) {
     int arr[4]; /* hoisted: auto array in struct */
   };
   struct S s = {{1, 2, 3, 4}};
-  printf("%d\n", s.arr[2]);
+  // printf("%d\n", s.arr[2]);
 }
 
 void struct_pointer_test(void) {
@@ -111,7 +112,7 @@ void struct_pointer_test(void) {
   };
   struct S s = {42};
   struct S *sp = &s;
-  printf("%d\n", sp->field);
+  // printf("%d\n", sp->field);
 }
 
 void struct_unused_arr_test(void) {
@@ -121,7 +122,7 @@ void struct_unused_arr_test(void) {
   };
   struct S s;
   s.field2 = 42; /* only field2 is used, so arr is not hoisted */
-  printf("%d\n", s.field2);
+  // printf("%d\n", s.field2);
 }
 
 void struct_unused_arr_ptr_test(void) {
@@ -132,7 +133,7 @@ void struct_unused_arr_ptr_test(void) {
   struct S s;
   struct S *sp = &s;
   sp->field2 = 42; /* S has to be hoisted now... */
-  printf("%d\n", sp->field2);
+  // printf("%d\n", sp->field2);
 }
 
 void array_of_structs(void) {
@@ -142,11 +143,12 @@ void array_of_structs(void) {
   };
   struct S points[3] = {{1, 2}, {3, 4}, {5, 6}}; /* hoisted: auto array of structs */
   for (int i = 0; i < 3; i++)
-    printf("point %d: (%d, %d)\n", i, points[i].x, points[i].y);
+    ;
+  // printf("point %d: (%d, %d)\n", i, points[i].x, points[i].y);
 }
 
 int main(void) {
-  printf("sum  = %d\n", sum_array());
+  // printf("sum  = %d\n", sum_array());
   inc_via_ptr();
   mixed();
   static_array();

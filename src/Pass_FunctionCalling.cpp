@@ -3,32 +3,27 @@
 
 #include <clang/AST/ASTConsumer.h>
 #include <clang/AST/ASTContext.h>
+#include <clang/AST/Attrs.inc>
 #include <clang/AST/Expr.h>
-#include <clang/AST/OperationKinds.h>
 #include <clang/AST/RecursiveASTVisitor.h>
 #include <clang/AST/Stmt.h>
 #include <clang/AST/TypeBase.h>
-#include <clang/ASTMatchers/ASTMatchFinder.h>
-#include <clang/ASTMatchers/ASTMatchers.h>
 #include <clang/Basic/LLVM.h>
 #include <clang/Basic/SourceLocation.h>
-#include <clang/Basic/TokenKinds.h>
+#include <clang/Basic/Specifiers.h>
 #include <clang/Frontend/CompilerInstance.h>
 #include <clang/Lex/Lexer.h>
 #include <clang/Rewrite/Core/Rewriter.h>
 #include <clang/Tooling/Core/Replacement.h>
-#include <clang/Tooling/Refactoring/AtomicChange.h>
-#include <clang/Tooling/Transformer/RangeSelector.h>
-#include <clang/Tooling/Transformer/RewriteRule.h>
-#include <clang/Tooling/Transformer/Stencil.h>
-#include <clang/Tooling/Transformer/Transformer.h>
+#include <llvm/ADT/DenseMap.h>
+#include <llvm/ADT/MapVector.h>
 #include <llvm/ADT/ScopeExit.h>
 #include <llvm/ADT/SmallVector.h>
 #include <llvm/ADT/StringExtras.h>
 #include <llvm/ADT/StringRef.h>
+#include <llvm/Support/Casting.h>
 #include <llvm/Support/Error.h>
 #include <llvm/Support/ErrorHandling.h>
-#include <llvm/Support/FormatAdapters.h>
 #include <llvm/Support/FormatVariadic.h>
 #include <llvm/Support/raw_ostream.h>
 
@@ -41,8 +36,6 @@
 
 using namespace clang;
 using namespace clang::tooling;
-using namespace clang::transformer;
-using namespace clang::ast_matchers;
 
 namespace pancake::pass_inject_memcpy_polyfill {
 namespace {
@@ -63,9 +56,9 @@ static inline uint{0}_t __c2pnk_memcpy(uint8_t *dest, uint8_t *src, uint{0}_t le
 
 auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
   const auto &sm = Ctx.getSourceManager();
-  if (auto err = ps_ctx.replacements.add({sm, sm.getLocForStartOfFile(sm.getMainFileID()), 0,
-                                          llvm::formatv(memcpy_polyfill_code, GetPointerWidth(Ctx)).str()})) {
-    ps_ctx.error = CreateRuntimeError(llvm::formatv("Add replacement conflict: {0}", err));
+  if (auto error = ps_ctx.replacements.add({sm, sm.getLocForStartOfFile(sm.getMainFileID()), 0,
+                                            llvm::formatv(memcpy_polyfill_code, GetPointerWidth(Ctx)).str()})) {
+    ps_ctx.error = llvm::joinErrors(CreateRuntimeError("Add replacement conflict"), std::move(error));
     ps_ctx.whats_next = WhatsNext::MoveToNextFile;
     return;
   }
@@ -93,7 +86,7 @@ using FFIVariadicFunctionRewrites = llvm::MapVector<CallExpr *, Replacements>;
 namespace CollectFunctionInfo {
 struct WorkerData {
   ASTContext &Ctx;
-  PipelineStageCtx &pa_ctx;
+  PipelineStageCtx &ps_ctx;
 
   struct ReturnInfo {
     QualType return_type; // COULD be void
@@ -134,7 +127,7 @@ public:
   static auto shouldTraversePostOrder() -> bool { return false; }
 
   auto GetTempVarName(std::string hint) -> auto {
-    return llvm::formatv("__c2pnk_{0}_{1}_{2}_{3}", hint, data.pa_ctx.major_pass_number, data.pa_ctx.minor_pass_number,
+    return llvm::formatv("__c2pnk_{0}_{1}_{2}_{3}", hint, data.ps_ctx.major_pass_number, data.ps_ctx.minor_pass_number,
                          data.tmp_var_counter++);
   }
 
@@ -189,10 +182,10 @@ public:
         auto param_type = param_decl->getType();
         if ((param_type->isIntegerType() || param_type->isPointerType()) &&
             data.Ctx.getTypeSize(param_type) > GetPointerWidth(data.Ctx)) {
-          data.error = CreateRuntimeError(llvm::formatv(
+          data.error = CreateRuntimeError(std::move(llvm::formatv(
               "\n    at {0}\nFunctionDecl {1} has integer parameter {2} of type {3} larger than pointer width",
               param_decl->getBeginLoc().printToString(data.Ctx.getSourceManager()), func_decl->getName(),
-              param_decl->getName(), param_type.getAsString()));
+              param_decl->getName(), param_type.getAsString())));
           return false;
         }
 
@@ -232,7 +225,7 @@ using FunctionMap = CollectFunctionInfo::WorkerData::FunctionMap;
 
 struct WorkerData {
   ASTContext &Ctx;
-  PipelineStageCtx &pa_ctx;
+  PipelineStageCtx &ps_ctx;
   FunctionMap &function_map;
   NonFFIFunctionRewrites &non_ffi_rewrites;
   FFIFunctionRewrites &ffi_rewrites;
@@ -249,10 +242,10 @@ struct WorkerData {
   size_t tmp_var_counter = 0;
   FunctionDecl *current_function_decl = nullptr;
 
-  explicit WorkerData(ASTContext &Ctx, PipelineStageCtx &pa_ctx, FunctionMap &function_map,
+  explicit WorkerData(ASTContext &Ctx, PipelineStageCtx &ps_ctx, FunctionMap &function_map,
                       NonFFIFunctionRewrites &non_ffi_rewrites, FFIFunctionRewrites &ffi_rewrites,
                       FFIVariadicFunctionRewrites &ffi_variadic_rewrites)
-      : Ctx(Ctx), pa_ctx(pa_ctx), function_map(function_map), non_ffi_rewrites(non_ffi_rewrites),
+      : Ctx(Ctx), ps_ctx(ps_ctx), function_map(function_map), non_ffi_rewrites(non_ffi_rewrites),
         ffi_rewrites(ffi_rewrites), ffi_variadic_rewrites(ffi_variadic_rewrites) {}
 };
 
@@ -266,7 +259,7 @@ public:
   static auto shouldTraversePostOrder() -> bool { return false; }
 
   auto GetTempVarName(std::string hint) -> auto {
-    return llvm::formatv("__c2pnk_{0}_{1}_{2}_{3}", hint, data.pa_ctx.major_pass_number, data.pa_ctx.minor_pass_number,
+    return llvm::formatv("__c2pnk_{0}_{1}_{2}_{3}", hint, data.ps_ctx.major_pass_number, data.ps_ctx.minor_pass_number,
                          data.tmp_var_counter++);
   }
 
@@ -496,10 +489,10 @@ public:
         for (const auto &param_info : function_info.param_infos) {
           if (param_info.hoisted_name.has_value()) {
             // this is funadmentally incompatible!
-            data.error = CreateRuntimeError(llvm::formatv(
+            data.error = CreateRuntimeError(std::move(llvm::formatv(
                 "\n    at {0}\nExternal entry point function {1} needs a hoisted parameter {2}, which is not supported",
                 func_decl->getBeginLoc().printToString(data.Ctx.getSourceManager()), func_decl->getName(),
-                param_info.param_decl->getName()));
+                param_info.param_decl->getName())));
             return false;
           }
 
@@ -530,10 +523,11 @@ public:
             Lexer::getLocForEndOfToken(func_decl->getBody()->getEndLoc(), 0, sm, data.Ctx.getLangOpts());
         // bit of a hack putting it in the return rewrites...
         if (auto error = data.non_ffi_rewrites[func_decl].add(Replacement(sm, after_r_brace, 0, new_func_text))) {
-          data.error = CreateRuntimeError(
-              llvm::formatv("\n    at {0}\nFailed to add non-ffi function definition rewrite for function {1}: {2}",
-                            func_decl->getBeginLoc().printToString(data.Ctx.getSourceManager()), func_decl->getName(),
-                            llvm::fmt_consume(std::move(error))));
+          data.error = llvm::joinErrors(
+              CreateRuntimeError(std::move(llvm::formatv(
+                  "\n    at {0}\nFailed to add non-ffi function definition rewrite for function {1}",
+                  func_decl->getBeginLoc().printToString(data.Ctx.getSourceManager()), func_decl->getName()))),
+              std::move(error));
           return false;
         }
       }
@@ -605,10 +599,11 @@ public:
       if (auto error = data.non_ffi_rewrites[func_decl->getDefinition()].add(
               {data.Ctx.getSourceManager(), CharSourceRange::getTokenRange(func_decl->getSourceRange()),
                replacement_text, data.Ctx.getLangOpts()})) {
-        data.error = CreateRuntimeError(
-            llvm::formatv("\n    at {0}\nFailed to add non-ffi function declaration rewrite for function {1}: {2}",
-                          func_decl->getBeginLoc().printToString(data.Ctx.getSourceManager()), func_decl->getName(),
-                          llvm::fmt_consume(std::move(error))));
+        data.error = llvm::joinErrors(
+            CreateRuntimeError(std::move(llvm::formatv(
+                "\n    at {0}\nFailed to add non-ffi function declaration rewrite for function {1}",
+                func_decl->getBeginLoc().printToString(data.Ctx.getSourceManager()), func_decl->getName()))),
+            std::move(error));
         return false;
       };
     }
@@ -633,9 +628,9 @@ public:
     auto *callee_decl = call_expr->getDirectCallee();
     if (callee_decl == nullptr) {
       // maybe function pointer???
-      data.error =
-          CreateRuntimeError(llvm::formatv("\n    at {0}\nCallExpr has no direct callee",
-                                           call_expr->getBeginLoc().printToString(data.Ctx.getSourceManager())));
+      data.error = CreateRuntimeError(
+          std::move(llvm::formatv("\n    at {0}\nCallExpr has no direct callee",
+                                  call_expr->getBeginLoc().printToString(data.Ctx.getSourceManager()))));
       return false;
     }
 
@@ -673,13 +668,13 @@ public:
         llvm::raw_string_ostream os(expanded);
         os << "(void)" << callee_name << "(";
         for (const auto &[i, param_info] : function_info.param_infos | std::views::enumerate) {
-          auto *arg_i = call_expr->getArg((unsigned)i);
+          auto *arg_i = call_expr->getArg(static_cast<unsigned>(i));
           auto arg_i_src = GetSourceText(arg_i, data.Ctx);
           if (auto error = arg_i_src.takeError()) {
-            data.error = CreateRuntimeError(
-                llvm::formatv("\n    at {0}\nFailed to get source text for argument {1} of CallExpr: {2}",
-                              arg_i->getBeginLoc().printToString(data.Ctx.getSourceManager()), i,
-                              llvm::fmt_consume(std::move(error))));
+            data.error = llvm::joinErrors(CreateRuntimeError(std::move(llvm::formatv(
+                                              "\n    at {0}\nFailed to get source text for argument {1} of CallExpr",
+                                              arg_i->getBeginLoc().printToString(data.Ctx.getSourceManager()), i))),
+                                          std::move(error));
             return false;
           }
           os << *arg_i_src << ", ";
@@ -693,11 +688,12 @@ public:
         if (auto error = data.non_ffi_rewrites[callee_decl].add(
                 {data.Ctx.getSourceManager(), CharSourceRange::getTokenRange(call_expr->getSourceRange()), expanded,
                  data.Ctx.getLangOpts()})) {
-          data.error = CreateRuntimeError(
-              llvm::formatv("\n    at {0}\nFailed to add rewrite for non-FFI function call: {1}\n    Did you "
-                            "recursively call this function? If so, c2pancake does not support that yet.",
-                            call_expr->getBeginLoc().printToString(data.Ctx.getSourceManager()),
-                            llvm::fmt_consume(std::move(error))));
+          data.error = llvm::joinErrors(
+              CreateRuntimeError(
+                  std::move(llvm::formatv("\n    at {0}\nFailed to add rewrite for non-FFI function call\n    Did you "
+                                          "recursively call this function? If so, c2pancake does not support that yet.",
+                                          call_expr->getBeginLoc().printToString(data.Ctx.getSourceManager())))),
+              std::move(error));
           return false;
         }
       } else if (function_info.needs_rewriting) {
@@ -722,13 +718,13 @@ public:
         os2 << callee_name << "(";
 
         for (const auto &[i, param_info] : function_info.param_infos | std::views::enumerate) {
-          auto *arg_i = call_expr->getArg((unsigned)i);
+          auto *arg_i = call_expr->getArg(static_cast<unsigned>(i));
           auto arg_i_src = GetSourceText(arg_i, data.Ctx);
           if (auto error = arg_i_src.takeError()) {
-            data.error = CreateRuntimeError(
-                llvm::formatv("\n    at {0}\nFailed to get source text for argument {1} of CallExpr: {2}",
-                              arg_i->getBeginLoc().printToString(data.Ctx.getSourceManager()), i,
-                              llvm::fmt_consume(std::move(error))));
+            data.error = llvm::joinErrors(CreateRuntimeError(std::move(llvm::formatv(
+                                              "\n    at {0}\nFailed to get source text for argument {1} of CallExpr",
+                                              arg_i->getBeginLoc().printToString(data.Ctx.getSourceManager()), i))),
+                                          std::move(error));
             return false;
           }
           if (param_info.hoisted_name.has_value()) {
@@ -758,11 +754,12 @@ public:
         if (auto error = data.non_ffi_rewrites[callee_decl].add(
                 {data.Ctx.getSourceManager(), CharSourceRange::getTokenRange(call_expr->getSourceRange()), expanded,
                  data.Ctx.getLangOpts()})) {
-          data.error = CreateRuntimeError(
-              llvm::formatv("\n    at {0}\nFailed to add rewrite for non-FFI function call: {1}\n    Did you "
-                            "recursively call this function? If so, c2pancake does not support that yet.",
-                            call_expr->getBeginLoc().printToString(data.Ctx.getSourceManager()),
-                            llvm::fmt_consume(std::move(error))));
+          data.error = llvm::joinErrors(
+              CreateRuntimeError(std::move(llvm::formatv(
+                  "\n    at {0}\nFailed to add rewrite for non-FFI function call: {1}\n    Did you recursively call "
+                  "this function? If so, c2pancake does not support that yet.",
+                  call_expr->getBeginLoc().printToString(data.Ctx.getSourceManager()), callee_decl->getName()))),
+              std::move(error));
           return false;
         }
       }
@@ -830,11 +827,11 @@ public:
           auto param_type = param_info->getType();
           auto type_size = data.Ctx.getTypeSize(param_type);
           if (type_size % 8 != 0) {
-            data.error = CreateRuntimeError(llvm::formatv(
+            data.error = CreateRuntimeError(std::move(llvm::formatv(
                 "\n    at {0}\nFFI function {1} has parameter {2} of type {3} with size {4} bits, which is not a "
                 "multiple of 8 bits",
                 param_info->getBeginLoc().printToString(data.Ctx.getSourceManager()), callee_decl->getName(),
-                param_info->getName(), param_type.getAsString(), type_size));
+                param_info->getName(), param_type.getAsString(), type_size)));
             return false;
           }
           param_offsets_sizes.insert({param_info, {input_buf_size, type_size / 8}});
@@ -846,11 +843,11 @@ public:
         if (!return_type->isVoidType()) {
           auto type_size = data.Ctx.getTypeSize(return_type);
           if (type_size % 8 != 0) {
-            data.error = CreateRuntimeError(llvm::formatv(
+            data.error = CreateRuntimeError(std::move(llvm::formatv(
                 "\n    at {0}\nFFI function {1} has return type {2} with size {3} bits, which is not a multiple of 8 "
                 "bits",
                 callee_decl->getBeginLoc().printToString(data.Ctx.getSourceManager()), callee_decl->getName(),
-                return_type.getAsString(), type_size));
+                return_type.getAsString(), type_size)));
             return false;
           }
           output_buf_size = (type_size / 8);
@@ -869,16 +866,16 @@ public:
         auto loc = sm.getFileLoc(callee_decl->getLocation());
         auto file_id = sm.getFileID(loc);
         if (file_id == sm.getMainFileID()) {
-          data.error = CreateRuntimeError(llvm::formatv(
+          data.error = CreateRuntimeError(std::move(llvm::formatv(
               "\n    at {0}\nFFI function {1} is defined in the current source file which doesn't make sense",
-              callee_decl->getBeginLoc().printToString(data.Ctx.getSourceManager()), callee_decl->getName()));
+              callee_decl->getBeginLoc().printToString(data.Ctx.getSourceManager()), callee_decl->getName())));
           return false;
         }
         auto file_entry = sm.getFileEntryRefForID(file_id);
         if (!file_entry.has_value()) {
-          data.error = CreateRuntimeError(llvm::formatv(
+          data.error = CreateRuntimeError(std::move(llvm::formatv(
               "\n    at {0}\nCouldn't get header file where FFI function {1} resides",
-              callee_decl->getBeginLoc().printToString(data.Ctx.getSourceManager()), callee_decl->getName()));
+              callee_decl->getBeginLoc().printToString(data.Ctx.getSourceManager()), callee_decl->getName())));
           return false;
         }
         auto &file_manager = sm.getFileManager();
@@ -904,7 +901,7 @@ public:
           auto [offset, size] = param_offsets_sizes.at(param_info);
 
           os << PrintType(param_type, param_info->getName()) << ";\n";
-          os << llvm::formatv("memcpy(&{0}, &input_buf[{1}], {2}UL);\n", param_info->getName(), offset, size);
+          os << llvm::formatv("memcpy(&{0}, &input_buf[{1}UL], {2}UL);\n", param_info->getName(), offset, size);
         }
 
         if (!return_type->isVoidType()) {
@@ -929,7 +926,7 @@ public:
 
         // copy return value to output buffer
         if (!return_type->isVoidType()) {
-          os << llvm::formatv("memcpy(&output_buf[0], &__c2pnk_ret_val, {0}UL);\n", output_buf_size);
+          os << llvm::formatv("memcpy(&output_buf[0UL], &__c2pnk_ret_val, {0}UL);\n", output_buf_size);
         }
         os << "return 0UL;\n";
         os << "}\n";
@@ -938,10 +935,11 @@ public:
         // add to the top of the main source file
         if (auto error = data.ffi_rewrites[callee_decl].add(
                 {data.Ctx.getSourceManager(), sm.getLocForStartOfFile(sm.getMainFileID()), 0, replacement_text})) {
-          data.error =
-              CreateRuntimeError(llvm::formatv("\n    at {0}\nFailed to add rewrite for FFI function wrapper: {1}",
-                                               callee_decl->getBeginLoc().printToString(data.Ctx.getSourceManager()),
-                                               llvm::fmt_consume(std::move(error))));
+          data.error = llvm::joinErrors(
+              CreateRuntimeError(std::move(llvm::formatv(
+                  "\n    at {0}\nFailed to add rewrite for FFI function wrapper: {1}",
+                  callee_decl->getBeginLoc().printToString(data.Ctx.getSourceManager()), callee_decl->getName()))),
+              std::move(error));
           return false;
         }
       }
@@ -954,12 +952,13 @@ public:
       // copy all the args to the input buffer
       for (const auto &[i, param_info] : callee_decl->parameters() | std::views::enumerate) {
         auto param_type = param_info->getType();
-        auto *arg_i = call_expr->getArg((unsigned)i)->IgnoreParenImpCasts();
+        auto *arg_i = call_expr->getArg(static_cast<unsigned>(i))->IgnoreParenImpCasts();
         auto arg_i_src = GetSourceText(arg_i, data.Ctx);
         if (auto error = arg_i_src.takeError()) {
-          data.error = CreateRuntimeError(llvm::formatv(
-              "\n    at {0}\nFailed to get source text for argument {1} of CallExpr: {2}",
-              arg_i->getBeginLoc().printToString(data.Ctx.getSourceManager()), i, llvm::fmt_consume(std::move(error))));
+          data.error = llvm::joinErrors(CreateRuntimeError(std::move(llvm::formatv(
+                                            "\n    at {0}\nFailed to get source text for argument {1} of CallExpr",
+                                            arg_i->getBeginLoc().printToString(data.Ctx.getSourceManager()), i))),
+                                        std::move(error));
           return false;
         }
         auto [offset, size] = data.ffi_function_info[callee_decl].param_info[param_info];
@@ -1002,10 +1001,12 @@ public:
       if (auto error = data.ffi_rewrites[callee_decl].add({data.Ctx.getSourceManager(),
                                                            CharSourceRange::getTokenRange(call_expr->getSourceRange()),
                                                            replacement_text, data.Ctx.getLangOpts()})) {
-        data.error = CreateRuntimeError(llvm::formatv(
-            "\n    at {0}\nFailed to add rewrite for FFI function call: {1}\n    Did you "
-            "recursively call this function? If so, c2pancake does not support that yet.",
-            call_expr->getBeginLoc().printToString(data.Ctx.getSourceManager()), llvm::fmt_consume(std::move(error))));
+        data.error = llvm::joinErrors(
+            CreateRuntimeError(std::move(llvm::formatv(
+                "\n    at {0}\nFailed to add rewrite for FFI function call: {1}\n    Did you "
+                "recursively call this function? If so, c2pancake does not support that yet.",
+                call_expr->getBeginLoc().printToString(data.Ctx.getSourceManager()), callee_decl->getName()))),
+            std::move(error));
         return false;
       }
     }
@@ -1028,8 +1029,8 @@ public:
     }
 
     if (data.current_function_decl == nullptr) {
-      data.error = CreateRuntimeError(llvm::formatv("\n    at {0}\nReturnStmt found outside of a FunctionDecl",
-                                                    return_stmt->getBeginLoc().printToString(sm)));
+      data.error = CreateRuntimeError(std::move(llvm::formatv(
+          "\n    at {0}\nReturnStmt found outside of a FunctionDecl", return_stmt->getBeginLoc().printToString(sm))));
       return false;
     }
 
@@ -1054,10 +1055,10 @@ public:
         if (return_stmt->getRetValue() != nullptr) {
           auto ret_value_src = GetSourceText(return_stmt->getRetValue(), data.Ctx);
           if (auto error = ret_value_src.takeError()) {
-            data.error =
-                CreateRuntimeError(llvm::formatv("\n    at {0}\nFailed to get source text for ReturnStmt: {1}",
-                                                 return_stmt->getBeginLoc().printToString(data.Ctx.getSourceManager()),
-                                                 llvm::fmt_consume(std::move(error))));
+            data.error = llvm::joinErrors(CreateRuntimeError(std::move(llvm::formatv(
+                                              "\n    at {0}\nFailed to get source text for ReturnStmt",
+                                              return_stmt->getBeginLoc().printToString(data.Ctx.getSourceManager())))),
+                                          std::move(error));
             return false;
           }
           os << *ret_value_src;
@@ -1099,7 +1100,7 @@ public:
 auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
   CollectFunctionInfo::WorkerData::FunctionMap function_map;
   {
-    CollectFunctionInfo::WorkerData data{.Ctx = Ctx, .pa_ctx = ps_ctx, .function_map = function_map};
+    CollectFunctionInfo::WorkerData data{.Ctx = Ctx, .ps_ctx = ps_ctx, .function_map = function_map};
     CollectFunctionInfo::Worker w(data);
     w.TraverseDecl(Ctx.getTranslationUnitDecl());
 

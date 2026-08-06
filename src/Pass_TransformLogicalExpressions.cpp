@@ -27,7 +27,6 @@
 #include <llvm/ADT/StringRef.h>
 #include <llvm/Support/Error.h>
 #include <llvm/Support/ErrorHandling.h>
-#include <llvm/Support/FormatAdapters.h>
 #include <llvm/Support/FormatVariadic.h>
 #include <llvm/Support/raw_ostream.h>
 
@@ -47,7 +46,7 @@ namespace pancake::pass_hoist_condition_expressions {
 namespace {
 struct WorkerData {
   ASTContext &Ctx;
-  PipelineStageCtx &pa_ctx;
+  PipelineStageCtx &ps_ctx;
   llvm::SmallVector<Replacement, 64> &replacements;
   llvm::Error error = llvm::Error::success();
   size_t tmp_var_counter = 0;
@@ -63,7 +62,7 @@ public:
   static auto shouldTraversePostOrder() -> bool { return false; }
 
   auto GetTempVarName(std::string hint) -> auto {
-    return llvm::formatv("__c2pnk_{0}_{1}_{2}_{3}", hint, data.pa_ctx.major_pass_number, data.pa_ctx.minor_pass_number,
+    return llvm::formatv("__c2pnk_{0}_{1}_{2}_{3}", hint, data.ps_ctx.major_pass_number, data.ps_ctx.minor_pass_number,
                          data.tmp_var_counter++);
   }
 
@@ -87,9 +86,10 @@ public:
     llvm::raw_string_ostream os(replacement_text);
     auto cond_source_text = GetSourceText(cond, data.Ctx);
     if (auto error = cond_source_text.takeError()) {
-      data.error = CreateRuntimeError(std::move(llvm::formatv(
-          "\n    at {0}\nFailed to get source text for IfStmt condition: {1}",
-          cond->getExprLoc().printToString(data.Ctx.getSourceManager()), llvm::fmt_consume(std::move(error)))));
+      data.error = llvm::joinErrors(
+          CreateRuntimeError(std::move(llvm::formatv("\n    at {0}\nFailed to get source text for IfStmt condition",
+                                                     cond->getExprLoc().printToString(data.Ctx.getSourceManager())))),
+          std::move(error));
       return false;
     }
     os << llvm::formatv("{0} {1} = {2};\n", GetWordTypeStr(data.Ctx), tmp_var_name, *cond_source_text);
@@ -132,9 +132,10 @@ public:
     llvm::raw_string_ostream os(replacement_text);
     auto cond_source_text = GetSourceText(cond, data.Ctx);
     if (auto error = cond_source_text.takeError()) {
-      data.error = CreateRuntimeError(std::move(llvm::formatv(
-          "\n    at {0}\nFailed to get source text for ReturnStmt expression: {1}",
-          cond->getExprLoc().printToString(data.Ctx.getSourceManager()), llvm::fmt_consume(std::move(error)))));
+      data.error = llvm::joinErrors(CreateRuntimeError(std::move(llvm::formatv(
+                                        "\n    at {0}\nFailed to get source text for ReturnStmt expression",
+                                        cond->getExprLoc().printToString(data.Ctx.getSourceManager())))),
+                                    std::move(error));
       return false;
     }
     os << llvm::formatv("{0} {1} = {2};\n", GetWordTypeStr(data.Ctx), tmp_var_name, *cond_source_text);
@@ -153,7 +154,7 @@ public:
 
 auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
   llvm::SmallVector<Replacement, 64> replacements;
-  WorkerData data{.Ctx = Ctx, .pa_ctx = ps_ctx, .replacements = replacements};
+  WorkerData data{.Ctx = Ctx, .ps_ctx = ps_ctx, .replacements = replacements};
   Worker w(data);
   w.TraverseDecl(Ctx.getTranslationUnitDecl());
 
@@ -165,8 +166,8 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
 
   int errors = 0;
   for (const auto &r : replacements) {
-    if (auto err = ps_ctx.replacements.add(r)) {
-      llvm::consumeError(std::move(err));
+    if (auto error = ps_ctx.replacements.add(r)) {
+      llvm::consumeError(std::move(error));
       errors++;
     }
   }
@@ -195,21 +196,23 @@ auto MakeRule() -> RewriteRule {
 
 auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
   llvm::SmallVector<AtomicChange, 64> changes;
-  llvm::Error err = llvm::Error::success();
+  llvm::Error error = llvm::Error::success();
   auto t = Transformer(MakeRule(), [&](llvm::Expected<llvm::MutableArrayRef<AtomicChange>> c) -> void {
-    if (c)
+    if (c) {
       changes.insert(changes.end(), c->begin(), c->end());
-    else
-      err = c.takeError();
+    } else if (error) {
+      error = llvm::joinErrors(std::move(error), c.takeError());
+    } else {
+      error = c.takeError();
+    }
   });
 
   MatchFinder finder;
   t.registerMatchers(&finder);
   finder.matchAST(Ctx);
 
-  if (err) {
-    ps_ctx.error =
-        CreateRuntimeError(llvm::formatv("Error during transformation: {0}", llvm::fmt_consume(std::move(err))));
+  if (error) {
+    ps_ctx.error = llvm::joinErrors(CreateRuntimeError("Error during transformation"), std::move(error));
     ps_ctx.whats_next = WhatsNext::MoveToNextFile;
     return;
   }
@@ -217,8 +220,8 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
   int errors = 0;
   for (const auto &change : changes) {
     for (const auto &r : change.getReplacements()) {
-      if (auto err = ps_ctx.replacements.add(r)) {
-        llvm::consumeError(std::move(err));
+      if (auto error = ps_ctx.replacements.add(r)) {
+        llvm::consumeError(std::move(error));
         errors++;
       }
     }
@@ -248,21 +251,23 @@ auto MakeRule() -> RewriteRule {
 
 auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
   llvm::SmallVector<AtomicChange, 64> changes;
-  llvm::Error err = llvm::Error::success();
+  llvm::Error error = llvm::Error::success();
   auto t = Transformer(MakeRule(), [&](llvm::Expected<llvm::MutableArrayRef<AtomicChange>> c) -> void {
-    if (c)
+    if (c) {
       changes.insert(changes.end(), c->begin(), c->end());
-    else
-      err = c.takeError();
+    } else if (error) {
+      error = llvm::joinErrors(std::move(error), c.takeError());
+    } else {
+      error = c.takeError();
+    }
   });
 
   MatchFinder finder;
   t.registerMatchers(&finder);
   finder.matchAST(Ctx);
 
-  if (err) {
-    ps_ctx.error =
-        CreateRuntimeError(llvm::formatv("Error during transformation: {0}", llvm::fmt_consume(std::move(err))));
+  if (error) {
+    ps_ctx.error = llvm::joinErrors(CreateRuntimeError("Error during transformation"), std::move(error));
     ps_ctx.whats_next = WhatsNext::MoveToNextFile;
     return;
   }
@@ -270,8 +275,8 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
   int errors = 0;
   for (const auto &change : changes) {
     for (const auto &r : change.getReplacements()) {
-      if (auto err = ps_ctx.replacements.add(r)) {
-        llvm::consumeError(std::move(err));
+      if (auto error = ps_ctx.replacements.add(r)) {
+        llvm::consumeError(std::move(error));
         errors++;
       }
     }
@@ -494,32 +499,32 @@ public:
     const QualType final_expr_type = expr->getType();
 
     if (auto *decl_ref_expr = dyn_cast<DeclRefExpr>(expr)) {
-      if (auto err = PrintSourceText(os, decl_ref_expr, data.Ctx)) {
-        return CreateRuntimeError(
-            std::move(llvm::formatv("\n    at {0}\nFailed to print source text for DeclRefExpr: {1}",
-                                    decl_ref_expr->getExprLoc().printToString(data.Ctx.getSourceManager()),
-                                    llvm::fmt_consume(std::move(err)))));
+      if (auto error = PrintSourceText(os, decl_ref_expr, data.Ctx)) {
+        return llvm::joinErrors(CreateRuntimeError(std::move(llvm::formatv(
+                                    "\n    at {0}\nFailed to print source text for DeclRefExpr",
+                                    decl_ref_expr->getExprLoc().printToString(data.Ctx.getSourceManager())))),
+                                std::move(error));
       }
     } else if (auto *integer_literal = dyn_cast<IntegerLiteral>(expr)) {
-      if (auto err = PrintSourceText(os, integer_literal, data.Ctx)) {
-        return CreateRuntimeError(
-            std::move(llvm::formatv("\n    at {0}\nFailed to print source text for IntegerLiteral: {1}",
-                                    integer_literal->getExprLoc().printToString(data.Ctx.getSourceManager()),
-                                    llvm::fmt_consume(std::move(err)))));
+      if (auto error = PrintSourceText(os, integer_literal, data.Ctx)) {
+        return llvm::joinErrors(CreateRuntimeError(std::move(llvm::formatv(
+                                    "\n    at {0}\nFailed to print source text for IntegerLiteral",
+                                    integer_literal->getExprLoc().printToString(data.Ctx.getSourceManager())))),
+                                std::move(error));
       }
     } else if (auto *floating_literal = dyn_cast<FloatingLiteral>(expr)) {
-      if (auto err = PrintSourceText(os, floating_literal, data.Ctx)) {
-        return CreateRuntimeError(
-            std::move(llvm::formatv("\n    at {0}\nFailed to print source text for FloatingLiteral: {1}",
-                                    floating_literal->getExprLoc().printToString(data.Ctx.getSourceManager()),
-                                    llvm::fmt_consume(std::move(err)))));
+      if (auto error = PrintSourceText(os, floating_literal, data.Ctx)) {
+        return llvm::joinErrors(CreateRuntimeError(std::move(llvm::formatv(
+                                    "\n    at {0}\nFailed to print source text for FloatingLiteral",
+                                    floating_literal->getExprLoc().printToString(data.Ctx.getSourceManager())))),
+                                std::move(error));
       }
     } else if (auto *character_literal = dyn_cast<CharacterLiteral>(expr)) {
-      if (auto err = PrintSourceText(os, character_literal, data.Ctx)) {
-        return CreateRuntimeError(
-            std::move(llvm::formatv("\n    at {0}\nFailed to print source text for CharacterLiteral: {1}",
-                                    character_literal->getExprLoc().printToString(data.Ctx.getSourceManager()),
-                                    llvm::fmt_consume(std::move(err)))));
+      if (auto error = PrintSourceText(os, character_literal, data.Ctx)) {
+        return llvm::joinErrors(CreateRuntimeError(std::move(llvm::formatv(
+                                    "\n    at {0}\nFailed to print source text for CharacterLiteral",
+                                    character_literal->getExprLoc().printToString(data.Ctx.getSourceManager())))),
+                                std::move(error));
       }
     } else if (auto *string_literal = dyn_cast<StringLiteral>(expr)) {
       if (ctx.string_literal_usage_kind.has_value()) {
@@ -545,7 +550,7 @@ public:
           // create new char array variable and return the pointer to the zero-th element of the array,
           //
           // e.g. "char __c2pnk_str_0[] = { 'char1', 'char2', ..., 'charN', '\0' };" and return "__c2pnk_str_0"
-          std::string tmp_var_name = GetTempVarName("StringLiteral");
+          std::string const tmp_var_name = GetTempVarName("StringLiteral");
           pre_stmts.emplace_back(
               llvm::formatv("{0} = {1};", PrintType(string_literal->getType(), tmp_var_name), expanded));
           os << tmp_var_name;
@@ -560,11 +565,11 @@ public:
         }
         data.ps_ctx.whats_next = WhatsNext::RepeatPass;
       } else {
-        if (auto err = PrintSourceText(os, string_literal, data.Ctx)) {
-          return CreateRuntimeError(
-              std::move(llvm::formatv("\n    at {0}\nFailed to print source text for StringLiteral: {1}",
-                                      string_literal->getExprLoc().printToString(data.Ctx.getSourceManager()),
-                                      llvm::fmt_consume(std::move(err)))));
+        if (auto error = PrintSourceText(os, string_literal, data.Ctx)) {
+          return llvm::joinErrors(CreateRuntimeError(std::move(llvm::formatv(
+                                      "\n    at {0}\nFailed to print source text for StringLiteral",
+                                      string_literal->getExprLoc().printToString(data.Ctx.getSourceManager())))),
+                                  std::move(error));
         }
       }
     } else if (auto *implicit_value_init_expr = dyn_cast<ImplicitValueInitExpr>(expr)) {
@@ -824,10 +829,10 @@ public:
       auto compound_literal_initializer =
           GetSourceText(compound_literal->getInitializer()->IgnoreParenImpCasts(), data.Ctx);
       if (auto error = compound_literal_initializer.takeError()) {
-        return CreateRuntimeError(
-            std::move(llvm::formatv("\n    at {0}\nFailed to get source text for CompoundLiteralExpr initializer: {1}",
-                                    compound_literal->getExprLoc().printToString(data.Ctx.getSourceManager()),
-                                    llvm::fmt_consume(std::move(error)))));
+        return llvm::joinErrors(CreateRuntimeError(std::move(llvm::formatv(
+                                    "\n    at {0}\nFailed to get source text for CompoundLiteralExpr initializer",
+                                    compound_literal->getExprLoc().printToString(data.Ctx.getSourceManager())))),
+                                std::move(error));
       }
       pre_stmts.push_back(llvm::formatv(
           /*
@@ -867,10 +872,11 @@ public:
       if (ctx.usage_kind == Usage::Effect) {
         os2 << "{\n";
         for (auto *stmt : compound_stmt->body()) {
-          if (auto err = PrintSourceText(os2, stmt, data.Ctx)) {
-            return CreateRuntimeError(std::move(llvm::formatv(
-                "\n    at {0}\nFailed to print source text for statement in StmtExpr: {1}",
-                stmt->getBeginLoc().printToString(data.Ctx.getSourceManager()), llvm::fmt_consume(std::move(err)))));
+          if (auto error = PrintSourceText(os2, stmt, data.Ctx)) {
+            return llvm::joinErrors(CreateRuntimeError(std::move(llvm::formatv(
+                                        "\n    at {0}\nFailed to print source text for statement in StmtExpr",
+                                        stmt->getBeginLoc().printToString(data.Ctx.getSourceManager())))),
+                                    std::move(error));
           }
           if (StmtNeedsSemi(stmt)) {
             os2 << ";";
@@ -908,10 +914,11 @@ public:
               os2 << llvm::formatv("\n(void){0};", last_expr_built_expr->final_expr);
             }
           } else {
-            if (auto err = PrintSourceText(os2, stmt, data.Ctx)) {
-              return CreateRuntimeError(std::move(llvm::formatv(
-                  "\n    at {0}\nFailed to print source text for statement in StmtExpr: {1}",
-                  stmt->getBeginLoc().printToString(data.Ctx.getSourceManager()), llvm::fmt_consume(std::move(err)))));
+            if (auto error = PrintSourceText(os2, stmt, data.Ctx)) {
+              return llvm::joinErrors(CreateRuntimeError(std::move(llvm::formatv(
+                                          "\n    at {0}\nFailed to print source text for statement in StmtExpr",
+                                          stmt->getBeginLoc().printToString(data.Ctx.getSourceManager())))),
+                                      std::move(error));
             }
             if (StmtNeedsSemi(stmt)) {
               os2 << ";";
@@ -1082,10 +1089,10 @@ if ({4}) {
         std::string tmp_var_name = GetTempVarName("LAnd");
         auto expr_source_text = GetSourceText(expr, data.Ctx);
         if (auto error = expr_source_text.takeError()) {
-          return CreateRuntimeError(
-              std::move(llvm::formatv("\n    at {0}\nFailed to get source text for logical && expression: {1}",
-                                      binary_operator->getExprLoc().printToString(data.Ctx.getSourceManager()),
-                                      llvm::fmt_consume(std::move(error)))));
+          return llvm::joinErrors(CreateRuntimeError(std::move(llvm::formatv(
+                                      "\n    at {0}\nFailed to get source text for logical && expression",
+                                      binary_operator->getExprLoc().printToString(data.Ctx.getSourceManager())))),
+                                  std::move(error));
         }
         std::string const if_cond = llvm::formatv(
             /*
@@ -1138,10 +1145,10 @@ if (!({4})) {
         std::string tmp_var_name = GetTempVarName("LOr");
         auto expr_source_text = GetSourceText(expr, data.Ctx);
         if (auto error = expr_source_text.takeError()) {
-          return CreateRuntimeError(
-              std::move(llvm::formatv("\n    at {0}\nFailed to get source text for logical || expression: {1}",
-                                      binary_operator->getExprLoc().printToString(data.Ctx.getSourceManager()),
-                                      llvm::fmt_consume(std::move(error)))));
+          return llvm::joinErrors(CreateRuntimeError(std::move(llvm::formatv(
+                                      "\n    at {0}\nFailed to get source text for logical || expression",
+                                      binary_operator->getExprLoc().printToString(data.Ctx.getSourceManager())))),
+                                  std::move(error));
         }
         const std::string if_cond = llvm::formatv(
             /*
@@ -1515,10 +1522,11 @@ if ({4}) {
       os << llvm::formatv("({0}).{1}", res->final_expr, member_expr->getMemberNameInfo().getAsString());
       pre_stmts.insert(pre_stmts.end(), res->pre_stmts.begin(), res->pre_stmts.end());
     } else {
-      if (auto err = PrintSourceText(os, expr, data.Ctx)) {
-        return CreateRuntimeError(std::move(llvm::formatv(
-            "\n    at {0}\nFailed to print source text for expression: {1}",
-            expr->getBeginLoc().printToString(data.Ctx.getSourceManager()), llvm::fmt_consume(std::move(err)))));
+      if (auto error = PrintSourceText(os, expr, data.Ctx)) {
+        return llvm::joinErrors(CreateRuntimeError(std::move(
+                                    llvm::formatv("\n    at {0}\nFailed to print source text for expression",
+                                                  expr->getBeginLoc().printToString(data.Ctx.getSourceManager())))),
+                                std::move(error));
       }
     }
 
@@ -1551,11 +1559,12 @@ if ({4}) {
           struct S a;
         */
         if (record_decl->isThisDeclarationADefinition()) {
-          if (auto err = PrintSourceText(os, record_decl, data.Ctx)) {
-            data.error = CreateRuntimeError(
-                std::move(llvm::formatv("\n    at {0}\nFailed to print source text for RecordDecl: {1}",
-                                        record_decl->getBeginLoc().printToString(data.Ctx.getSourceManager()),
-                                        llvm::fmt_consume(std::move(err)))));
+          if (auto error = PrintSourceText(os, record_decl, data.Ctx)) {
+            data.error = llvm::joinErrors(CreateRuntimeError(std::move(llvm::formatv(
+                                              "\n    at {0}\nFailed to print source text for RecordDecl: {1}",
+                                              record_decl->getBeginLoc().printToString(data.Ctx.getSourceManager()),
+                                              record_decl->getNameAsString()))),
+                                          std::move(error));
             return false;
           }
           os << ";";
@@ -1696,8 +1705,8 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
       continue;
     }
 
-    if (auto err = ps_ctx.replacements.add(r)) {
-      ps_ctx.error = CreateRuntimeError(llvm::formatv("Add replacement conflict: {0}", err));
+    if (auto error = ps_ctx.replacements.add(r)) {
+      ps_ctx.error = llvm::joinErrors(CreateRuntimeError("Error adding replacement"), std::move(error));
       ps_ctx.whats_next = WhatsNext::MoveToNextFile;
       return;
     }
@@ -1727,21 +1736,23 @@ auto MakeRule() -> RewriteRule {
 
 auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
   llvm::SmallVector<AtomicChange, 64> changes;
-  llvm::Error err = llvm::Error::success();
+  llvm::Error error = llvm::Error::success();
   auto t = Transformer(MakeRule(), [&](llvm::Expected<llvm::MutableArrayRef<AtomicChange>> c) -> void {
-    if (c)
+    if (c) {
       changes.insert(changes.end(), c->begin(), c->end());
-    else
-      err = c.takeError();
+    } else if (error) {
+      error = llvm::joinErrors(std::move(error), c.takeError());
+    } else {
+      error = c.takeError();
+    }
   });
 
   MatchFinder finder;
   t.registerMatchers(&finder);
   finder.matchAST(Ctx);
 
-  if (err) {
-    ps_ctx.error =
-        CreateRuntimeError(llvm::formatv("Error during transformation: {0}", llvm::fmt_consume(std::move(err))));
+  if (error) {
+    ps_ctx.error = llvm::joinErrors(CreateRuntimeError("Error during transformation"), std::move(error));
     ps_ctx.whats_next = WhatsNext::MoveToNextFile;
     return;
   }
@@ -1749,8 +1760,8 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
   int errors = 0;
   for (const auto &change : changes) {
     for (const auto &r : change.getReplacements()) {
-      if (auto err = ps_ctx.replacements.add(r)) {
-        llvm::consumeError(std::move(err));
+      if (auto error = ps_ctx.replacements.add(r)) {
+        llvm::consumeError(std::move(error));
         errors++;
       }
     }

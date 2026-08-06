@@ -17,7 +17,6 @@
 #include <llvm/ADT/SmallVector.h>
 #include <llvm/Support/Casting.h>
 #include <llvm/Support/Error.h>
-#include <llvm/Support/FormatAdapters.h>
 #include <llvm/Support/FormatVariadic.h>
 #include <llvm/Support/raw_ostream.h>
 
@@ -32,7 +31,7 @@ namespace pancake::pass_normalise_if_statements {
 namespace {
 struct WorkerData {
   ASTContext &Ctx;
-  PipelineStageCtx &pa_ctx;
+  PipelineStageCtx &ps_ctx;
   llvm::SmallVector<Replacement, 64> &replacements;
   llvm::Error error = llvm::Error::success();
   size_t if_cond_tmp_var_counter = 0;
@@ -48,8 +47,8 @@ public:
   static auto shouldTraversePostOrder() -> bool { return true; }
 
   auto GetIfCondTempVarName() -> auto {
-    return llvm::formatv("__c2pnk_if_cond_tmp_var_{0}_{1}_{2}", data.pa_ctx.major_pass_number,
-                         data.pa_ctx.minor_pass_number, data.if_cond_tmp_var_counter++);
+    return llvm::formatv("__c2pnk_if_cond_tmp_var_{0}_{1}_{2}", data.ps_ctx.major_pass_number,
+                         data.ps_ctx.minor_pass_number, data.if_cond_tmp_var_counter++);
   }
 
   auto IsPartOfElseIfChain(const IfStmt *if_stmt) -> bool {
@@ -106,9 +105,10 @@ public:
     llvm::raw_string_ostream os(replacement_text);
     auto original_cond_text = GetSourceText(cond, data.Ctx);
     if (auto error = original_cond_text.takeError()) {
-      return CreateRuntimeError(std::move(llvm::formatv(
-          "\n    at {0}\nFailed to get source text for IfStmt condition: {1}",
-          cond->getExprLoc().printToString(data.Ctx.getSourceManager()), llvm::fmt_consume(std::move(error)))));
+      return llvm::joinErrors(
+          CreateRuntimeError(std::move(llvm::formatv("\n    at {0}\nFailed to get source text for IfStmt condition",
+                                                     cond->getExprLoc().printToString(data.Ctx.getSourceManager())))),
+          std::move(error));
     }
     const std::string cond_name = needs_cond_hoist ? GetIfCondTempVarName() : *original_cond_text;
 
@@ -123,18 +123,19 @@ public:
 
     os << llvm::formatv("if ({0}) ", cond_name);
     if (const auto *then_compound_stmt = dyn_cast<CompoundStmt>(then_stmt)) {
-      if (auto err = PrintSourceText(os, then_compound_stmt, data.Ctx)) {
-        return CreateRuntimeError(
-            std::move(llvm::formatv("\n    at {0}\nFailed to print source text for CompoundStmt: {1}",
-                                    then_compound_stmt->getBeginLoc().printToString(data.Ctx.getSourceManager()),
-                                    llvm::fmt_consume(std::move(err)))));
+      if (auto error = PrintSourceText(os, then_compound_stmt, data.Ctx)) {
+        return llvm::joinErrors(CreateRuntimeError(std::move(llvm::formatv(
+                                    "\n    at {0}\nFailed to print source text for CompoundStmt",
+                                    then_compound_stmt->getBeginLoc().printToString(data.Ctx.getSourceManager())))),
+                                std::move(error));
       }
     } else {
       os << "{\n";
-      if (auto err = PrintSourceText(os, then_stmt, data.Ctx)) {
-        return CreateRuntimeError(std::move(llvm::formatv(
-            "\n    at {0}\nFailed to print source text for statement: {1}",
-            then_stmt->getBeginLoc().printToString(data.Ctx.getSourceManager()), llvm::fmt_consume(std::move(err)))));
+      if (auto error = PrintSourceText(os, then_stmt, data.Ctx)) {
+        return llvm::joinErrors(CreateRuntimeError(std::move(llvm::formatv(
+                                    "\n    at {0}\nFailed to print source text for statement",
+                                    then_stmt->getBeginLoc().printToString(data.Ctx.getSourceManager())))),
+                                std::move(error));
       }
       os << ";\n}";
     }
@@ -142,18 +143,19 @@ public:
     if (else_stmt != nullptr) {
       os << " else ";
       if (const auto *else_compound_stmt = dyn_cast<CompoundStmt>(else_stmt)) {
-        if (auto err = PrintSourceText(os, else_compound_stmt, data.Ctx)) {
-          return CreateRuntimeError(
-              std::move(llvm::formatv("\n    at {0}\nFailed to print source text for CompoundStmt: {1}",
-                                      else_compound_stmt->getBeginLoc().printToString(data.Ctx.getSourceManager()),
-                                      llvm::fmt_consume(std::move(err)))));
+        if (auto error = PrintSourceText(os, else_compound_stmt, data.Ctx)) {
+          return llvm::joinErrors(CreateRuntimeError(std::move(llvm::formatv(
+                                      "\n    at {0}\nFailed to print source text for CompoundStmt",
+                                      else_compound_stmt->getBeginLoc().printToString(data.Ctx.getSourceManager())))),
+                                  std::move(error));
         }
       } else {
         os << "{\n";
-        if (auto err = PrintSourceText(os, else_stmt, data.Ctx)) {
-          return CreateRuntimeError(std::move(llvm::formatv(
-              "\n    at {0}\nFailed to print source text for statement: {1}",
-              else_stmt->getBeginLoc().printToString(data.Ctx.getSourceManager()), llvm::fmt_consume(std::move(err)))));
+        if (auto error = PrintSourceText(os, else_stmt, data.Ctx)) {
+          return llvm::joinErrors(CreateRuntimeError(std::move(llvm::formatv(
+                                      "\n    at {0}\nFailed to print source text for statement",
+                                      else_stmt->getBeginLoc().printToString(data.Ctx.getSourceManager())))),
+                                  std::move(error));
         }
         os << "\n}";
       }
@@ -188,7 +190,7 @@ public:
 
 auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
   llvm::SmallVector<Replacement, 64> replacements;
-  WorkerData data{.Ctx = Ctx, .pa_ctx = ps_ctx, .replacements = replacements};
+  WorkerData data{.Ctx = Ctx, .ps_ctx = ps_ctx, .replacements = replacements};
   Worker w(data);
   w.TraverseDecl(Ctx.getTranslationUnitDecl());
 
@@ -200,8 +202,8 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
 
   int errors = 0;
   for (const auto &r : replacements) {
-    if (auto err = ps_ctx.replacements.add(r)) {
-      llvm::consumeError(std::move(err));
+    if (auto error = ps_ctx.replacements.add(r)) {
+      llvm::consumeError(std::move(error));
       errors++;
     }
   }

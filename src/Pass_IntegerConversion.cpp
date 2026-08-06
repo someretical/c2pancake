@@ -34,7 +34,6 @@
 #include <llvm/ADT/StringRef.h>
 #include <llvm/Support/Error.h>
 #include <llvm/Support/ErrorHandling.h>
-#include <llvm/Support/FormatAdapters.h>
 #include <llvm/Support/FormatVariadic.h>
 #include <llvm/Support/raw_ostream.h>
 
@@ -91,10 +90,13 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
   llvm::SmallVector<AtomicChange, 64> changes;
   llvm::Error error = llvm::Error::success();
   auto t = Transformer(MakeRule(), [&](llvm::Expected<llvm::MutableArrayRef<AtomicChange>> c) -> void {
-    if (c)
+    if (c) {
       changes.insert(changes.end(), c->begin(), c->end());
-    else
+    } else if (error) {
+      error = llvm::joinErrors(std::move(error), c.takeError());
+    } else {
       error = c.takeError();
+    }
   });
 
   MatchFinder finder;
@@ -102,8 +104,7 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
   finder.matchAST(Ctx);
 
   if (error) {
-    ps_ctx.error =
-        CreateRuntimeError(llvm::formatv("Error during transformation: {0}", llvm::fmt_consume(std::move(error))));
+    ps_ctx.error = llvm::joinErrors(CreateRuntimeError("Error during transformation"), std::move(error));
     ps_ctx.whats_next = WhatsNext::MoveToNextFile;
     return;
   }
@@ -653,7 +654,7 @@ static inline uint32_t __c2pnk_trunc_u32_to_i8(uint32_t x) {
 
 struct WorkerData {
   ASTContext &Ctx;
-  PipelineStageCtx &pa_ctx;
+  PipelineStageCtx &ps_ctx;
   llvm::SmallVector<Replacement, 64> &replacements;
   size_t tmp_var_counter = 0;
   llvm::Error error = llvm::Error::success();
@@ -670,7 +671,7 @@ public:
   static auto shouldTraversePostOrder() -> bool { return false; }
 
   auto GetTempVarName(std::string hint) -> auto {
-    return llvm::formatv("__c2pnk_{0}_{1}_{2}_{3}", hint, data.pa_ctx.major_pass_number, data.pa_ctx.minor_pass_number,
+    return llvm::formatv("__c2pnk_{0}_{1}_{2}_{3}", hint, data.ps_ctx.major_pass_number, data.ps_ctx.minor_pass_number,
                          data.tmp_var_counter++);
   }
 
@@ -753,10 +754,10 @@ public:
 
         auto decl_ref_expr_source_text = GetSourceText(decl_ref_expr, data.Ctx);
         if (auto error = decl_ref_expr_source_text.takeError()) {
-          return CreateRuntimeError(
-              std::move(llvm::formatv("\n    at {0}\nFailed to get source text for DeclRefExpr: {1}",
-                                      decl_ref_expr->getExprLoc().printToString(data.Ctx.getSourceManager()),
-                                      llvm::fmt_consume(std::move(error)))));
+          return llvm::joinErrors(CreateRuntimeError(std::move(llvm::formatv(
+                                      "\n    at {0}\nFailed to get source text for DeclRefExpr",
+                                      decl_ref_expr->getExprLoc().printToString(data.Ctx.getSourceManager())))),
+                                  std::move(error));
         }
         auto signed_to_unsigned = llvm::formatv("__c2pnk_{0}{1}_to_u{2}({3})", is_signed ? 'i' : 'u', bit_width,
                                                 GetPointerWidth(data.Ctx), *decl_ref_expr_source_text);
@@ -766,10 +767,10 @@ public:
       } else {
       decl_ref_expr_general_case:
         if (auto error = PrintSourceText(os, decl_ref_expr, data.Ctx)) {
-          return CreateRuntimeError(
-              std::move(llvm::formatv("\n    at {0}\nFailed to print source text for DeclRefExpr: {1}",
-                                      decl_ref_expr->getExprLoc().printToString(data.Ctx.getSourceManager()),
-                                      llvm::fmt_consume(std::move(error)))));
+          return llvm::joinErrors(CreateRuntimeError(std::move(llvm::formatv(
+                                      "\n    at {0}\nFailed to print source text for DeclRefExpr",
+                                      decl_ref_expr->getExprLoc().printToString(data.Ctx.getSourceManager())))),
+                                  std::move(error));
         }
       }
     } else if (auto *integer_literal = dyn_cast<IntegerLiteral>(expr)) {
@@ -784,25 +785,25 @@ public:
 
       if (bit_width == GetPointerWidth(data.Ctx) && !is_signed) {
         if (auto error = PrintSourceText(os, integer_literal, data.Ctx)) {
-          return CreateRuntimeError(
-              std::move(llvm::formatv("\n    at {0}\nFailed to print source text for IntegerLiteral: {1}",
-                                      integer_literal->getExprLoc().printToString(data.Ctx.getSourceManager()),
-                                      llvm::fmt_consume(std::move(error)))));
+          return llvm::joinErrors(CreateRuntimeError(std::move(llvm::formatv(
+                                      "\n    at {0}\nFailed to print source text for IntegerLiteral",
+                                      integer_literal->getExprLoc().printToString(data.Ctx.getSourceManager())))),
+                                  std::move(error));
         }
       } else if (!is_signed) {
         if (auto error = PrintSourceText(os, integer_literal, data.Ctx)) {
-          return CreateRuntimeError(
-              std::move(llvm::formatv("\n    at {0}\nFailed to print source text for IntegerLiteral: {1}",
-                                      integer_literal->getExprLoc().printToString(data.Ctx.getSourceManager()),
-                                      llvm::fmt_consume(std::move(error)))));
+          return llvm::joinErrors(CreateRuntimeError(std::move(llvm::formatv(
+                                      "\n    at {0}\nFailed to print source text for IntegerLiteral",
+                                      integer_literal->getExprLoc().printToString(data.Ctx.getSourceManager())))),
+                                  std::move(error));
         }
       } else {
         auto integer_literal_source_text = GetSourceText(integer_literal, data.Ctx);
         if (auto error = integer_literal_source_text.takeError()) {
-          return CreateRuntimeError(
-              std::move(llvm::formatv("\n    at {0}\nFailed to get source text for IntegerLiteral: {1}",
-                                      integer_literal->getExprLoc().printToString(data.Ctx.getSourceManager()),
-                                      llvm::fmt_consume(std::move(error)))));
+          return llvm::joinErrors(CreateRuntimeError(std::move(llvm::formatv(
+                                      "\n    at {0}\nFailed to get source text for IntegerLiteral",
+                                      integer_literal->getExprLoc().printToString(data.Ctx.getSourceManager())))),
+                                  std::move(error));
         }
         auto signed_to_unsigned = llvm::formatv("__c2pnk_{0}{1}_to_u{2}({3})", is_signed ? 'i' : 'u', bit_width,
                                                 GetPointerWidth(data.Ctx), *integer_literal_source_text);
@@ -826,18 +827,18 @@ public:
 
       if (!is_signed) {
         if (auto error = PrintSourceText(os, character_literal, data.Ctx)) {
-          return CreateRuntimeError(
-              std::move(llvm::formatv("\n    at {0}\nFailed to print source text for CharacterLiteral: {1}",
-                                      character_literal->getExprLoc().printToString(data.Ctx.getSourceManager()),
-                                      llvm::fmt_consume(std::move(error)))));
+          return llvm::joinErrors(CreateRuntimeError(std::move(llvm::formatv(
+                                      "\n    at {0}\nFailed to print source text for CharacterLiteral",
+                                      character_literal->getExprLoc().printToString(data.Ctx.getSourceManager())))),
+                                  std::move(error));
         }
       } else {
         auto character_literal_source_text = GetSourceText(character_literal, data.Ctx);
         if (auto error = character_literal_source_text.takeError()) {
-          return CreateRuntimeError(
-              std::move(llvm::formatv("\n    at {0}\nFailed to get source text for CharacterLiteral: {1}",
-                                      character_literal->getExprLoc().printToString(data.Ctx.getSourceManager()),
-                                      llvm::fmt_consume(std::move(error)))));
+          return llvm::joinErrors(CreateRuntimeError(std::move(llvm::formatv(
+                                      "\n    at {0}\nFailed to get source text for CharacterLiteral",
+                                      character_literal->getExprLoc().printToString(data.Ctx.getSourceManager())))),
+                                  std::move(error));
         }
         auto signed_to_unsigned = llvm::formatv("__c2pnk_{0}{1}_to_u{2}({3})", is_signed ? 'i' : 'u', bit_width,
                                                 GetPointerWidth(data.Ctx), *character_literal_source_text);
@@ -847,10 +848,10 @@ public:
       }
     } else if (auto *string_literal = dyn_cast<StringLiteral>(expr)) {
       if (auto error = PrintSourceText(os, string_literal, data.Ctx)) {
-        return CreateRuntimeError(
-            std::move(llvm::formatv("\n    at {0}\nFailed to print source text for StringLiteral: {1}",
-                                    string_literal->getExprLoc().printToString(data.Ctx.getSourceManager()),
-                                    llvm::fmt_consume(std::move(error)))));
+        return llvm::joinErrors(CreateRuntimeError(std::move(llvm::formatv(
+                                    "\n    at {0}\nFailed to print source text for StringLiteral",
+                                    string_literal->getExprLoc().printToString(data.Ctx.getSourceManager())))),
+                                std::move(error));
       }
     } else if (auto *c_style_cast_expr = dyn_cast<CStyleCastExpr>(expr)) {
       auto *sub_expr = c_style_cast_expr->getSubExpr();
@@ -1218,9 +1219,10 @@ public:
       pre_stmts.insert(pre_stmts.end(), res->pre_stmts.begin(), res->pre_stmts.end());
     } else {
       if (auto error = PrintSourceText(os, expr, data.Ctx)) {
-        return CreateRuntimeError(std::move(llvm::formatv(
-            "\n    at {0}\nFailed to print source text for expression: {1}",
-            expr->getExprLoc().printToString(data.Ctx.getSourceManager()), llvm::fmt_consume(std::move(error)))));
+        return llvm::joinErrors(
+            CreateRuntimeError(std::move(llvm::formatv("\n    at {0}\nFailed to print source text for expression",
+                                                       expr->getExprLoc().printToString(data.Ctx.getSourceManager())))),
+            std::move(error));
       }
     }
 
@@ -1351,7 +1353,7 @@ public:
 
 auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
   llvm::SmallVector<Replacement, 64> replacements;
-  WorkerData data{.Ctx = Ctx, .pa_ctx = ps_ctx, .replacements = replacements, .need_int_helpers = false};
+  WorkerData data{.Ctx = Ctx, .ps_ctx = ps_ctx, .replacements = replacements, .need_int_helpers = false};
   Worker w(data);
   w.TraverseDecl(Ctx.getTranslationUnitDecl());
 
@@ -1375,8 +1377,8 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
       continue;
     }
 
-    if (auto err = ps_ctx.replacements.add(r)) {
-      ps_ctx.error = CreateRuntimeError(llvm::formatv("Add replacement conflict: {0}", err));
+    if (auto error = ps_ctx.replacements.add(r)) {
+      ps_ctx.error = llvm::joinErrors(CreateRuntimeError("Add replacement conflict"), std::move(error));
       ps_ctx.whats_next = WhatsNext::MoveToNextFile;
       return;
     }

@@ -29,7 +29,6 @@
 #include <llvm/ADT/StringRef.h>
 #include <llvm/Support/Error.h>
 #include <llvm/Support/ErrorHandling.h>
-#include <llvm/Support/FormatAdapters.h>
 #include <llvm/Support/FormatVariadic.h>
 #include <llvm/Support/raw_ostream.h>
 
@@ -86,10 +85,11 @@ auto MakeRule() -> RewriteRule {
 
           SourceLocation const l_brace = rd->getBraceRange().getBegin();
           SourceLocation const r_brace = rd->getBraceRange().getEnd();
-          if (auto err = PrintSourceText(os, CharSourceRange::getTokenRange(l_brace, r_brace), *result.Context)) {
-            return CreateRuntimeError(std::move(llvm::formatv(
-                "\n    at {0}\nFailed to print source text for RecordDecl: {1}",
-                rd->getBeginLoc().printToString(*result.SourceManager), llvm::fmt_consume(std::move(err)))));
+          if (auto error = PrintSourceText(os, CharSourceRange::getTokenRange(l_brace, r_brace), *result.Context)) {
+            return llvm::joinErrors(CreateRuntimeError(std::move(
+                                        llvm::formatv("\n    at {0}\nFailed to print source text for RecordDecl braces",
+                                                      rd->getBeginLoc().printToString(*result.SourceManager)))),
+                                    std::move(error));
           }
           os.flush();
 
@@ -103,21 +103,23 @@ auto MakeRule() -> RewriteRule {
 
 auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
   llvm::SmallVector<AtomicChange, 64> changes;
-  llvm::Error err = llvm::Error::success();
+  llvm::Error error = llvm::Error::success();
   auto t = Transformer(MakeRule(), [&](llvm::Expected<llvm::MutableArrayRef<AtomicChange>> c) -> void {
-    if (c)
+    if (c) {
       changes.insert(changes.end(), c->begin(), c->end());
-    else
-      err = c.takeError();
+    } else if (error) {
+      error = llvm::joinErrors(std::move(error), c.takeError());
+    } else {
+      error = c.takeError();
+    }
   });
 
   MatchFinder finder;
   t.registerMatchers(&finder);
   finder.matchAST(Ctx);
 
-  if (err) {
-    ps_ctx.error =
-        CreateRuntimeError(llvm::formatv("Error during transformation: {0}", llvm::fmt_consume(std::move(err))));
+  if (error) {
+    ps_ctx.error = llvm::joinErrors(CreateRuntimeError("Error during transformation"), std::move(error));
     ps_ctx.whats_next = WhatsNext::MoveToNextFile;
     return;
   }
@@ -125,8 +127,8 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
   int errors = 0;
   for (const auto &change : changes) {
     for (const auto &r : change.getReplacements()) {
-      if (auto err = ps_ctx.replacements.add(r)) {
-        llvm::consumeError(std::move(err));
+      if (auto error = ps_ctx.replacements.add(r)) {
+        llvm::consumeError(std::move(error));
         errors++;
       }
     }
@@ -155,8 +157,8 @@ auto MakeRule() -> RewriteRule {
 
                     auto name = rd->getName();
                     if (name.empty()) {
-                      return CreateRuntimeError(llvm::formatv("RecordDecl has no name: {0}",
-                                                              rd->getBeginLoc().printToString(*result.SourceManager)));
+                      return CreateRuntimeError(std::move(llvm::formatv(
+                          "RecordDecl has no name: {0}", rd->getBeginLoc().printToString(*result.SourceManager))));
                     }
                     const char *prefix = "__c2pnk_promoted_record";
                     if (name.starts_with(prefix))
@@ -222,21 +224,23 @@ auto MakeRule() -> RewriteRule {
 
 auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
   llvm::SmallVector<AtomicChange, 64> changes;
-  llvm::Error err = llvm::Error::success();
+  llvm::Error error = llvm::Error::success();
   auto t = Transformer(MakeRule(), [&](llvm::Expected<llvm::MutableArrayRef<AtomicChange>> c) -> void {
-    if (c)
+    if (c) {
       changes.insert(changes.end(), c->begin(), c->end());
-    else
-      err = c.takeError();
+    } else if (error) {
+      error = llvm::joinErrors(std::move(error), c.takeError());
+    } else {
+      error = c.takeError();
+    }
   });
 
   MatchFinder finder;
   t.registerMatchers(&finder);
   finder.matchAST(Ctx);
 
-  if (err) {
-    ps_ctx.error =
-        CreateRuntimeError(llvm::formatv("Error during transformation: {0}", llvm::fmt_consume(std::move(err))));
+  if (error) {
+    ps_ctx.error = llvm::joinErrors(CreateRuntimeError("Error during transformation"), std::move(error));
     ps_ctx.whats_next = WhatsNext::MoveToNextFile;
     return;
   }
@@ -244,8 +248,8 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
   int errors = 0;
   for (const auto &change : changes) {
     for (const auto &r : change.getReplacements()) {
-      if (auto err = ps_ctx.replacements.add(r)) {
-        llvm::consumeError(std::move(err));
+      if (auto error = ps_ctx.replacements.add(r)) {
+        llvm::consumeError(std::move(error));
         errors++;
       }
     }
@@ -267,7 +271,7 @@ namespace pancake::pass_promote_records {
 namespace {
 struct WorkerData {
   ASTContext &Ctx;
-  PipelineStageCtx &pa_ctx;
+  PipelineStageCtx &ps_ctx;
   llvm::SmallVector<Replacement, 64> &replacements;
   llvm::Error error = llvm::Error::success();
   FunctionDecl *current_function_decl = nullptr;
@@ -301,11 +305,11 @@ public:
       llvm::raw_string_ostream os(replacement_text);
       os << "\n/* c2pancake: promoted record declarations for function " << func_decl->getName() << " BEGIN */\n";
       for (const auto *record_decl : it->second) {
-        if (auto err = PrintSourceText(os, record_decl, data.Ctx)) {
-          data.error = CreateRuntimeError(
-              std::move(llvm::formatv("\n    at {0}\nFailed to print source text for RecordDecl: {1}",
-                                      record_decl->getBeginLoc().printToString(data.Ctx.getSourceManager()),
-                                      llvm::fmt_consume(std::move(err)))));
+        if (auto error = PrintSourceText(os, record_decl, data.Ctx)) {
+          data.error = llvm::joinErrors(CreateRuntimeError(std::move(llvm::formatv(
+                                            "\n    at {0}\nFailed to print source text for RecordDecl",
+                                            record_decl->getBeginLoc().printToString(data.Ctx.getSourceManager())))),
+                                        std::move(error));
           return false;
         }
         os << ";\n";
@@ -347,8 +351,9 @@ public:
         if (record_decl->isThisDeclarationADefinition()) {
           auto name = record_decl->getName();
           if (!name.starts_with("__c2pnk_promoted_record")) {
-            data.error = CreateRuntimeError(llvm::formatv("\n    at {0}\nRecordDecl {1} is not a promoted record",
-                                                          record_decl->getBeginLoc().printToString(sm), name));
+            data.error =
+                CreateRuntimeError(std::move(llvm::formatv("\n    at {0}\nRecordDecl {1} is not a promoted record",
+                                                           record_decl->getBeginLoc().printToString(sm), name)));
             return false;
           }
 
@@ -370,8 +375,9 @@ public:
       if (record_decl->isThisDeclarationADefinition()) {
         auto name = record_decl->getName();
         if (!name.starts_with("__c2pnk_promoted_record")) {
-          data.error = CreateRuntimeError(llvm::formatv("\n    at {0}\nRecordDecl {1} is not a promoted record at {1}",
-                                                        record_decl->getBeginLoc().printToString(sm), name));
+          data.error =
+              CreateRuntimeError(std::move(llvm::formatv("\n    at {0}\nRecordDecl {1} is not a promoted record at {1}",
+                                                         record_decl->getBeginLoc().printToString(sm), name)));
           return false;
         }
 
@@ -399,7 +405,7 @@ public:
 auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
   llvm::SmallVector<Replacement, 64> replacements;
   WorkerData data{.Ctx = Ctx,
-                  .pa_ctx = ps_ctx,
+                  .ps_ctx = ps_ctx,
                   .replacements = replacements,
                   .current_function_decl = nullptr,
                   .current_record_decl = nullptr,
@@ -414,8 +420,8 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
   }
 
   for (const auto &r : replacements) {
-    if (auto err = ps_ctx.replacements.add(r)) {
-      ps_ctx.error = CreateRuntimeError(llvm::formatv("Add replacement conflict: {0}", err));
+    if (auto error = ps_ctx.replacements.add(r)) {
+      ps_ctx.error = llvm::joinErrors(CreateRuntimeError("Add replacement conflict"), std::move(error));
       ps_ctx.whats_next = WhatsNext::MoveToNextFile;
       return;
     }

@@ -20,8 +20,8 @@
 #include <llvm/ADT/StringRef.h>
 #include <llvm/Support/Error.h>
 #include <llvm/Support/ErrorHandling.h>
-#include <llvm/Support/FormatVariadic.h>
 #include <llvm/Support/raw_ostream.h>
+#include <utility>
 
 using namespace clang;
 using namespace clang::tooling;
@@ -32,7 +32,7 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
   const auto &sm = Ctx.getSourceManager();
   const auto *file_entry = sm.getFileEntryForID(sm.getMainFileID());
   if (file_entry == nullptr) {
-    ps_ctx.error = CreateRuntimeError(llvm::formatv("Main file entry is null"));
+    ps_ctx.error = CreateRuntimeError("Main file entry is null");
     ps_ctx.whats_next = WhatsNext::MoveToNextFile;
     return;
   }
@@ -52,8 +52,8 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
   }
 
   for (const auto &r : replacements) {
-    if (auto err = ps_ctx.replacements.add(r)) {
-      ps_ctx.error = CreateRuntimeError(llvm::formatv("Add replacement conflict: {0}", err));
+    if (auto error = ps_ctx.replacements.add(r)) {
+      ps_ctx.error = llvm::joinErrors(CreateRuntimeError("Add replacement conflict"), std::move(error));
       ps_ctx.whats_next = WhatsNext::MoveToNextFile;
       return;
     }

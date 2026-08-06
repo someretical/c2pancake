@@ -5,19 +5,44 @@
 #include <clang/AST/ASTContext.h>
 #include <clang/AST/Expr.h>
 #include <clang/AST/Stmt.h>
+#include <clang/ASTMatchers/ASTMatchFinder.h>
+#include <clang/ASTMatchers/ASTMatchers.h>
 #include <clang/Basic/AddressSpaces.h>
+#include <clang/Basic/LLVM.h>
 #include <clang/Basic/SourceManager.h>
 #include <clang/Frontend/CompilerInstance.h>
 #include <clang/Lex/Lexer.h>
 #include <clang/Rewrite/Core/Rewriter.h>
 #include <clang/Tooling/CompilationDatabase.h>
 #include <clang/Tooling/Core/Replacement.h>
+#include <clang/Tooling/Refactoring/AtomicChange.h>
+#include <clang/Tooling/Transformer/RangeSelector.h>
+#include <clang/Tooling/Transformer/RewriteRule.h>
+#include <clang/Tooling/Transformer/SourceCode.h>
+#include <clang/Tooling/Transformer/Stencil.h>
+#include <clang/Tooling/Transformer/Transformer.h>
 #include <llvm/Support/FormatVariadic.h>
 #include <llvm/Support/raw_ostream.h>
 
 #include <source_location>
 #include <string>
 #include <utility>
+
+namespace clang::ast_matchers {
+AST_MATCHER(Stmt, StmtNotInMacro) {
+  auto &sm = Finder->getASTContext().getSourceManager();
+  auto location = Node.getBeginLoc();
+
+  return !sm.isMacroBodyExpansion(location) && !sm.isMacroArgExpansion(location);
+}
+
+AST_MATCHER(Expr, ExprNotInMacro) {
+  auto &sm = Finder->getASTContext().getSourceManager();
+  auto location = Node.getExprLoc();
+
+  return !sm.isMacroBodyExpansion(location) && !sm.isMacroArgExpansion(location);
+}
+} // namespace clang::ast_matchers
 
 namespace pancake {
 enum class PointerWidth : uint8_t { None = 0, W32 = 32, W64 = 64 };
@@ -81,6 +106,16 @@ struct PipelineStageCtx {
 auto PrintLogBegin(llvm::raw_ostream &os, const PipelineStageCtx &ctx) -> void;
 
 auto PrintLogBeginShort(llvm::raw_ostream &os, llvm::StringRef in_file) -> void;
+
+inline auto CreateRuntimeError(const std::string &msg, const std::source_location loc = std::source_location::current())
+    -> llvm::Error {
+  std::string base;
+  llvm::raw_string_ostream os(base);
+  os << llvm::formatv("Runtime error:\n    at {0}:{1}:{2}: ", loc.file_name(), loc.line(), loc.column());
+  os << msg;
+  os.flush();
+  return llvm::createStringError(std::move(base), std::make_error_code(std::errc::invalid_argument));
+}
 
 inline auto CreateRuntimeError(const llvm::formatv_object_base &&msg,
                                const std::source_location loc = std::source_location::current()) -> llvm::Error {

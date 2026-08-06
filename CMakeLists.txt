@@ -73,6 +73,7 @@ target_compile_options(
           -fstrict-flex-arrays=3
           -fstack-clash-protection
           -fstack-protector-strong
+          -fsanitize=address,undefined
           -U_FORTIFY_SOURCE)
 
 target_compile_definitions(c2pancake PRIVATE _FORTIFY_SOURCE=3
@@ -81,6 +82,7 @@ target_compile_definitions(c2pancake PRIVATE _FORTIFY_SOURCE=3
 target_link_options(
   c2pancake
   PRIVATE
+  -fsanitize=address,undefined
   -Wl,-z,nodlopen
   -Wl,-z,noexecstack
   -Wl,-z,relro

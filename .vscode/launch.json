@@ -10,7 +10,7 @@
             "name": "Debug c2pancake with current file",
             "program": "${command:cmake.getLaunchTargetPath}",
             "args": [
-                "--end=RewriteFunctionCalling",
+                // "--end=RewriteFunctionCalling",
                 "${file}",
                 "--",
                 // "--target=aarch64-linux-gnu",
@@ -27,10 +27,13 @@
             "request": "launch",
             "name": "Debug c2pancake with uart.c",
             "program": "${command:cmake.getLaunchTargetPath}",
+            "env": {
+                "LSAN_OPTIONS": "verbosity=1:log_threads=1"
+            },
             "args": [
                 "/home/one/sddf/drivers/serial/imx/uart.c",
                 "--max-pass-retries=20",
-                "--end=RewriteFunctionCalling",
+                // "--end=RewriteFunctionCalling",
                 "--",
                 "-ffreestanding",
                 "--target=aarch64-linux-gnu",

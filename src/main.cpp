@@ -1,4 +1,5 @@
 #include "Pass_FunctionCalling.h"
+#include "Pass_HoistArraysAndAddresses.h"
 #include "Pass_InjectHeaders.h"
 #include "Pass_IntegerConversion.h"
 #include "Pass_LoopsToWhile.h"
@@ -8,16 +9,20 @@
 #include "Pass_SwitchToIf.h"
 #include "Pass_TransformLogicalExpressions.h"
 #include "Pipeline.h"
+#include "Utils.h"
 
 #include <clang/Basic/LLVM.h>
 #include <clang/Tooling/CommonOptionsParser.h>
 #include <llvm/ADT/StringRef.h>
+#include <llvm/Config/llvm-config.h>
 #include <llvm/Support/CommandLine.h>
 #include <llvm/Support/FormatAdapters.h>
 #include <llvm/Support/FormatVariadic.h>
 #include <llvm/Support/raw_ostream.h>
 
 #include <cstddef>
+#include <string>
+#include <utility>
 
 using namespace pancake;
 
@@ -79,7 +84,7 @@ auto main(int argc, const char **argv) -> int {
   To add a new stage to the pipeline, use the following code.
   Consumer::HandleTranslationUnit is the entry point and must be implemented.
 
-  The main thing HandleTranslationUnit should do is add Replacements to pa_ctx.replacements
+  The main thing HandleTranslationUnit should do is add Replacements to ps_ctx.replacements
   The Pipeline will take care of applying the replacements and writing the output file
 
   class Consumer : public C2PancakePass {
@@ -123,6 +128,8 @@ auto main(int argc, const char **argv) -> int {
   // deliberately repeated. Those final explicit casts are just to make the C compiler happy, they have no effect when
   // converting to pancake.
   pipeline.AddStage<pass_implicit_to_explicit_casts::Action>();
+  pipeline.AddStage<pass_rename_to_be_hoisted_globals::Action>();
+  pipeline.AddStage<pass_hoist_locals::Action>();
 
   // pipeline.AddPass<pass_hoist_arrays_and_addresses::Action>();
   return pipeline.Run();

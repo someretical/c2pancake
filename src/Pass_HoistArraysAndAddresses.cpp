@@ -1,434 +1,443 @@
 #include "Pass_HoistArraysAndAddresses.h"
 #include "Utils.h"
 
+#include <clang-tools-extra/clangd/FindTarget.h>
 #include <clang/AST/ASTConsumer.h>
 #include <clang/AST/ASTContext.h>
-#include <clang/AST/Decl.h>
 #include <clang/AST/Expr.h>
 #include <clang/AST/OperationKinds.h>
+#include <clang/AST/RecordLayout.h>
+#include <clang/AST/RecursiveASTVisitor.h>
 #include <clang/AST/Stmt.h>
-#include <clang/AST/TypeBase.h>
 #include <clang/Basic/LLVM.h>
 #include <clang/Basic/SourceLocation.h>
 #include <clang/Basic/Specifiers.h>
 #include <clang/Frontend/CompilerInstance.h>
+#include <clang/Index/USRGeneration.h>
+#include <clang/Lex/Lexer.h>
 #include <clang/Rewrite/Core/Rewriter.h>
 #include <clang/Tooling/Core/Replacement.h>
+#include <llvm/ADT/DenseMap.h>
+#include <llvm/ADT/ScopeExit.h>
+#include <llvm/ADT/SmallVector.h>
 #include <llvm/ADT/StringRef.h>
 #include <llvm/Support/Casting.h>
-#include <llvm/Support/FormatAdapters.h>
+#include <llvm/Support/Error.h>
+#include <llvm/Support/ErrorHandling.h>
 #include <llvm/Support/FormatVariadic.h>
 #include <llvm/Support/raw_ostream.h>
 
 #include <cstddef>
-#include <set>
 #include <string>
 #include <utility>
-#include <vector>
 
-using namespace pancake::pass_hoist_arrays_and_addresses;
+using namespace clang;
+using namespace clang::clangd;
+using namespace clang::tooling;
 
+namespace pancake::pass_rename_to_be_hoisted_globals {
 namespace {
-// generate a unique global name for a hoisted array variable
-auto ArrayPrefix(bool make_shared, size_t counter, llvm::StringRef func, llvm::StringRef var) -> std::string {
-  return llvm::formatv("__c2pnk_{0}_array_{1}_{2}_{3}", make_shared ? "shared" : "local", func, var, counter).str();
-}
+struct WorkerData {
+  ASTContext &Ctx;
+  PipelineStageCtx &ps_ctx;
+  llvm::DenseMap<VarDecl *, Replacements> &hoisted_vars;
+  size_t tmp_var_counter = 0;
+  FunctionDecl *current_function_decl = nullptr;
+  llvm::Error error = llvm::Error::success();
+};
 
-// generate a unique global name for a hoisted address-taken variable
-auto PtrPrefix(bool make_shared, size_t counter, llvm::StringRef func, llvm::StringRef var) -> std::string {
-  return llvm::formatv("__c2pnk_{0}_ptr_{1}_{2}_{3}", make_shared ? "shared" : "local", func, var, counter).str();
-}
+class Worker : public RecursiveASTVisitor<Worker> {
+  struct WorkerData &data;
 
-auto RecordPrefix(bool make_shared, size_t counter, llvm::StringRef func, llvm::StringRef var) -> std::string {
-  return llvm::formatv("__c2pnk_{0}_record_{1}_{2}_{3}", make_shared ? "shared" : "local", func, var, counter).str();
-}
+public:
+  explicit Worker(struct WorkerData &data) : data(data) {}
 
-// Nested array init helper
-//
-// Walks an InitListExpr recursively, tracking the subscript path (e.g.
-// "[0][2]") and emitting one flat assignment statement per scalar leaf.
-// This also works for structs
-//
-//   float mat[3][3] = {{1,0,0},{0,1,0},{0,0,1}};
-//   ->
-//   __hoist_arr_matrix_mat_0[0][0] = 1;
-//   __hoist_arr_matrix_mat_0[0][1] = 0;
-// NOLINTNEXTLINE(misc-no-recursion)
-void EmitNestedInits(const clang::Expr *expr, const clang::Type *type, llvm::StringRef baseName,
-                     llvm::StringRef accessPath, const clang::PrintingPolicy &pp, clang::ASTContext &Ctx,
-                     llvm::raw_ostream &out) {
-  const auto *stripped = expr->IgnoreParenCasts();
-  const auto *ile = dyn_cast<clang::InitListExpr>(stripped);
+  // process all inner switch statements first, then the outermost one
+  static auto shouldTraversePostOrder() -> bool { return false; }
 
-  if (ile == nullptr) {
-    // Scalar leaf — emit the assignment
-    std::string val;
-    llvm::raw_string_ostream os(val);
-    expr->printPretty(os, nullptr, pp);
-    out << llvm::formatv("{0}{1} = {2};\n", baseName, accessPath, val);
-    return;
+  auto GetTempVarName(const StringRef original_name, const StringRef func_name, const SourceLocation loc) -> auto {
+    return llvm::formatv("__c2pnk_local_{0}_{1}_L{2}C{3}_{4}_{5}_{6}", original_name.str(), func_name.str(),
+                         data.Ctx.getSourceManager().getSpellingLineNumber(loc),
+                         data.Ctx.getSourceManager().getSpellingColumnNumber(loc), data.ps_ctx.major_pass_number,
+                         data.ps_ctx.minor_pass_number, data.tmp_var_counter++);
   }
 
-  const auto *to_walk = ile->isSyntacticForm() ? ile : ile->getSyntacticForm();
-  if (to_walk == nullptr)
-    to_walk = ile;
+  auto GetTempVarName(const std::string &hint) const {
+    return llvm::formatv("__c2pnk_{0}_{1}_{2}_{3}", hint, data.ps_ctx.major_pass_number, data.ps_ctx.minor_pass_number,
+                         data.tmp_var_counter++);
+  }
 
-  if (to_walk->getNumInits() == 0)
-    return;
+  auto TraverseFunctionDecl(FunctionDecl *func_decl) -> bool {
+    auto *tmp_function_decl = data.current_function_decl;
+    data.current_function_decl = func_decl;
+    auto cleanup =
+        llvm::scope_exit([this, tmp_function_decl] -> void { data.current_function_decl = tmp_function_decl; });
 
-  if (type->isArrayType()) {
-    const auto *at = Ctx.getAsArrayType(clang::QualType(type, 0));
-    const clang::Type *elem_type = at->getElementType().getTypePtr();
+    return RecursiveASTVisitor<Worker>::TraverseFunctionDecl(func_decl);
+  }
 
-    for (unsigned i = 0; i < to_walk->getNumInits(); ++i) {
-      llvm::SmallString<64> path;
-      llvm::raw_svector_ostream(path) << accessPath << "[" << i << "]";
-      EmitNestedInits(to_walk->getInit(i), elem_type, baseName, path, pp, Ctx, out);
+  auto VisitVarDecl(VarDecl *var_decl) -> bool {
+    if (data.error) {
+      return false;
     }
-  } else if (type->isRecordType()) {
-    const auto *rd = type->getAs<clang::RecordType>()->getDecl();
-    // Collect fields in order to match against init list positions
-    llvm::SmallVector<const clang::FieldDecl *, 8> fields;
-    for (const clang::FieldDecl *fd : rd->fields())
-      fields.push_back(fd);
 
-    for (unsigned i = 0; i < to_walk->getNumInits() && i < fields.size(); ++i) {
-      // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
-      const clang::FieldDecl *fd = fields[i];
-      llvm::SmallString<64> path;
-      llvm::raw_svector_ostream(path) << accessPath << "." << fd->getName();
-      EmitNestedInits(to_walk->getInit(i), fd->getType().getTypePtr(), baseName, path, pp, Ctx, out);
+    if (data.current_function_decl == nullptr) {
+      return true;
     }
-  } else {
-    // Shouldn't happen except for bitfields...
-    std::string val;
-    llvm::raw_string_ostream os(val);
-    expr->printPretty(os, nullptr, pp);
-    out << llvm::formatv("{0}{1} = {2};\n", baseName, accessPath, val);
-  }
-}
 
-// Build a global declaration string for a VarDecl
-auto BuildGlobalDecl(const clang::VarDecl *VD, llvm::StringRef newName, clang::ASTContext &Ctx, bool preserveInit)
-    -> std::string {
-  const auto &pp(Ctx.getLangOpts());
-  const auto qt = VD->getType();
-  const auto sc = VD->getStorageClass();
-  llvm::SmallString<128> decl;
-  llvm::raw_svector_ostream os(decl);
-  os << ((sc == clang::SC_Extern) ? "extern " : "static ");
-  qt.print(os, pp, newName);
-  os << ";";
+    auto &sm = data.Ctx.getSourceManager();
+    if (!sm.isInMainFile(sm.getSpellingLoc(var_decl->getBeginLoc()))) {
+      return true;
+    }
 
-  if (preserveInit && VD->hasInit()) {
-    os << llvm::formatv("\n/* c2pancake: initialiser for static variable {0} was not a "
-                        "compile-time constant, so it was emitted as runtime code */\n",
-                        newName);
-    os << "/* c2pancake: move the following code into the entry point of the "
-          "program */\n";
-    EmitNestedInits(VD->getInit(), VD->getType().getTypePtr(), newName, "", pp, Ctx, os);
-    os << llvm::formatv("/* c2pancake: end of initialiser for static variable {0} */\n", newName);
+    // check if static
+    if (var_decl->getStorageClass() == SC_Static) {
+      data.error = CreateRuntimeError(
+          llvm::formatv("\n    at {0}\nStatic variable {1} found in function {2}. Static variables are not supported.",
+                        var_decl->getBeginLoc().printToString(data.Ctx.getSourceManager()), var_decl->getName(),
+                        data.current_function_decl->getName()));
+      return false;
+    }
+
+    auto var_name = var_decl->getName();
+    if (var_name.starts_with("__c2pnk_local_")) {
+      // don't rewrite pancake helper variables
+      return true;
+    }
+
+    if (data.hoisted_vars.contains(var_decl)) {
+      data.error = CreateRuntimeError(std::move(llvm::formatv(
+          "\n    at {0}\nVariable {1} found in function {2} has already been hoisted. This should not happen.",
+          var_decl->getBeginLoc().printToString(data.Ctx.getSourceManager()), var_name,
+          data.current_function_decl->getName())));
+      return false;
+    }
+
+    auto tmp_var_name = GetTempVarName(var_name, data.current_function_decl->getName(), var_decl->getBeginLoc()).str();
+    if (var_decl->getType()->isArrayType()) {
+      Replacements repls;
+      const auto *canonical_target = var_decl->getCanonicalDecl();
+      findExplicitReferences(
+          data.Ctx,
+          [&](const ReferenceLoc &ref) -> void {
+            for (const auto *target : ref.Targets) {
+              if (const auto *target_vd = dyn_cast<VarDecl>(target)) {
+                if (target_vd->getCanonicalDecl() == canonical_target) {
+                  if (auto error = repls.add({data.Ctx.getSourceManager(), CharSourceRange::getTokenRange(ref.NameLoc),
+                                              tmp_var_name, data.Ctx.getLangOpts()})) {
+                    data.error =
+                        llvm::joinErrors(CreateRuntimeError(std::move(llvm::formatv(
+                                             "\n    at {0}\nFailed to add rewrite for to-be-hoisted array variable {1}",
+                                             ref.NameLoc.printToString(data.Ctx.getSourceManager()), var_name))),
+                                         std::move(error));
+                    return;
+                  }
+                }
+              }
+            }
+          },
+          nullptr);
+
+      if (data.error) {
+        return false;
+      }
+
+      data.hoisted_vars.insert({var_decl, std::move(repls)});
+    } else if (var_decl->getType()->isRecordType()) {
+      Replacements repls;
+      const auto *canonical_target = var_decl->getType()->getAsRecordDecl()->getCanonicalDecl();
+      if (canonical_target == nullptr) {
+        data.error = CreateRuntimeError(
+            std::move(llvm::formatv("\n    at {0}\nVariable {1} found in function {2} has a record type with "
+                                    "no canonical decl. This should not happen.",
+                                    var_decl->getBeginLoc().printToString(data.Ctx.getSourceManager()), var_name,
+                                    data.current_function_decl->getName())));
+        return false;
+      }
+
+      findExplicitReferences(
+          data.Ctx,
+          [&](const ReferenceLoc &ref) -> void {
+            for (const auto *target : ref.Targets) {
+              if (const auto *target_rd = dyn_cast<RecordDecl>(target)) {
+                if (target_rd->getCanonicalDecl() == canonical_target) {
+                  if (auto error = repls.add({data.Ctx.getSourceManager(), CharSourceRange::getTokenRange(ref.NameLoc),
+                                              tmp_var_name, data.Ctx.getLangOpts()})) {
+                    data.error =
+                        llvm::joinErrors(CreateRuntimeError(std::move(llvm::formatv(
+                                             "\n    at {0}\nFailed to add rewrite for to-be-hoisted array variable {1}",
+                                             ref.NameLoc.printToString(data.Ctx.getSourceManager()), var_name))),
+                                         std::move(error));
+                    return;
+                  }
+                }
+              }
+            }
+          },
+          nullptr);
+
+      if (data.error) {
+        return false;
+      }
+
+      data.hoisted_vars.insert({var_decl, std::move(repls)});
+    }
+    return true;
   }
-  return std::string(decl);
-}
+
+  auto VisitUnaryOperator(UnaryOperator *unary_operator) -> bool {
+    if (data.error) {
+      return false;
+    }
+
+    if (data.current_function_decl == nullptr) {
+      return true;
+    }
+
+    auto &sm = data.Ctx.getSourceManager();
+    if (!sm.isInMainFile(sm.getSpellingLoc(unary_operator->getBeginLoc()))) {
+      return true;
+    }
+
+    if (unary_operator->getOpcode() == UO_AddrOf) {
+      auto *operand = unary_operator->getSubExpr()->IgnoreParenImpCasts();
+      if (auto *decl_ref_expr = llvm::dyn_cast<DeclRefExpr>(operand)) {
+        if (auto *var_decl = llvm::dyn_cast<VarDecl>(decl_ref_expr->getDecl())) {
+          auto var_name = var_decl->getName();
+          if (!data.hoisted_vars.contains(var_decl) && !var_name.starts_with("__c2pnk_local_")) {
+            Replacements repls;
+            const auto *canonical_target = var_decl->getCanonicalDecl();
+            auto tmp_var_name =
+                GetTempVarName(var_name, data.current_function_decl->getName(), unary_operator->getBeginLoc()).str();
+            findExplicitReferences(
+                data.Ctx,
+                [&](const ReferenceLoc &ref) -> void {
+                  for (const auto *target : ref.Targets) {
+                    if (const auto *target_vd = dyn_cast<VarDecl>(target)) {
+                      if (target_vd->getCanonicalDecl() == canonical_target) {
+                        if (auto error =
+                                repls.add({data.Ctx.getSourceManager(), CharSourceRange::getTokenRange(ref.NameLoc),
+                                           tmp_var_name, data.Ctx.getLangOpts()})) {
+                          data.error = llvm::joinErrors(
+                              CreateRuntimeError(std::move(llvm::formatv(
+                                  "\n    at {0}\nFailed to add rewrite for to-be-hoisted addrof variable {1}",
+                                  ref.NameLoc.printToString(data.Ctx.getSourceManager()), var_name))),
+                              std::move(error));
+                          return;
+                        }
+                      }
+                    }
+                  }
+                },
+                nullptr);
+
+            if (data.error) {
+              return false;
+            }
+
+            data.hoisted_vars.insert({var_decl, std::move(repls)});
+          }
+        }
+      }
+    }
+    return true;
+  }
+};
 } // namespace
 
-auto PassFind::VisitUnaryOperator(clang::UnaryOperator *UO) -> bool {
-  if (UO->getOpcode() == clang::UO_AddrOf) {
-    auto *sub = UO->getSubExpr()->IgnoreParenCasts();
-    if (auto *dr = dyn_cast<clang::DeclRefExpr>(sub))
-      if (auto *vd = dyn_cast<clang::VarDecl>(dr->getDecl()))
-        addressTaken.insert(vd);
-  }
-  return true;
-}
+auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
+  llvm::DenseMap<VarDecl *, Replacements> hoisted_vars;
+  WorkerData data{.Ctx = Ctx, .ps_ctx = ps_ctx, .hoisted_vars = hoisted_vars};
+  Worker w(data);
+  w.TraverseDecl(Ctx.getTranslationUnitDecl());
 
-auto PassFind::VisitMemberExpr(clang::MemberExpr *ME) -> bool {
-  auto *fd = dyn_cast<clang::FieldDecl>(ME->getMemberDecl());
-  if ((fd == nullptr) || !fd->getType()->isArrayType())
-    return true;
-
-  // Strip & and -> to get to the base VarDecl
-  const clang::Expr *base = ME->getBase()->IgnoreParenImpCasts();
-  // handle p->arr where p is a pointer-to-struct local and nested structs
-  while (true) {
-    if (const auto *inner = dyn_cast<clang::MemberExpr>(base)) {
-      base = inner->getBase()->IgnoreParenImpCasts();
-
-    } else if (const auto *uo = dyn_cast<clang::UnaryOperator>(base);
-               (uo != nullptr) && uo->getOpcode() == clang::UO_Deref) {
-      base = uo->getSubExpr()->IgnoreParenImpCasts();
-    } else {
-      break;
-    }
-  }
-
-  if (const auto *dr = dyn_cast<clang::DeclRefExpr>(base))
-    if (const auto *vd = dyn_cast<clang::VarDecl>(dr->getDecl()))
-      arrayFieldAccessed.insert(vd);
-
-  return true;
-}
-
-auto PassAnalyse::VisitFunctionDecl(clang::FunctionDecl *FD) -> bool {
-  if (!FD->hasBody() || !FD->isThisDeclarationADefinition())
-    return true;
-
-  PassFind atf;
-  atf.TraverseStmt(FD->getBody());
-  WalkStmt(FD->getBody(), FD, atf);
-  return true;
-}
-
-// NOLINTNEXTLINE(misc-no-recursion)
-void PassAnalyse::WalkStmt(clang::Stmt *S, clang::FunctionDecl *FD, PassFind &atf) {
-  if (S == nullptr)
-    return;
-
-  if (auto *ds = dyn_cast<clang::DeclStmt>(S)) {
-    for (clang::Decl *d : ds->decls()) {
-      auto *vd = dyn_cast<clang::VarDecl>(d);
-      if (vd == nullptr)
-        continue;
-
-      const auto sc = vd->getStorageClass();
-      const auto qt = vd->getType();
-      const auto is_array = qt->isArrayType();
-      const auto addr_taken_var = atf.addressTaken.contains(vd);
-      const auto array_field_accessed_var = atf.arrayFieldAccessed.contains(vd);
-      const auto *rt = qt->getAs<clang::RecordType>();
-      const auto is_record = (rt != nullptr);
-
-      if (sc == clang::SC_Extern) {
-        info.hoistMap.insert({vd, VarHoistEntry{vd->getName().str(), DeclTreatment::ExternRedecl, FD}});
-        continue;
-      }
-
-      if (sc == clang::SC_Static && (is_array || addr_taken_var)) {
-        // static func vars are always shared across all threads
-        const auto new_name = is_array ? ArrayPrefix(true, info.hoist_arr_counter++, FD->getName(), vd->getName())
-                                       : PtrPrefix(true, info.hoist_ptr_counter++, FD->getName(), vd->getName());
-        info.hoistMap.insert({vd, VarHoistEntry{new_name, DeclTreatment::StaticGlobal, FD}});
-        continue;
-      }
-
-      if (vd->hasLocalStorage() && (is_array || addr_taken_var)) {
-        const auto new_name = is_array ? ArrayPrefix(false, info.hoist_arr_counter++, FD->getName(), vd->getName())
-                                       : PtrPrefix(false, info.hoist_ptr_counter++, FD->getName(), vd->getName());
-        info.hoistMap.insert({vd, VarHoistEntry{new_name, DeclTreatment::NewGlobal, FD}});
-      }
-
-      if (vd->hasLocalStorage() && is_record) {
-        if (addr_taken_var || array_field_accessed_var) {
-          const auto new_name = RecordPrefix(false, info.hoist_record_counter++, FD->getName(), vd->getName());
-          info.hoistMap.insert({vd, VarHoistEntry{new_name, DeclTreatment::NewGlobal, FD}});
-          continue;
-        }
-      }
-
-      if (sc == clang::SC_Static && is_record) {
-        if (addr_taken_var || array_field_accessed_var) {
-          const auto new_name = RecordPrefix(true, info.hoist_record_counter++, FD->getName(), vd->getName());
-          info.hoistMap.insert({vd, VarHoistEntry{new_name, DeclTreatment::StaticGlobal, FD}});
-          continue;
-        }
-      }
-    }
-  }
-
-  for (auto *child : S->children())
-    WalkStmt(child, FD, atf);
-}
-
-auto PassRename::VisitDeclStmt(clang::DeclStmt *DS) -> bool {
-  struct Partition {
-    clang::VarDecl *VD{};
-    VarHoistEntry *entry{};
-  };
-  std::vector<Partition> parts;
-  bool any_hoisted = false;
-
-  for (clang::Decl *d : DS->decls()) {
-    auto *vd = dyn_cast<clang::VarDecl>(d);
-    if (vd == nullptr)
-      continue;
-    auto it = info.hoistMap.find(vd);
-    if (it != info.hoistMap.end()) {
-      parts.emplace_back(vd, &it->second);
-      any_hoisted = true;
-    } else {
-      parts.emplace_back(vd, nullptr);
-    }
-  }
-
-  if (!any_hoisted)
-    return true;
-
-  const clang::PrintingPolicy pp(Ctx.getLangOpts());
-  llvm::SmallString<256> replacement;
-  llvm::raw_svector_ostream out(replacement);
-
-  for (auto &p : parts) {
-    auto *vd = p.VD;
-
-    if (p.entry == nullptr) {
-      // wasn't hoisted
-      std::string decl_str;
-      llvm::raw_string_ostream os(decl_str);
-      vd->print(os, pp);
-      out << llvm::formatv("{0};\n", decl_str);
-      continue;
-    }
-
-    const VarHoistEntry &entry = *p.entry;
-
-    switch (entry.treatment) {
-
-    case DeclTreatment::ExternRedecl:
-      // Remove the local re-declaration; the external symbol already exists.
-      out << llvm::formatv("\n\n/* c2pancake: extern decl {0} was moved to global scope */\n", vd->getName());
-      break;
-
-    case DeclTreatment::StaticGlobal: {
-      // The global decl (with constant init if applicable) was already
-      // emitted before the function.  Here we only need to emit a runtime
-      // re-initialisation assignment if the initialiser is not a constant.
-      bool emitted = false;
-      if (vd->hasInit()) {
-        clang::Expr::EvalResult result;
-        const bool is_const = vd->getInit()->EvaluateAsRValue(result, Ctx);
-        if (!is_const) {
-          std::string init_str;
-          llvm::raw_string_ostream os(init_str);
-          vd->getInit()->printPretty(os, nullptr, pp);
-          out << llvm::formatv("{0} = {1};\n", entry.newName, init_str);
-          emitted = true;
-        }
-      }
-      if (!emitted)
-        out << llvm::formatv("/* c2pancake: static decl {0} was moved to global scope */\n\n", vd->getName());
-      break;
-    }
-
-    case DeclTreatment::NewGlobal: {
-      if (vd->hasInit()) {
-        auto *init = vd->getInit();
-        EmitNestedInits(init, vd->getType().getTypePtr(), entry.newName, "", pp, Ctx, out);
-      }
-      // If no init, then the global is already zero-initialised so we don't
-      // need to do anything
-      break;
-    }
-    } // switch
-  }
-
-  llvm::StringRef const replacement_ref =
-      replacement.empty() ? llvm::StringRef("/* hoisted */\n") : llvm::StringRef(replacement);
-
-  AddReplacement(DS->getSourceRange(), replacement_ref);
-  return true;
-}
-auto PassRename::VisitDeclRefExpr(clang::DeclRefExpr *DR) -> bool {
-  if (auto *vd = dyn_cast<clang::VarDecl>(DR->getDecl())) {
-    auto it = info.hoistMap.find(vd);
-    if (it != info.hoistMap.end())
-      AddReplacement(DR->getSourceRange(), it->second.newName);
-  }
-  return true;
-}
-void PassRename::AddReplacement(clang::SourceRange range, llvm::StringRef text) {
-  // Expand to account for macro expansions so we replace the spelling loc.
-  auto char_range = clang::CharSourceRange::getTokenRange(range);
-  clang::tooling::Replacement const repl(SM, char_range, text);
-  if (auto error = Repls.add(repl)) {
-    llvm::errs() << llvm::formatv("Replacement conflict: {0}\n", llvm::fmt_consume(std::move(error)));
-    has_replacement_error = true;
-  }
-}
-
-void Consumer::HandleTranslationUnit(clang::ASTContext &Ctx) {
-  const auto &sm = Ctx.getSourceManager();
-  auto *tu = Ctx.getTranslationUnitDecl();
-
-  // collect all variables that are arrays/address-taken
-  HoistInfo info;
-  PassAnalyse cv(info, Ctx);
-  cv.TraverseDecl(tu);
-
-  if (info.hoistMap.empty()) {
+  if (data.error) {
+    ps_ctx.error = std::move(data.error);
+    ps_ctx.whats_next = WhatsNext::MoveToNextFile;
     return;
   }
 
-  // find first func location to insert global vars before it
-  clang::SourceLocation first_func_loc;
-  for (clang::Decl *d : tu->decls()) {
-    if (auto *fd = dyn_cast<clang::FunctionDecl>(d)) {
-      if (!fd->hasBody())
-        continue;
-      clang::SourceLocation const loc = fd->getSourceRange().getBegin();
-      if (!sm.isInMainFile(loc))
-        continue;
-      if (first_func_loc.isInvalid() || sm.isBeforeInTranslationUnit(loc, first_func_loc))
-        first_func_loc = loc;
+  if (hoisted_vars.empty()) {
+    ps_ctx.whats_next = WhatsNext::MoveToNextPass;
+    return;
+  }
+
+  Replacements replacements;
+  for (const auto &[var_decl, repls] : hoisted_vars) {
+    for (const auto &r : repls) {
+      if (auto error = replacements.add(r)) {
+        ps_ctx.error = llvm::joinErrors(
+            CreateRuntimeError(std::move(llvm::formatv(
+                "\n    at {0}\nFailed to add rewrite for to-be-hoisted variable {1}",
+                var_decl->getBeginLoc().printToString(data.Ctx.getSourceManager()), var_decl->getName()))),
+            std::move(error));
+        ps_ctx.whats_next = WhatsNext::MoveToNextFile;
+        return;
+      }
     }
   }
 
-  bool insertion_failed = false;
-
-  // insert global declarations before the first function definition
-  if (first_func_loc.isValid()) {
-    llvm::SmallString<512> global_block;
-    llvm::raw_svector_ostream gb(global_block);
-    gb << "\n/* c2pancake: hoisted variables (arrays "
-          "and address-taken locals) begin */\n";
-
-    for (auto &[VD, entry] : info.hoistMap) {
-      switch (entry.treatment) {
-      case DeclTreatment::NewGlobal:
-        // omit init as it will be re-applied at each time the function is
-        // called
-        gb << BuildGlobalDecl(VD, entry.newName, Ctx, false) << "\n";
-        break;
-
-      case DeclTreatment::StaticGlobal: {
-        // keep init only if it is a compile-time constant
-        bool keep_init = false;
-        if (VD->hasInit()) {
-          clang::Expr::EvalResult result;
-          keep_init = VD->getInit()->EvaluateAsRValue(result, Ctx);
-        }
-        gb << BuildGlobalDecl(VD, entry.newName, Ctx, keep_init) << "\n";
-        break;
-      }
-
-      case DeclTreatment::ExternRedecl: {
-        // extern can be emitted multipile times without issue
-        gb << BuildGlobalDecl(VD, entry.newName, Ctx, false) << "\n";
-        break;
-      }
-      }
-    }
-
-    gb << "/* c2pancake: hoisted variables (arrays and "
-          "address-taken locals) end */\n";
-
-    // An insertion is modelled as a zero-length replacement at the offset.
-    unsigned const insert_offset = sm.getFileOffset(first_func_loc);
-    const clang::tooling::Replacement ins(sm.getFilename(first_func_loc), insert_offset, 0, global_block.str());
-    if (auto err = ps_ctx.replacements.add(ins)) {
-      PrintLogBegin(llvm::errs(), ps_ctx);
-      llvm::errs() << llvm::formatv("Replacement conflict\n");
-
-      insertion_failed = true;
-    }
-  }
-
-  // collect DeclStmt and DeclRefExpr replacements
-  PassRename crv(ps_ctx.replacements, Ctx, info);
-  crv.TraverseDecl(tu);
-
-  if (insertion_failed || crv.has_replacement_error) {
-    PrintLogBegin(llvm::errs(), ps_ctx);
-    llvm::errs() << llvm::formatv("Aborting due to replacement conflicts, no output written\n");
-  }
+  ps_ctx.replacements = std::move(replacements);
+  ps_ctx.whats_next = WhatsNext::MoveToNextPass;
 }
+} // namespace pancake::pass_rename_to_be_hoisted_globals
+
+namespace pancake::pass_hoist_locals {
+namespace {
+struct WorkerData {
+  ASTContext &Ctx;
+  PipelineStageCtx &ps_ctx;
+  llvm::DenseMap<FunctionDecl *, Replacements> &replacements;
+  llvm::DenseMap<FunctionDecl *, llvm::SmallVector<VarDecl *, 16>> function_prologues;
+  llvm::Error error = llvm::Error::success();
+  FunctionDecl *current_function_decl = nullptr;
+};
+
+class Worker : public RecursiveASTVisitor<Worker> {
+  struct WorkerData &data;
+
+public:
+  explicit Worker(struct WorkerData &data) : data(data) {}
+
+  static auto shouldTraversePostOrder() -> bool { return false; }
+
+  auto PrintType(llvm::raw_ostream &os, const QualType ty, const llvm::StringRef var_name) const {
+    ty.print(os, data.Ctx.getPrintingPolicy(), var_name);
+  }
+
+  auto TraverseFunctionDecl(FunctionDecl *func_decl) -> bool {
+    auto *tmp = data.current_function_decl;
+    data.current_function_decl = func_decl;
+    auto cleanup = llvm::scope_exit([&] -> void { data.current_function_decl = tmp; });
+
+    auto res = RecursiveASTVisitor::TraverseFunctionDecl(func_decl);
+
+    if (data.error) {
+      return false;
+    }
+
+    auto it = data.function_prologues.find(func_decl);
+    if (it != data.function_prologues.end()) {
+      std::string replacement_text;
+      llvm::raw_string_ostream os(replacement_text);
+      os << "\n/* c2pancake: promoted variable declarations for function " << func_decl->getName() << " BEGIN */\n";
+      for (const auto *var_decl : it->second) {
+        PrintType(os, var_decl->getType(), var_decl->getName());
+        os << ";\n";
+      }
+      os << "/* c2pancake: promoted variable declarations for function " << func_decl->getName() << " END */\n";
+      os.flush();
+      // insert before start of function...
+      if (auto error = data.replacements[func_decl].add(
+              {data.Ctx.getSourceManager(), func_decl->getBeginLoc(), 0, replacement_text})) {
+        data.error = llvm::joinErrors(
+            CreateRuntimeError(std::move(llvm::formatv(
+                "\n    at {0}\nFailed to add rewrite for promoted variable declarations for function {1}",
+                func_decl->getBeginLoc().printToString(data.Ctx.getSourceManager()), func_decl->getName()))),
+            std::move(error));
+        return false;
+      }
+    }
+
+    return res;
+  }
+
+  auto HandleVarDecl(VarDecl *var_decl) -> llvm::Error {
+    auto name = var_decl->getName();
+    if (name.starts_with("__c2pnk_local_")) {
+      data.function_prologues[data.current_function_decl].push_back(var_decl);
+      std::string replacement_text;
+      llvm::raw_string_ostream os(replacement_text);
+      if (var_decl->hasInit()) {
+        auto init_source_text = GetSourceText(var_decl->getInit(), data.Ctx);
+        if (auto error = init_source_text.takeError()) {
+          return llvm::joinErrors(CreateRuntimeError(std::move(llvm::formatv(
+                                      "\n    at {0}\nFailed to get source text for initializer of variable {1}",
+                                      var_decl->getBeginLoc().printToString(data.Ctx.getSourceManager()), name))),
+                                  std::move(error));
+        }
+        os << llvm::formatv("{0} = {1}", var_decl->getName(), *init_source_text);
+        os.flush();
+      }
+
+      if (auto error = data.replacements[data.current_function_decl].add(
+              {data.Ctx.getSourceManager(), CharSourceRange::getTokenRange(var_decl->getSourceRange()),
+               replacement_text, data.Ctx.getLangOpts()})) {
+        return llvm::joinErrors(CreateRuntimeError(std::move(llvm::formatv(
+                                    "\n    at {0}\nFailed to add rewrite for promoted variable declaration "
+                                    "for variable {1} in function {2}",
+                                    var_decl->getBeginLoc().printToString(data.Ctx.getSourceManager()), name,
+                                    data.current_function_decl->getName()))),
+                                std::move(error));
+      }
+    }
+
+    return llvm::Error::success();
+  }
+
+  auto VisitDeclStmt(DeclStmt *decl_stmt) -> bool {
+    if (data.error) {
+      return false;
+    }
+
+    auto &sm = data.Ctx.getSourceManager();
+    if (decl_stmt == nullptr || !sm.isInMainFile(sm.getSpellingLoc(decl_stmt->getBeginLoc())) ||
+        data.current_function_decl == nullptr) {
+      return true;
+    }
+
+    if (decl_stmt->isSingleDecl()) {
+      if (auto *var_decl = dyn_cast<VarDecl>(decl_stmt->getSingleDecl())) {
+        if (auto error = HandleVarDecl(var_decl)) {
+          data.error = std::move(error);
+          return false;
+        }
+      }
+    } else {
+      data.error = CreateRuntimeError(std::move(llvm::formatv(
+          "\n    at {0}\nDeclStmt with multiple declarations found in function {1}. This should not happen.",
+          decl_stmt->getBeginLoc().printToString(data.Ctx.getSourceManager()), data.current_function_decl->getName())));
+      return false;
+    }
+
+    return true;
+  }
+};
+} // namespace
+
+auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
+  llvm::DenseMap<FunctionDecl *, Replacements> hoisted_vars;
+  llvm::DenseMap<FunctionDecl *, llvm::SmallVector<VarDecl *, 16>> const function_prologues;
+  WorkerData data{.Ctx = Ctx,
+                  .ps_ctx = ps_ctx,
+                  .replacements = hoisted_vars,
+                  .function_prologues = function_prologues,
+                  .current_function_decl = nullptr};
+  Worker w(data);
+  w.TraverseDecl(Ctx.getTranslationUnitDecl());
+
+  if (data.error) {
+    ps_ctx.error = std::move(data.error);
+    ps_ctx.whats_next = WhatsNext::MoveToNextFile;
+    return;
+  }
+
+  Replacements replacements;
+  for (const auto &[func_decl, repls] : hoisted_vars) {
+    for (const auto &r : repls) {
+      if (auto error = replacements.add(r)) {
+        ps_ctx.error = llvm::joinErrors(
+            CreateRuntimeError(std::move(llvm::formatv(
+                "\n    at {0}\nFailed to add rewrite for hoisted variable in function {1}",
+                func_decl->getBeginLoc().printToString(data.Ctx.getSourceManager()), func_decl->getName()))),
+            std::move(error));
+        ps_ctx.whats_next = WhatsNext::MoveToNextFile;
+        return;
+      }
+    }
+  }
+
+  ps_ctx.replacements = std::move(replacements);
+  ps_ctx.whats_next = WhatsNext::MoveToNextPass;
+}
+} // namespace pancake::pass_hoist_locals

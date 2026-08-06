@@ -15,7 +15,6 @@
 #include <llvm/Support/Casting.h>
 #include <llvm/Support/Error.h>
 #include <llvm/Support/ErrorHandling.h>
-#include <llvm/Support/FormatAdapters.h>
 #include <llvm/Support/FormatVariadic.h>
 #include <llvm/Support/raw_ostream.h>
 
@@ -41,7 +40,7 @@ auto MakeRule() -> RewriteRule {
   Moves while loop conditions into the body of the loop
   */
   return applyFirst(
-      {makeRule(whileStmt(isExpansionInMainFile(), hasCondition(expr().bind(cond_bind)),
+      {makeRule(whileStmt(isExpansionInMainFile(), StmtNotInMacro(), hasCondition(expr().bind(cond_bind)),
                           unless(hasCondition(ignoringParenImpCasts(integerLiteral(equals(1))))),
                           hasBody(compoundStmt(
                                       // Bind the body as a compoundStmt so statements() can extract its interior.
@@ -50,36 +49,36 @@ auto MakeRule() -> RewriteRule {
                     .bind(while_bind),
                 changeTo(node(while_bind),
                          cat("while (1UL) {\nif (!(", node(cond_bind), ")) { break; }", statements(body_bind), "\n}"))),
-       makeRule(whileStmt(isExpansionInMainFile(), hasCondition(expr().bind(cond_bind)),
+       makeRule(whileStmt(isExpansionInMainFile(), StmtNotInMacro(), hasCondition(expr().bind(cond_bind)),
                           unless(hasCondition(ignoringParenImpCasts(integerLiteral(equals(1))))),
                           hasBody(
                               // Exclude compoundStmt so Case A takes priority in applyFirst.
                               stmt(unless(compoundStmt())).bind(body_bind)))
                     .bind(while_bind),
                 changeTo(node(while_bind),
-                         cat("while (1UL) {\nif (!(", node(cond_bind), ")) { break; }", node(body_bind), ";\n}")))}
-
-  );
+                         cat("while (1UL) {\nif (!(", node(cond_bind), ")) { break; }", node(body_bind), ";\n}")))});
 }
 } // namespace
 
 auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
   llvm::SmallVector<AtomicChange, 64> changes;
-  llvm::Error err = llvm::Error::success();
+  llvm::Error error = llvm::Error::success();
   auto t = Transformer(MakeRule(), [&](llvm::Expected<llvm::MutableArrayRef<AtomicChange>> c) -> void {
-    if (c)
+    if (c) {
       changes.insert(changes.end(), c->begin(), c->end());
-    else
-      err = c.takeError();
+    } else if (error) {
+      error = llvm::joinErrors(std::move(error), c.takeError());
+    } else {
+      error = c.takeError();
+    }
   });
 
   MatchFinder finder;
   t.registerMatchers(&finder);
   finder.matchAST(Ctx);
 
-  if (err) {
-    ps_ctx.error =
-        CreateRuntimeError(llvm::formatv("Error during transformation: {0}", llvm::fmt_consume(std::move(err))));
+  if (error) {
+    ps_ctx.error = llvm::joinErrors(CreateRuntimeError("Error during transformation"), std::move(error));
     ps_ctx.whats_next = WhatsNext::MoveToNextFile;
     return;
   }
@@ -87,8 +86,8 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
   int errors = 0;
   for (const auto &change : changes) {
     for (const auto &r : change.getReplacements()) {
-      if (auto err = ps_ctx.replacements.add(r)) {
-        llvm::consumeError(std::move(err));
+      if (auto error = ps_ctx.replacements.add(r)) {
+        llvm::consumeError(std::move(error));
         errors++;
       }
     }
@@ -158,29 +157,31 @@ auto MakeRule() -> RewriteRule {
 
 auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
   llvm::SmallVector<AtomicChange, 64> changes;
-  llvm::Error err = llvm::Error::success();
+  llvm::Error error = llvm::Error::success();
   auto t = Transformer(MakeRule(), [&](llvm::Expected<llvm::MutableArrayRef<AtomicChange>> c) -> void {
-    if (c)
+    if (c) {
       changes.insert(changes.end(), c->begin(), c->end());
-    else
-      err = c.takeError();
+    } else if (error) {
+      error = llvm::joinErrors(std::move(error), c.takeError());
+    } else {
+      error = c.takeError();
+    }
   });
 
   MatchFinder finder;
   t.registerMatchers(&finder);
   finder.matchAST(Ctx);
 
-  if (err) {
-    ps_ctx.error =
-        CreateRuntimeError(llvm::formatv("Error during transformation: {0}", llvm::fmt_consume(std::move(err))));
+  if (error) {
+    ps_ctx.error = llvm::joinErrors(CreateRuntimeError("Error during transformation"), std::move(error));
     ps_ctx.whats_next = WhatsNext::MoveToNextFile;
     return;
   }
 
   for (const auto &change : changes) {
     for (const auto &r : change.getReplacements()) {
-      if (auto err = ps_ctx.replacements.add(r)) {
-        ps_ctx.error = CreateRuntimeError(llvm::formatv("Add replacement conflict: {0}", err));
+      if (auto error = ps_ctx.replacements.add(r)) {
+        ps_ctx.error = llvm::joinErrors(CreateRuntimeError("Add replacement conflict"), std::move(error));
         ps_ctx.whats_next = WhatsNext::MoveToNextFile;
         return;
       }
@@ -229,7 +230,8 @@ auto MakeRule() -> RewriteRule {
   The compound statement case prevents an extra set of {}s.
   */
   return applyFirst(
-      {makeRule(forStmt(isExpansionInMainFile(), anyOf(hasLoopInit(stmt().bind(init_bind)), anything()),
+      {makeRule(forStmt(isExpansionInMainFile(), StmtNotInMacro(),
+                        anyOf(hasLoopInit(stmt().bind(init_bind)), anything()),
                         anyOf(hasCondition(expr().bind(cond_bind)), anything()),
                         anyOf(hasIncrement(stmt().bind(inc_bind)), anything()),
                         hasBody(compoundStmt(
@@ -239,15 +241,16 @@ auto MakeRule() -> RewriteRule {
                     .bind(for_bind),
                 changeTo(node(for_bind), cat("{\n", OptInit(), "while (1UL) {", BreakCond(), statements(body_bind),
                                              OptInc(), "\n}", "\n}"))),
-       makeRule(forStmt(isExpansionInMainFile(), anyOf(hasLoopInit(stmt().bind(init_bind)), anything()),
-                        anyOf(hasCondition(expr().bind(cond_bind)), anything()),
-                        anyOf(hasIncrement(stmt().bind(inc_bind)), anything()),
-                        hasBody(
-                            // Exclude compoundStmt so Case A takes priority in applyFirst.
-                            stmt(unless(compoundStmt())).bind(body_bind)))
-                    .bind(for_bind),
-                changeTo(node(for_bind), cat("{\n", OptInit(), "while (1UL) {", BreakCond(), node(body_bind), ";",
-                                             OptInc(), "\n}", "\n}")))}
+       makeRule(
+           forStmt(isExpansionInMainFile(), StmtNotInMacro(), anyOf(hasLoopInit(stmt().bind(init_bind)), anything()),
+                   anyOf(hasCondition(expr().bind(cond_bind)), anything()),
+                   anyOf(hasIncrement(stmt().bind(inc_bind)), anything()),
+                   hasBody(
+                       // Exclude compoundStmt so Case A takes priority in applyFirst.
+                       stmt(unless(compoundStmt())).bind(body_bind)))
+               .bind(for_bind),
+           changeTo(node(for_bind),
+                    cat("{\n", OptInit(), "while (1UL) {", BreakCond(), node(body_bind), ";", OptInc(), "\n}", "\n}")))}
 
   );
 }
@@ -255,21 +258,23 @@ auto MakeRule() -> RewriteRule {
 
 auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
   llvm::SmallVector<AtomicChange, 64> changes;
-  llvm::Error err = llvm::Error::success();
+  llvm::Error error = llvm::Error::success();
   auto t = Transformer(MakeRule(), [&](llvm::Expected<llvm::MutableArrayRef<AtomicChange>> c) -> void {
-    if (c)
+    if (c) {
       changes.insert(changes.end(), c->begin(), c->end());
-    else
-      err = c.takeError();
+    } else if (error) {
+      error = llvm::joinErrors(std::move(error), c.takeError());
+    } else {
+      error = c.takeError();
+    }
   });
 
   MatchFinder finder;
   t.registerMatchers(&finder);
   finder.matchAST(Ctx);
 
-  if (err) {
-    ps_ctx.error =
-        CreateRuntimeError(llvm::formatv("Error during transformation: {0}", llvm::fmt_consume(std::move(err))));
+  if (error) {
+    ps_ctx.error = llvm::joinErrors(CreateRuntimeError("Error during transformation"), std::move(error));
     ps_ctx.whats_next = WhatsNext::MoveToNextFile;
     return;
   }
@@ -277,8 +282,8 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
   int errors = 0;
   for (const auto &change : changes) {
     for (const auto &r : change.getReplacements()) {
-      if (auto err = ps_ctx.replacements.add(r)) {
-        llvm::consumeError(std::move(err));
+      if (auto error = ps_ctx.replacements.add(r)) {
+        llvm::consumeError(std::move(error));
         errors++;
       }
     }
@@ -367,29 +372,31 @@ auto MakeRule() -> RewriteRule {
 
 auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
   llvm::SmallVector<AtomicChange, 64> changes;
-  llvm::Error err = llvm::Error::success();
+  llvm::Error error = llvm::Error::success();
   auto t = Transformer(MakeRule(), [&](llvm::Expected<llvm::MutableArrayRef<AtomicChange>> c) -> void {
-    if (c)
+    if (c) {
       changes.insert(changes.end(), c->begin(), c->end());
-    else
-      err = c.takeError();
+    } else if (error) {
+      error = llvm::joinErrors(std::move(error), c.takeError());
+    } else {
+      error = c.takeError();
+    }
   });
 
   MatchFinder finder;
   t.registerMatchers(&finder);
   finder.matchAST(Ctx);
 
-  if (err) {
-    ps_ctx.error =
-        CreateRuntimeError(llvm::formatv("Error during transformation: {0}", llvm::fmt_consume(std::move(err))));
+  if (error) {
+    ps_ctx.error = llvm::joinErrors(CreateRuntimeError("Error during transformation"), std::move(error));
     ps_ctx.whats_next = WhatsNext::MoveToNextFile;
     return;
   }
 
   for (const auto &change : changes) {
     for (const auto &r : change.getReplacements()) {
-      if (auto err = ps_ctx.replacements.add(r)) {
-        ps_ctx.error = CreateRuntimeError(llvm::formatv("Add replacement conflict: {0}", err));
+      if (auto error = ps_ctx.replacements.add(r)) {
+        ps_ctx.error = llvm::joinErrors(CreateRuntimeError("Add replacement conflict"), std::move(error));
         ps_ctx.whats_next = WhatsNext::MoveToNextFile;
         return;
       }
@@ -421,7 +428,7 @@ auto MakeRule() -> RewriteRule {
   }
   */
   return applyFirst(
-      {makeRule(doStmt(isExpansionInMainFile(), anyOf(hasCondition(expr().bind(cond_bind)), anything()),
+      {makeRule(doStmt(isExpansionInMainFile(), StmtNotInMacro(), hasCondition(expr().bind(cond_bind)),
                        hasBody(compoundStmt(
                                    // Bind the body as a compoundStmt so statements() can extract its interior.
                                    anything())
@@ -429,12 +436,12 @@ auto MakeRule() -> RewriteRule {
                     .bind(do_bind),
                 changeTo(node(do_bind), cat("while (1UL) {\n", statements(body_bind), "\nif (!(", node(cond_bind),
                                             ")) { break; }", "\n}"))),
-       makeRule(doStmt(isExpansionInMainFile(), anyOf(hasCondition(expr().bind(cond_bind)), anything()),
+       makeRule(doStmt(isExpansionInMainFile(), StmtNotInMacro(), hasCondition(expr().bind(cond_bind)),
                        hasBody(
                            // Exclude compoundStmt so Case A takes priority in applyFirst.
                            stmt(unless(compoundStmt())).bind(body_bind)))
                     .bind(do_bind),
-                changeTo(node(do_bind), cat("while (1UL) {\n", node(body_bind), ";\nif (!(", node(cond_bind),
+                changeTo(node(do_bind), cat("while (1UL) {\n", statement(body_bind), ";\nif (!(", node(cond_bind),
                                             ")) { break; }", "\n}")))}
 
   );
@@ -443,21 +450,23 @@ auto MakeRule() -> RewriteRule {
 
 auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
   llvm::SmallVector<AtomicChange, 64> changes;
-  llvm::Error err = llvm::Error::success();
+  llvm::Error error = llvm::Error::success();
   auto t = Transformer(MakeRule(), [&](llvm::Expected<llvm::MutableArrayRef<AtomicChange>> c) -> void {
-    if (c)
+    if (c) {
       changes.insert(changes.end(), c->begin(), c->end());
-    else
-      err = c.takeError();
+    } else if (error) {
+      error = llvm::joinErrors(std::move(error), c.takeError());
+    } else {
+      error = c.takeError();
+    }
   });
 
   MatchFinder finder;
   t.registerMatchers(&finder);
   finder.matchAST(Ctx);
 
-  if (err) {
-    ps_ctx.error =
-        CreateRuntimeError(llvm::formatv("Error during transformation: {0}", llvm::fmt_consume(std::move(err))));
+  if (error) {
+    ps_ctx.error = llvm::joinErrors(CreateRuntimeError("Error during transformation"), std::move(error));
     ps_ctx.whats_next = WhatsNext::MoveToNextFile;
     return;
   }
@@ -465,8 +474,8 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
   int errors = 0;
   for (const auto &change : changes) {
     for (const auto &r : change.getReplacements()) {
-      if (auto err = ps_ctx.replacements.add(r)) {
-        llvm::consumeError(std::move(err));
+      if (auto error = ps_ctx.replacements.add(r)) {
+        llvm::consumeError(std::move(error));
         errors++;
       }
     }
