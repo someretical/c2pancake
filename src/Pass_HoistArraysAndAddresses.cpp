@@ -85,6 +85,11 @@ public:
       return true;
     }
 
+    if (data.current_function_decl->getName().starts_with("__c2pnk_")) {
+      // don't rewrite pancake helper functions
+      return true;
+    }
+
     auto &sm = data.Ctx.getSourceManager();
     if (!sm.isInMainFile(sm.getSpellingLoc(var_decl->getBeginLoc()))) {
       return true;
@@ -114,60 +119,36 @@ public:
     }
 
     auto tmp_var_name = GetTempVarName(var_name, data.current_function_decl->getName(), var_decl->getBeginLoc()).str();
-    if (var_decl->getType()->isArrayType()) {
+    if (var_decl->getType()->isArrayType() || var_decl->getType()->isRecordType()) {
       Replacements repls;
-      const auto *canonical_target = var_decl->getCanonicalDecl();
+
+      // rename declaration
+      // if (auto error =
+      //         repls.add({data.Ctx.getSourceManager(), CharSourceRange::getTokenRange(var_decl->getSourceRange()),
+      //                    tmp_var_name, data.Ctx.getLangOpts()})) {
+      //   data.error = llvm::joinErrors(
+      //       CreateRuntimeError(
+      //           std::move(llvm::formatv("\n    at {0}\nFailed to add rewrite for to-be-hoisted variable {1}",
+      //                                   var_decl->getBeginLoc().printToString(data.Ctx.getSourceManager()),
+      //                                   var_name))),
+      //       std::move(error));
+      //   return false;
+      // }
+
       findExplicitReferences(
           data.Ctx,
           [&](const ReferenceLoc &ref) -> void {
             for (const auto *target : ref.Targets) {
               if (const auto *target_vd = dyn_cast<VarDecl>(target)) {
-                if (target_vd->getCanonicalDecl() == canonical_target) {
+                if (target_vd == var_decl) {
                   if (auto error = repls.add({data.Ctx.getSourceManager(), CharSourceRange::getTokenRange(ref.NameLoc),
                                               tmp_var_name, data.Ctx.getLangOpts()})) {
-                    data.error =
+                    data.error = llvm::joinErrors(
+                        std::move(data.error),
                         llvm::joinErrors(CreateRuntimeError(std::move(llvm::formatv(
-                                             "\n    at {0}\nFailed to add rewrite for to-be-hoisted array variable {1}",
+                                             "\n    at {0}\nFailed to add rewrite for to-be-hoisted variable {1}",
                                              ref.NameLoc.printToString(data.Ctx.getSourceManager()), var_name))),
-                                         std::move(error));
-                    return;
-                  }
-                }
-              }
-            }
-          },
-          nullptr);
-
-      if (data.error) {
-        return false;
-      }
-
-      data.hoisted_vars.insert({var_decl, std::move(repls)});
-    } else if (var_decl->getType()->isRecordType()) {
-      Replacements repls;
-      const auto *canonical_target = var_decl->getType()->getAsRecordDecl()->getCanonicalDecl();
-      if (canonical_target == nullptr) {
-        data.error = CreateRuntimeError(
-            std::move(llvm::formatv("\n    at {0}\nVariable {1} found in function {2} has a record type with "
-                                    "no canonical decl. This should not happen.",
-                                    var_decl->getBeginLoc().printToString(data.Ctx.getSourceManager()), var_name,
-                                    data.current_function_decl->getName())));
-        return false;
-      }
-
-      findExplicitReferences(
-          data.Ctx,
-          [&](const ReferenceLoc &ref) -> void {
-            for (const auto *target : ref.Targets) {
-              if (const auto *target_rd = dyn_cast<RecordDecl>(target)) {
-                if (target_rd->getCanonicalDecl() == canonical_target) {
-                  if (auto error = repls.add({data.Ctx.getSourceManager(), CharSourceRange::getTokenRange(ref.NameLoc),
-                                              tmp_var_name, data.Ctx.getLangOpts()})) {
-                    data.error =
-                        llvm::joinErrors(CreateRuntimeError(std::move(llvm::formatv(
-                                             "\n    at {0}\nFailed to add rewrite for to-be-hoisted array variable {1}",
-                                             ref.NameLoc.printToString(data.Ctx.getSourceManager()), var_name))),
-                                         std::move(error));
+                                         std::move(error)));
                     return;
                   }
                 }
@@ -182,6 +163,7 @@ public:
 
       data.hoisted_vars.insert({var_decl, std::move(repls)});
     }
+
     return true;
   }
 

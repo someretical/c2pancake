@@ -1242,21 +1242,25 @@ public:
     return res;
   }
 
-  auto TraverseDeclStmt(DeclStmt *declStmt) -> bool {
+  auto TraverseDeclStmt(DeclStmt *decl_stmt) -> bool {
     if (data.error) {
       return false;
     }
 
     auto &sm = data.Ctx.getSourceManager();
-    if (declStmt == nullptr || !sm.isInMainFile(sm.getSpellingLoc(declStmt->getBeginLoc())) ||
+    if (decl_stmt == nullptr || !sm.isInMainFile(sm.getSpellingLoc(decl_stmt->getBeginLoc())) ||
         data.current_function_decl == nullptr) {
       return true;
+    }
+
+    if (data.current_function_decl->getName().starts_with("__c2pnk_")) {
+      return RecursiveASTVisitor::TraverseDeclStmt(decl_stmt);
     }
 
     std::string replacement_text;
     llvm::raw_string_ostream os(replacement_text);
 
-    for (auto *decl : declStmt->decls()) {
+    for (auto *decl : decl_stmt->decls()) {
       if (auto *var_decl = dyn_cast<VarDecl>(decl)) {
         auto *init_expr = var_decl->getInit();
         if (init_expr != nullptr) {
@@ -1292,12 +1296,12 @@ public:
     os.flush();
     if (!replacement_text.empty()) {
       data.replacements.emplace_back(data.Ctx.getSourceManager(),
-                                     CharSourceRange::getTokenRange(declStmt->getSourceRange()), replacement_text,
+                                     CharSourceRange::getTokenRange(decl_stmt->getSourceRange()), replacement_text,
                                      data.Ctx.getLangOpts());
       return true;
     }
 
-    return RecursiveASTVisitor::TraverseDeclStmt(declStmt);
+    return RecursiveASTVisitor::TraverseDeclStmt(decl_stmt);
   }
 
   auto TraverseStmt(Stmt *stmt) -> bool {
@@ -1309,6 +1313,10 @@ public:
     if (stmt == nullptr || !sm.isInMainFile(sm.getSpellingLoc(stmt->getBeginLoc())) ||
         data.current_function_decl == nullptr) {
       return true;
+    }
+
+    if (data.current_function_decl->getName().starts_with("__c2pnk_")) {
+      return RecursiveASTVisitor::TraverseStmt(stmt);
     }
 
     if (auto *expr = dyn_cast<Expr>(stmt)) {

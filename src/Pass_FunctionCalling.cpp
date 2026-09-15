@@ -223,6 +223,64 @@ namespace RewriteFunctions {
 using FunctionInfo = CollectFunctionInfo::WorkerData::FunctionInfo;
 using FunctionMap = CollectFunctionInfo::WorkerData::FunctionMap;
 
+struct FFIFunctionWrapperParamInfo {
+  ParmVarDecl *original_param_decl;
+  size_t original_param_index;
+  std::optional<std::pair<size_t, size_t>> offset_and_size;
+  // if not present, then it's on the fast path
+  // otherwise, the first element is the offset in bytes from the start of the input buffer, and the second element is
+  // the size in bytes
+  explicit FFIFunctionWrapperParamInfo(ParmVarDecl *original_param_decl, size_t original_param_index,
+                                       std::optional<std::pair<size_t, size_t>> offset_and_size = std::nullopt)
+      : original_param_decl(original_param_decl), original_param_index(original_param_index),
+        offset_and_size(std::move(offset_and_size)) {}
+};
+
+struct FFIFunctionWrapperReturnInfo {
+  QualType original_return_type;
+  std::optional<size_t> size_in_bytes;
+
+  explicit FFIFunctionWrapperReturnInfo(QualType original_return_type,
+                                        std::optional<size_t> size_in_bytes = std::nullopt)
+      : original_return_type(original_return_type), size_in_bytes(size_in_bytes) {}
+
+  // "fast path" (meaning no memcpy but global var still needed)
+  auto IsFastPath() const -> bool { return !size_in_bytes.has_value(); }
+};
+
+struct FFIFunctionWrapperInfo {
+  std::array<std::optional<FFIFunctionWrapperParamInfo>, 4> param_infos;
+  llvm::SmallVector<FFIFunctionWrapperParamInfo> non_fast_path_param_infos;
+  llvm::SmallVector<std::pair<std::optional<size_t>, std::optional<size_t>>> param_map;
+  size_t non_fastpath_input_buf_size; // compile-time constant, hardcoded into generated code, no slot
+  FFIFunctionWrapperReturnInfo return_info;
+
+  explicit FFIFunctionWrapperInfo(std::array<std::optional<FFIFunctionWrapperParamInfo>, 4> param_infos,
+                                  llvm::SmallVector<FFIFunctionWrapperParamInfo> non_fast_path_param_infos,
+                                  llvm::SmallVector<std::pair<std::optional<size_t>, std::optional<size_t>>> param_map,
+                                  size_t non_fastpath_input_buf_size, FFIFunctionWrapperReturnInfo return_info)
+      : param_infos(std::move(param_infos)), non_fast_path_param_infos(std::move(non_fast_path_param_infos)),
+        param_map(std::move(param_map)), non_fastpath_input_buf_size(non_fastpath_input_buf_size),
+        return_info(return_info) {}
+
+  // Only two possible reserved slots now: output_buf, then input_buf. Lengths are compile-time
+  // constants (return_info.size_in_bytes / non_fastpath_input_buf_size) baked directly into the
+  // generated wrapper body, so they never occupy a slot.
+  auto HasOutputBufSlot() const -> bool { return !return_info.original_return_type->isVoidType(); }
+  auto HasInputSlot() const -> bool { return !non_fast_path_param_infos.empty(); }
+
+  auto OutputBufSlotIndex() const -> std::optional<size_t> {
+    if (!HasOutputBufSlot())
+      return std::nullopt;
+    return 0;
+  }
+  auto InputBufSlotIndex() const -> std::optional<size_t> {
+    if (!HasInputSlot())
+      return std::nullopt;
+    return HasOutputBufSlot() ? 1 : 0;
+  }
+};
+
 struct WorkerData {
   ASTContext &Ctx;
   PipelineStageCtx &ps_ctx;
@@ -231,12 +289,7 @@ struct WorkerData {
   FFIFunctionRewrites &ffi_rewrites;
   FFIVariadicFunctionRewrites &ffi_variadic_rewrites;
 
-  struct FFIFunctionInfo {
-    size_t input_buf_size = 0;
-    size_t output_buf_size = 0;
-    llvm::DenseMap<ParmVarDecl *, std::pair<size_t, size_t>> param_info;
-  };
-  llvm::DenseMap<FunctionDecl *, FFIFunctionInfo> ffi_function_info;
+  llvm::DenseMap<const FunctionDecl *, FFIFunctionWrapperInfo> ffi_function_info;
 
   llvm::Error error = llvm::Error::success();
   size_t tmp_var_counter = 0;
@@ -286,6 +339,271 @@ public:
     case SC_Register:
       return "register";
     }
+  }
+
+  auto ConstructFunctionWrapperInfo(const FunctionDecl *func_decl) const -> FFIFunctionWrapperInfo {
+    std::array<std::optional<FFIFunctionWrapperParamInfo>, 4> param_infos{};
+    llvm::SmallVector<FFIFunctionWrapperParamInfo> non_fast_path_param_infos;
+    llvm::SmallVector<std::pair<std::optional<size_t>, std::optional<size_t>>> param_map;
+    std::optional<FFIFunctionWrapperReturnInfo> return_info;
+
+    auto pointer_width = GetPointerWidth(data.Ctx);
+
+    auto fits_fastpath = [&](QualType type) -> bool {
+      auto size = data.Ctx.getTypeSize(type) / 8;
+      return (type->isIntegerType() || type->isPointerType()) && size <= pointer_width;
+    };
+
+    // process return type first
+    auto return_type = func_decl->getReturnType();
+    if (return_type->isVoidType()) {
+      return_info = FFIFunctionWrapperReturnInfo(return_type);
+    } else {
+      auto return_type_size = data.Ctx.getTypeSize(return_type) / 8;
+      if (fits_fastpath(return_type)) {
+        // fits directly: no memcpy needed, just a typed store through the output pointer
+        return_info = FFIFunctionWrapperReturnInfo(return_type);
+      } else {
+        // too big: needs a memcpy into the caller-provided output buffer
+        return_info = FFIFunctionWrapperReturnInfo(return_type, return_type_size);
+      }
+    }
+
+    // reserved slots always sit at a fixed prefix: output_buf [, input_buf].
+    // lengths are compile-time constants, so they never take a slot.
+    size_t fastpath_index_counter = 0;
+    if (!return_type->isVoidType()) {
+      fastpath_index_counter++; // output_buf
+    }
+
+    auto num_params = func_decl->getNumParams();
+    size_t remaining_slots_after_output = 4 - fastpath_index_counter;
+    bool needs_input_buffer = num_params > remaining_slots_after_output;
+    if (!needs_input_buffer) {
+      for (const auto &param_decl : func_decl->parameters()) {
+        if (!fits_fastpath(param_decl->getType())) {
+          needs_input_buffer = true;
+          break;
+        }
+      }
+    }
+    if (needs_input_buffer) {
+      fastpath_index_counter++; // input_buf
+    }
+
+    // place each parameter: fastpath-eligible params fill whatever slots remain, in order
+    // anything left over (type-ineligible, or the fastpath slots ran out) goes into the
+    // non-fastpath input buffer, with its offset/size recorded and padded to the param's
+    // required alignment so structs (and anything else with alignment > 1) land correctly.
+    size_t current_input_buf_offset = 0;
+    for (const auto [i, param_decl] : func_decl->parameters() | std::views::enumerate) {
+      auto param_type = param_decl->getType();
+      auto param_type_size = data.Ctx.getTypeSize(param_type) / 8;
+      if (fits_fastpath(param_type) && fastpath_index_counter < 4) {
+        param_infos.at(fastpath_index_counter) = FFIFunctionWrapperParamInfo(param_decl, static_cast<size_t>(i));
+        param_map.push_back(std::make_pair(fastpath_index_counter, std::nullopt));
+        fastpath_index_counter++;
+      } else {
+        auto param_align = data.Ctx.getTypeAlign(param_type) / 8; // bits -> bytes
+        current_input_buf_offset = llvm::alignTo(current_input_buf_offset, param_align);
+
+        non_fast_path_param_infos.push_back(FFIFunctionWrapperParamInfo(
+            param_decl, static_cast<size_t>(i), std::make_pair(current_input_buf_offset, param_type_size)));
+        param_map.push_back(std::make_pair(std::nullopt, non_fast_path_param_infos.size() - 1));
+        current_input_buf_offset += param_type_size;
+      }
+    }
+
+    return FFIFunctionWrapperInfo(std::move(param_infos), std::move(non_fast_path_param_infos), std::move(param_map),
+                                  current_input_buf_offset, *return_info);
+  }
+
+  auto GenerateFFIWrapperFunction(const FunctionDecl *func_decl, llvm::raw_ostream &os) const -> llvm::Error {
+    auto info = ConstructFunctionWrapperInfo(func_decl);
+    const auto &policy = data.Ctx.getPrintingPolicy();
+
+    auto func_name = func_decl->getName();
+    auto wrapper_name = "__c2pnk_ffi_wrapper_" + func_name;
+
+    // add #include where func_decl is located
+    auto &sm = data.Ctx.getSourceManager();
+    auto loc = sm.getFileLoc(func_decl->getLocation());
+    auto file_id = sm.getFileID(loc);
+    if (file_id != sm.getMainFileID()) {
+      // sometimes external func decls can appear in the same file and only be specified during link time...
+      // return CreateRuntimeError(std::move(
+      //     llvm::formatv("\n    at {0}\nFFI function {1} is defined in the current source file which doesn't make
+      //     sense",
+      //                   func_decl->getBeginLoc().printToString(data.Ctx.getSourceManager()), func_name)));
+      auto file_entry = sm.getFileEntryRefForID(file_id);
+      if (!file_entry.has_value()) {
+        return CreateRuntimeError(
+            std::move(llvm::formatv("\n    at {0}\nCouldn't get header file where FFI function {1} resides",
+                                    func_decl->getBeginLoc().printToString(data.Ctx.getSourceManager()), func_name)));
+      }
+      auto &file_manager = sm.getFileManager();
+      os << llvm::formatv("#include <{0}>\n", file_manager.getCanonicalName(*file_entry));
+      os << llvm::formatv("#include <stdint.h>\n#include <string.h>\n");
+    }
+
+    // create the global buffers for the non-fastpath params and return value, if needed
+    if (auto idx = info.InputBufSlotIndex()) {
+      os << llvm::formatv("static uint8_t __c2pnk_ffi_input_buf_{0}[{1}];\n", func_name,
+                          info.non_fastpath_input_buf_size);
+    }
+    if (auto idx = info.OutputBufSlotIndex()) {
+      if (info.return_info.IsFastPath()) {
+        std::string return_var_name = "__c2pnk_ffi_output_buf_" + func_name.str();
+        os << llvm::formatv("static {0};\n", PrintType(info.return_info.original_return_type, return_var_name));
+      } else {
+        os << llvm::formatv("static uint8_t __c2pnk_ffi_output_buf_{0}[{1}];\n", func_name,
+                            info.return_info.size_in_bytes.value());
+      }
+    }
+
+    // emit the wrapper function signature
+    os << "void " << wrapper_name << "(uintptr_t arg0, uintptr_t arg1, uintptr_t arg2, uintptr_t arg3) {\n";
+
+    // pull out the reserved slots, if present
+    if (auto idx = info.InputBufSlotIndex()) {
+      os << "/* input_buf = arg" << *idx << " */\n";
+    }
+
+    // build the argument list for the call, in original parameter order
+    std::string call_args;
+    llvm::raw_string_ostream call_args_os(call_args);
+    for (size_t orig_idx = 0; orig_idx < info.param_map.size(); orig_idx++) {
+      if (orig_idx != 0) {
+        call_args_os << ", ";
+      }
+      auto [fastpath_slot, non_fastpath_idx] = info.param_map[orig_idx];
+
+      if (fastpath_slot.has_value()) {
+        auto &param_info = *info.param_infos.at(*fastpath_slot);
+        auto param_type = param_info.original_param_decl->getType();
+        auto type_str = param_type.getAsString(policy);
+        call_args_os << "(" << type_str << ")arg" << *fastpath_slot;
+      } else {
+        auto idx = info.InputBufSlotIndex().value();
+        auto &param_info = info.non_fast_path_param_infos[*non_fastpath_idx];
+        auto param_type = param_info.original_param_decl->getType();
+        auto type_str = data.Ctx.getPointerType(param_type).getAsString(policy);
+        auto [offset, size] = *param_info.offset_and_size;
+        call_args_os << "(*(" << type_str << " )(arg" << idx << " + " << offset << "UL))";
+      }
+    }
+    call_args_os.flush();
+
+    // emit the call and write the return value out, choosing the cheapest path available:
+    //   - void: just call it
+    //   - fastpath: store the call result straight through the output pointer, no temp needed
+    //   - non-fastpath: memcpy needs an addressable source, so a local temp is unavoidable here
+    if (info.return_info.original_return_type->isVoidType()) {
+      os << func_decl->getNameAsString() << "(" << call_args << ");\n";
+    } else {
+      auto ret_ptr_type = data.Ctx.getPointerType(info.return_info.original_return_type);
+      auto idx = info.OutputBufSlotIndex().value();
+      os << " /* output_buf = arg" << idx << " */\n";
+      os << "*(" << ret_ptr_type.getAsString(data.Ctx.getPrintingPolicy()) << ")arg" << idx << " = "
+         << func_decl->getNameAsString() << "(" << call_args << ");\n";
+    }
+
+    os << "}\n";
+    os.flush();
+    return llvm::Error::success();
+  }
+
+  auto CallExprToFFIWrapperStmtExpr(const CallExpr *call_expr, const FunctionDecl *func_decl, llvm::raw_ostream &os)
+      -> llvm::Error {
+    auto func_name = func_decl->getName();
+    auto &info = data.ffi_function_info.find(func_decl)->second;
+    const auto &policy = data.Ctx.getPrintingPolicy();
+
+    auto wrapper_name = "__c2pnk_ffi_wrapper_" + func_decl->getName();
+    bool is_void_return = info.return_info.original_return_type->isVoidType();
+    auto return_type = info.return_info.original_return_type;
+
+    // build the 4 wrapper call arguments up front
+    std::array<std::string, 4> slot_args = {"0UL", "0UL", "0UL", "0UL"};
+    for (size_t slot = 0; slot < 4; slot++) {
+      if (!info.param_infos.at(slot).has_value()) {
+        continue;
+      }
+      auto &param_info = *info.param_infos.at(slot);
+      const auto *arg_expr = call_expr->getArg(static_cast<unsigned>(param_info.original_param_index));
+
+      auto src = GetSourceText(arg_expr, data.Ctx);
+      if (auto error = src.takeError()) {
+        return llvm::joinErrors(
+            CreateRuntimeError(
+                llvm::formatv("\n    at {0}\nCouldn't get source text for argument {1} of call to FFI function {2}",
+                              call_expr->getBeginLoc().printToString(data.Ctx.getSourceManager()),
+                              param_info.original_param_index, func_decl->getName())),
+            std::move(error));
+      }
+      slot_args.at(slot) = llvm::formatv("(uintptr_t)({0})", *src).str();
+    }
+
+    // optimization: void return + no non-fastpath params means no locals and no buffer are
+    // needed at all, so a plain call expression suffices
+    if (is_void_return && !info.HasInputSlot()) {
+      os << llvm::formatv("{0}({1}, {2}, {3}, {4})", wrapper_name, slot_args[0], slot_args[1], slot_args[2],
+                          slot_args[3]);
+      os.flush();
+      return llvm::Error::success();
+    }
+
+    os << "({\n";
+
+    // local buffer + fill-in for whatever params didn't fit a fastpath slot
+    if (info.HasInputSlot()) {
+      for (auto &param_info : info.non_fast_path_param_infos) {
+        auto [offset, size] = *param_info.offset_and_size;
+        auto param_type = param_info.original_param_decl->getType();
+        auto index = param_info.original_param_index;
+        const auto *arg_i = call_expr->getArg(static_cast<unsigned>(index))->IgnoreParenImpCasts();
+        auto arg_i_src = GetSourceText(arg_i, data.Ctx);
+        if (auto error = arg_i_src.takeError()) {
+          return llvm::joinErrors(CreateRuntimeError(std::move(llvm::formatv(
+                                      "\n    at {0}\nFailed to get source text for argument {1} of CallExpr",
+                                      arg_i->getBeginLoc().printToString(data.Ctx.getSourceManager()), index))),
+                                  std::move(error));
+        }
+
+        if (!func_decl->isVariadic()) {
+          if (!arg_i->isLValue()) {
+            // requires tmp var to hold the value of the argument so we can take the address of it
+            std::string tmp_var_name = GetTempVarName(llvm::formatv("arg_{0}", index));
+            os << llvm::formatv("{0} = {1};\n", PrintType(param_type, tmp_var_name), *arg_i_src);
+            os << llvm::formatv("__c2pnk_memcpy(__c2pnk_ffi_input_buf_{0} + {1}UL, (uint8_t *)&{2}, {3}UL);\n",
+                                func_name, offset, tmp_var_name, size);
+          } else {
+            os << llvm::formatv("__c2pnk_memcpy(__c2pnk_ffi_input_buf_{0} + {1}UL, (uint8_t *)&{2}, {3}UL);\n",
+                                func_name, offset, *arg_i_src, size);
+          }
+        }
+      }
+    }
+
+    if (auto idx = info.OutputBufSlotIndex()) {
+      slot_args.at(*idx) = llvm::formatv("(uintptr_t)&__c2pnk_ffi_output_buf_{0}", func_name);
+    }
+    if (auto idx = info.InputBufSlotIndex()) {
+      slot_args.at(*idx) = llvm::formatv("(uintptr_t)__c2pnk_ffi_input_buf_{0}", func_name);
+    }
+
+    os << llvm::formatv("{0}({1}, {2}, {3}, {4});\n", wrapper_name, slot_args[0], slot_args[1], slot_args[2],
+                        slot_args[3]);
+    os.flush();
+
+    if (!is_void_return) {
+      auto return_type_pointer = data.Ctx.getPointerType(return_type).getAsString(policy);
+      os << llvm::formatv("*({0})__c2pnk_ffi_output_buf_{1};\n", return_type_pointer, func_name);
+    }
+    os << "})";
+    os.flush();
+
+    return llvm::Error::success();
   }
 
   auto TraverseFunctionDecl(FunctionDecl *func_decl) -> bool {
@@ -489,10 +807,11 @@ public:
         for (const auto &param_info : function_info.param_infos) {
           if (param_info.hoisted_name.has_value()) {
             // this is funadmentally incompatible!
-            data.error = CreateRuntimeError(std::move(llvm::formatv(
-                "\n    at {0}\nExternal entry point function {1} needs a hoisted parameter {2}, which is not supported",
-                func_decl->getBeginLoc().printToString(data.Ctx.getSourceManager()), func_decl->getName(),
-                param_info.param_decl->getName())));
+            data.error = CreateRuntimeError(
+                std::move(llvm::formatv("\n    at {0}\nExternal entry point function {1} needs a hoisted parameter "
+                                        "{2}, which is not supported",
+                                        func_decl->getBeginLoc().printToString(data.Ctx.getSourceManager()),
+                                        func_decl->getName(), param_info.param_decl->getName())));
             return false;
           }
 
@@ -819,118 +1138,19 @@ public:
         // create a new name mangled variadic version of the function every time...
       } else if (it == data.ffi_rewrites.end()) {
         // create ffi "stub" for this function
+        auto wrapper_info = ConstructFunctionWrapperInfo(callee_decl);
+        data.ffi_function_info.insert({callee_decl, FFIFunctionWrapperInfo(wrapper_info)});
 
-        // get size of input args
-        size_t input_buf_size = 0;
-        llvm::DenseMap<ParmVarDecl *, std::pair<size_t, size_t>> param_offsets_sizes; // param_decl -> (offset, size)
-        for (const auto &param_info : callee_decl->parameters()) {
-          auto param_type = param_info->getType();
-          auto type_size = data.Ctx.getTypeSize(param_type);
-          if (type_size % 8 != 0) {
-            data.error = CreateRuntimeError(std::move(llvm::formatv(
-                "\n    at {0}\nFFI function {1} has parameter {2} of type {3} with size {4} bits, which is not a "
-                "multiple of 8 bits",
-                param_info->getBeginLoc().printToString(data.Ctx.getSourceManager()), callee_decl->getName(),
-                param_info->getName(), param_type.getAsString(), type_size)));
-            return false;
-          }
-          param_offsets_sizes.insert({param_info, {input_buf_size, type_size / 8}});
-          input_buf_size += (data.Ctx.getTypeSize(param_type) / 8);
-        }
-
-        size_t output_buf_size = 0;
-        auto return_type = callee_decl->getReturnType();
-        if (!return_type->isVoidType()) {
-          auto type_size = data.Ctx.getTypeSize(return_type);
-          if (type_size % 8 != 0) {
-            data.error = CreateRuntimeError(std::move(llvm::formatv(
-                "\n    at {0}\nFFI function {1} has return type {2} with size {3} bits, which is not a multiple of 8 "
-                "bits",
-                callee_decl->getBeginLoc().printToString(data.Ctx.getSourceManager()), callee_decl->getName(),
-                return_type.getAsString(), type_size)));
-            return false;
-          }
-          output_buf_size = (type_size / 8);
-        }
-
-        data.ffi_function_info.insert({callee_decl, WorkerData::FFIFunctionInfo{.input_buf_size = input_buf_size,
-                                                                                .output_buf_size = output_buf_size,
-                                                                                .param_info = param_offsets_sizes}});
-
-        auto func_name = callee_decl->getName();
         std::string replacement_text;
         llvm::raw_string_ostream os(replacement_text);
-
-        // add #include where callee_decl is located
-        auto &sm = data.Ctx.getSourceManager();
-        auto loc = sm.getFileLoc(callee_decl->getLocation());
-        auto file_id = sm.getFileID(loc);
-        if (file_id == sm.getMainFileID()) {
-          data.error = CreateRuntimeError(std::move(llvm::formatv(
-              "\n    at {0}\nFFI function {1} is defined in the current source file which doesn't make sense",
-              callee_decl->getBeginLoc().printToString(data.Ctx.getSourceManager()), callee_decl->getName())));
+        if (auto error = GenerateFFIWrapperFunction(callee_decl, os)) {
+          data.error = llvm::joinErrors(
+              CreateRuntimeError(std::move(llvm::formatv(
+                  "\n    at {0}\nFailed to generate FFI wrapper function: {1}",
+                  callee_decl->getBeginLoc().printToString(data.Ctx.getSourceManager()), callee_decl->getName()))),
+              std::move(error));
           return false;
         }
-        auto file_entry = sm.getFileEntryRefForID(file_id);
-        if (!file_entry.has_value()) {
-          data.error = CreateRuntimeError(std::move(llvm::formatv(
-              "\n    at {0}\nCouldn't get header file where FFI function {1} resides",
-              callee_decl->getBeginLoc().printToString(data.Ctx.getSourceManager()), callee_decl->getName())));
-          return false;
-        }
-        auto &file_manager = sm.getFileManager();
-        os << llvm::formatv("#include <{0}>\n", file_manager.getCanonicalName(*file_entry));
-
-        // add global buffers
-        os << llvm::formatv("#include <stdint.h>\n#include <string.h>\n");
-        os << llvm::formatv("static uint8_t __c2pnk_ffi_input_buf_{0}[{1}];\n", func_name, input_buf_size);
-        if (return_type->isVoidType()) {
-          os << llvm::formatv("static uint8_t __c2pnk_ffi_output_buf_{0}[1]; /* placeholder for void return */\n",
-                              func_name);
-        } else {
-          os << llvm::formatv("static uint8_t __c2pnk_ffi_output_buf_{0}[{1}];\n", func_name, output_buf_size);
-        }
-
-        os << llvm::formatv("static {0} __c2pnk_ffi_{1}(uint8_t *input_buf, {0} input_buf_len, uint8_t *output_buf, "
-                            "{0} output_buf_len) {{\n",
-                            GetWordTypeStr(data.Ctx), func_name);
-
-        // create and init local vars to pass to actual function
-        for (const auto &[i, param_info] : callee_decl->parameters() | std::views::enumerate) {
-          auto param_type = param_info->getType();
-          auto [offset, size] = param_offsets_sizes.at(param_info);
-
-          os << PrintType(param_type, param_info->getName()) << ";\n";
-          os << llvm::formatv("memcpy(&{0}, &input_buf[{1}UL], {2}UL);\n", param_info->getName(), offset, size);
-        }
-
-        if (!return_type->isVoidType()) {
-          os << PrintType(return_type, "__c2pnk_ret_val") << ";\n";
-        }
-        // call the actual function
-        if (!return_type->isVoidType()) {
-          os << llvm::formatv("__c2pnk_ret_val = {0}(", func_name);
-        } else {
-          os << llvm::formatv("{0}(", func_name);
-        }
-        std::string arg_list;
-        llvm::raw_string_ostream os2(arg_list);
-        for (const auto &param_info : callee_decl->parameters()) {
-          os2 << param_info->getName() << ", ";
-        }
-        os2.flush();
-        if (arg_list.ends_with(", ")) {
-          arg_list.resize(arg_list.size() - 2);
-        }
-        os << arg_list << ");\n";
-
-        // copy return value to output buffer
-        if (!return_type->isVoidType()) {
-          os << llvm::formatv("memcpy(&output_buf[0UL], &__c2pnk_ret_val, {0}UL);\n", output_buf_size);
-        }
-        os << "return 0UL;\n";
-        os << "}\n";
-        os.flush();
 
         // add to the top of the main source file
         if (auto error = data.ffi_rewrites[callee_decl].add(
@@ -944,59 +1164,16 @@ public:
         }
       }
 
-      // now rewrite the call expr using a gnu statement expression
       std::string replacement_text;
       llvm::raw_string_ostream os(replacement_text);
-      os << "({\n";
-
-      // copy all the args to the input buffer
-      for (const auto &[i, param_info] : callee_decl->parameters() | std::views::enumerate) {
-        auto param_type = param_info->getType();
-        auto *arg_i = call_expr->getArg(static_cast<unsigned>(i))->IgnoreParenImpCasts();
-        auto arg_i_src = GetSourceText(arg_i, data.Ctx);
-        if (auto error = arg_i_src.takeError()) {
-          data.error = llvm::joinErrors(CreateRuntimeError(std::move(llvm::formatv(
-                                            "\n    at {0}\nFailed to get source text for argument {1} of CallExpr",
-                                            arg_i->getBeginLoc().printToString(data.Ctx.getSourceManager()), i))),
-                                        std::move(error));
-          return false;
-        }
-        auto [offset, size] = data.ffi_function_info[callee_decl].param_info[param_info];
-        if (!callee_decl->isVariadic()) {
-          if (!arg_i->isLValue()) {
-            // requires tmp var to hold the value of the argument so we can take the address of it
-            std::string tmp_var_name = GetTempVarName(llvm::formatv("arg_{0}", i));
-            os << llvm::formatv("{0} = {1};\n", PrintType(param_type, tmp_var_name), *arg_i_src);
-            os << llvm::formatv("__c2pnk_memcpy(__c2pnk_ffi_input_buf_{0} + {1}UL, (uint8_t *)&{2}, {3}UL);\n",
-                                callee_name, offset, tmp_var_name, size);
-          } else {
-            os << llvm::formatv("__c2pnk_memcpy(__c2pnk_ffi_input_buf_{0} + {1}UL, (uint8_t *)&{2}, {3}UL);\n",
-                                callee_name, offset, *arg_i_src, size);
-          }
-        } else {
-          // TODO variadic functions...
-        }
+      if (auto error = CallExprToFFIWrapperStmtExpr(call_expr, callee_decl, os)) {
+        data.error = llvm::joinErrors(
+            CreateRuntimeError(std::move(llvm::formatv(
+                "\n    at {0}\nFailed to generate FFI wrapper call for function: {1}",
+                call_expr->getBeginLoc().printToString(data.Ctx.getSourceManager()), callee_decl->getName()))),
+            std::move(error));
+        return false;
       }
-
-      // call the ffi stub function
-      if (callee_decl->isVariadic()) {
-        // TODO variadic functions...
-      } else {
-        os << llvm::formatv("__c2pnk_ffi_{0}(__c2pnk_ffi_input_buf_{0}, sizeof(__c2pnk_ffi_input_buf_{0}), "
-                            "__c2pnk_ffi_output_buf_{0}, sizeof(__c2pnk_ffi_output_buf_{0}));\n",
-                            callee_name);
-      }
-
-      if (!callee_decl->getReturnType()->isVoidType()) {
-        os << PrintType(callee_decl->getReturnType(), "__c2pnk_ret_val") << ";\n";
-        os << llvm::formatv("__c2pnk_memcpy((uint8_t *)&__c2pnk_ret_val, __c2pnk_ffi_output_buf_{0}, "
-                            "sizeof(__c2pnk_ffi_output_buf_{0}));\n",
-                            callee_name);
-        os << "__c2pnk_ret_val;\n";
-      }
-
-      os << "})";
-      os.flush();
 
       if (auto error = data.ffi_rewrites[callee_decl].add({data.Ctx.getSourceManager(),
                                                            CharSourceRange::getTokenRange(call_expr->getSourceRange()),
@@ -1013,6 +1190,20 @@ public:
 
     return true;
   };
+
+  static auto ValidateReturnStmt(ReturnStmt *return_stmt) -> bool {
+    if (return_stmt->getRetValue() == nullptr) {
+      return true;
+    }
+
+    if (auto *int_lit = llvm::dyn_cast<IntegerLiteral>(return_stmt->getRetValue())) {
+      if (int_lit->getValue() == 0) {
+        return false;
+      }
+    }
+
+    return true;
+  }
 
   auto TraverseReturnStmt(ReturnStmt *return_stmt) -> bool {
     if (!RecursiveASTVisitor<Worker>::TraverseReturnStmt(return_stmt)) {
@@ -1076,19 +1267,21 @@ public:
           return false;
         };
       }
-    } else {
-      // rewrite the return statement to return 0UL instead as per pancake rules
-      std::string replacement_text;
-      llvm::raw_string_ostream os(replacement_text);
-      os << "return 0UL";
-      os.flush();
+    } else if (function_info.turn_return_from_void_to_uint) {
+      if (ValidateReturnStmt(return_stmt)) {
+        // rewrite the return statement to return 0UL instead as per pancake rules
+        std::string replacement_text;
+        llvm::raw_string_ostream os(replacement_text);
+        os << "return 0UL";
+        os.flush();
 
-      if (auto error = data.non_ffi_rewrites[data.current_function_decl].add(
-              {data.Ctx.getSourceManager(), CharSourceRange::getTokenRange(return_stmt->getSourceRange()),
-               replacement_text, data.Ctx.getLangOpts()})) {
-        data.error = std::move(error);
-        return false;
-      };
+        if (auto error = data.non_ffi_rewrites[data.current_function_decl].add(
+                {data.Ctx.getSourceManager(), CharSourceRange::getTokenRange(return_stmt->getSourceRange()),
+                 replacement_text, data.Ctx.getLangOpts()})) {
+          data.error = std::move(error);
+          return false;
+        };
+      }
     }
 
     return true;

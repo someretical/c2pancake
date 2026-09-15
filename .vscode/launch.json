@@ -7,10 +7,10 @@
         {
             "type": "lldb-dap",
             "request": "launch",
-            "name": "Debug c2pancake with current file",
+            "name": "(lldb) Debug c2pancake with current file",
             "program": "${command:cmake.getLaunchTargetPath}",
             "args": [
-                // "--end=RewriteFunctionCalling",
+                "--end=RewriteFunctionCalling",
                 "${file}",
                 "--",
                 // "--target=aarch64-linux-gnu",
@@ -23,9 +23,39 @@
             "console": "integratedTerminal",
         },
         {
+            "name": "(gdb) Debug c2pancake with current file",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${command:cmake.getLaunchTargetPath}",
+            "args": [
+                "--end=RewriteFunctionCalling",
+                "${file}",
+                "--",
+                // "--target=aarch64-linux-gnu",
+                "-std=c23",
+            ],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}",
+            "environment": [],
+            "externalConsole": false,
+            "MIMode": "gdb",
+            "setupCommands": [
+                {
+                    "description": "Enable pretty-printing for gdb",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                },
+                {
+                    "description": "Set Disassembly Flavor to Intel",
+                    "text": "-gdb-set disassembly-flavor intel",
+                    "ignoreFailures": true
+                }
+            ]
+        },
+        {
             "type": "lldb-dap",
             "request": "launch",
-            "name": "Debug c2pancake with uart.c",
+            "name": "(lldb) Debug c2pancake with uart.c",
             "program": "${command:cmake.getLaunchTargetPath}",
             "env": {
                 "LSAN_OPTIONS": "verbosity=1:log_threads=1"
