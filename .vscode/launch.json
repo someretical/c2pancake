@@ -5,24 +5,6 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "type": "lldb-dap",
-            "request": "launch",
-            "name": "(lldb) Debug c2pancake with current file",
-            "program": "${command:cmake.getLaunchTargetPath}",
-            "args": [
-                "--end=RewriteFunctionCalling",
-                "${file}",
-                "--",
-                // "--target=aarch64-linux-gnu",
-                "-std=c23",
-            ],
-            "cwd": "${workspaceFolder}",
-            "sourceMap": {
-                "/scratch/yankai/c2pancake": "${workspaceFolder}"
-            },
-            "console": "integratedTerminal",
-        },
-        {
             "name": "(gdb) Debug c2pancake with current file",
             "type": "cppdbg",
             "request": "launch",
