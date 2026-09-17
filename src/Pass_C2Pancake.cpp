@@ -91,7 +91,7 @@ public:
   // process all outer record decls first
   static auto shouldTraversePostOrder() -> bool { return true; }
 
-  auto VisitTranslationUnitDecl(TranslationUnitDecl *tu_decl) -> bool {
+  auto TraverseTranslationUnitDecl(TranslationUnitDecl *tu_decl) -> bool {
     if (data.error) {
       return false;
     }
@@ -101,10 +101,97 @@ public:
         if (!func_decl->isThisDeclarationADefinition()) {
           continue;
         }
+
+        if (!TraverseFunctionDecl(func_decl)) {
+          return false;
+        }
+        continue;
       }
+
+      if (auto *_ = llvm::dyn_cast<TypedefDecl>(decl)) {
+        continue;
+      }
+
+      if (auto *_ = llvm::dyn_cast<RecordDecl>(decl)) {
+        continue;
+      }
+
+      data.error = CreateRuntimeError("Unexpected top-level declaration\n    at " +
+                                      decl->getBeginLoc().printToString(data.Ctx.getSourceManager()));
+      return false;
     }
 
     return true;
+  }
+
+  auto TraverseFunctionDecl(FunctionDecl *func_decl) -> bool {
+    if (data.error) {
+      return false;
+    }
+
+    if (!func_decl->isThisDeclarationADefinition()) {
+      return true;
+    }
+
+    auto *body = func_decl->getBody();
+    if (body != nullptr) {
+      if (auto *compound_stmt = llvm::dyn_cast<CompoundStmt>(body)) {
+        for (auto *stmt : compound_stmt->body()) {
+          if (!TraverseStmt(stmt)) {
+            return false;
+          }
+        }
+      } else {
+        data.error = CreateRuntimeError("Function body is not a compound statement\n    at " +
+                                        body->getBeginLoc().printToString(data.Ctx.getSourceManager()));
+        return false;
+      }
+    }
+
+    // TODO output pancake equivalent of the function
+    // the body should already be handled by TraverseStmt
+
+    return false;
+  }
+
+  auto TraverseStmt(Stmt *stmt) -> Expected<std::string> {
+    std::string replacement_text;
+    llvm::raw_string_ostream os(replacement_text);
+    if (auto *compound_stmt = llvm::dyn_cast<CompoundStmt>(stmt)) {
+      for (auto *sub_stmt : compound_stmt->body()) {
+        auto result = TraverseStmt(sub_stmt);
+        if (auto error = result.takeError()) {
+          return std::move(error);
+        }
+
+        os << *result;
+      }
+      os.flush();
+
+      return replacement_text;
+    }
+
+    if (auto *decl_stmt = llvm::dyn_cast<DeclStmt>(stmt)) {
+      for (auto *decl : decl_stmt->decls()) {
+        if (auto *var_decl = llvm::dyn_cast<VarDecl>(decl)) {
+          // TODO handle var decl
+          continue;
+        }
+
+        return CreateRuntimeError("Unexpected declaration statement\n    at " +
+                                  decl->getBeginLoc().printToString(data.Ctx.getSourceManager()));
+      }
+
+      return replacement_text;
+    }
+
+    return CreateRuntimeError("Unexpected statement\n    at " +
+                              stmt->getBeginLoc().printToString(data.Ctx.getSourceManager()));
+  }
+
+  auto TraverseExpr(const BuildExprCtx &ctx) -> Expected<BuiltExpr> {
+    return CreateRuntimeError("Unexpected expression\n    at " +
+                              ctx.expr->getBeginLoc().printToString(data.Ctx.getSourceManager()));
   }
 };
 } // namespace
