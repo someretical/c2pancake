@@ -41,6 +41,7 @@ add_executable(
   c2pancake
   src/Utils.cpp
   src/Pipeline.cpp
+  src/Pass_C2Pancake.cpp
   src/Pass_InjectHeaders.cpp
   src/Pass_FunctionCalling.cpp
   src/Pass_LowerBitfieldOps.cpp

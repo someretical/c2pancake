@@ -1,3 +1,4 @@
+#include "Pass_C2Pancake.h"
 #include "Pass_FunctionCalling.h"
 #include "Pass_HoistArraysAndAddresses.h"
 #include "Pass_InjectHeaders.h"
@@ -130,7 +131,7 @@ auto main(int argc, const char **argv) -> int {
   pipeline.AddStage<pass_implicit_to_explicit_casts::Action>();
   pipeline.AddStage<pass_rename_to_be_hoisted_globals::Action>();
   pipeline.AddStage<pass_hoist_locals::Action>();
+  pipeline.AddStage<pass_c2pancake::Action>();
 
-  // pipeline.AddPass<pass_hoist_arrays_and_addresses::Action>();
   return pipeline.Run();
 }
