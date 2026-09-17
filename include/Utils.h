@@ -76,7 +76,7 @@ A new ASTFrontendAction is created for each TU for each pass
 So there's a 1-1 relationship between PipelineAction and C2PancakePass
 The Ctx is created inside of Pipeline::Run and passed by reference to each PipelineAction and then C2PancakePass
 */
-enum class WhatsNext : uint8_t { MoveToNextPass, RepeatPass, MoveToNextFile, Abort };
+enum class WhatsNext : uint8_t { MoveToNextPass, RepeatPass, MoveToNextFile, Abort, FinalPass };
 enum class RunResult : uint8_t { Success, RepeatPass, Fail };
 struct PipelineStageCtx {
   const size_t major_pass_number;             // provided by Pipeline::Run
