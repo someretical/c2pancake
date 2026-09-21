@@ -22,6 +22,7 @@
 #include <llvm/Support/Error.h>
 #include <llvm/Support/ErrorHandling.h>
 #include <llvm/Support/raw_ostream.h>
+#include <string>
 #include <utility>
 
 using namespace clang;
@@ -79,9 +80,12 @@ struct BuiltExpr {
   llvm::SmallVector<std::string, 8> pre_stmts;
   clang::QualType final_expr_type;
   std::string final_expr;
+  bool is_on_heap;
+  std::optional<size_t> alignment;
   explicit BuiltExpr(llvm::SmallVector<std::string, 8> pre_stmts, std::string final_expr,
-                     clang::QualType final_expr_type)
-      : pre_stmts(std::move(pre_stmts)), final_expr_type(final_expr_type), final_expr(std::move(final_expr)) {}
+                     clang::QualType final_expr_type, bool is_on_heap, std::optional<size_t> alignment = std::nullopt)
+      : pre_stmts(std::move(pre_stmts)), final_expr_type(final_expr_type), final_expr(std::move(final_expr)),
+        is_on_heap(is_on_heap), alignment(alignment) {}
 };
 
 class Worker : public RecursiveASTVisitor<Worker> {
@@ -140,6 +144,11 @@ public:
 
         data.global_var_map[var_decl] = addr;
         // TODO replace with comment that includes the address
+
+        data.replacements.emplace_back(
+            data.Ctx.getSourceManager(), var_decl->getSourceRange(),
+            llvm::formatv("/* \"{0}\" at offset 0x{0:x} */", var_decl->getName(), addr).str(), data.Ctx.getLangOpts());
+        continue;
       }
 
       data.error = CreateRuntimeError("Unexpected top-level declaration\n    at " +
@@ -159,6 +168,9 @@ public:
       return true;
     }
 
+    // TODO check function attributes
+    // func_decl->getAttrs();
+
     auto *body = func_decl->getBody();
     if (body != nullptr) {
       if (auto *compound_stmt = llvm::dyn_cast<CompoundStmt>(body)) {
@@ -172,8 +184,24 @@ public:
           }
           stmts.emplace_back(res.get());
         }
-        // TODO output pancake equivalent of the function
-        // the body should already be handled by TraverseStmt
+
+        std::string replacement_text;
+        llvm::raw_string_ostream os(replacement_text);
+        os << "fun 1 " << func_decl->getName() << " (";
+        for (auto &&param : func_decl->parameters()) {
+          os << "1 " << param->getName();
+          if (param != func_decl->parameters().back()) {
+            os << ", ";
+          }
+        }
+        os << ") {\n";
+        for (auto &&stmt : stmts) {
+          os << stmt << "\n";
+        }
+        os << "}\n";
+        os.flush();
+        data.replacements.emplace_back(data.Ctx.getSourceManager(), func_decl->getSourceRange(), replacement_text,
+                                       data.Ctx.getLangOpts());
       } else {
         data.error = CreateRuntimeError("Function body is not a compound statement\n    at " +
                                         body->getBeginLoc().printToString(data.Ctx.getSourceManager()));
@@ -194,7 +222,7 @@ public:
           return std::move(error);
         }
 
-        os << *result;
+        os << result.get();
       }
       os.flush();
 
@@ -202,9 +230,12 @@ public:
     }
 
     if (auto *decl_stmt = llvm::dyn_cast<DeclStmt>(stmt)) {
+      std::string replacement_text;
+      llvm::raw_string_ostream os(replacement_text);
       for (auto *decl : decl_stmt->decls()) {
         if (auto *var_decl = llvm::dyn_cast<VarDecl>(decl)) {
-          // TODO handle var decl
+          // TODO handle shapes and stuff in the future...
+          os << "var 1 " << var_decl->getName() << ";\n";
           continue;
         }
 
@@ -228,30 +259,84 @@ public:
     const auto final_expr_type = expr->getType();
 
     if (auto *decl_ref_expr = dyn_cast<DeclRefExpr>(expr)) {
-      // TODO put the vars in the heap if necessary
-      if (auto error = PrintSourceText(os, decl_ref_expr, data.Ctx)) {
-        return llvm::joinErrors(CreateRuntimeError(std::move(llvm::formatv(
-                                    "\n    at {0}\nFailed to print source text for DeclRefExpr",
-                                    decl_ref_expr->getExprLoc().printToString(data.Ctx.getSourceManager())))),
-                                std::move(error));
+      if (auto *var_decl = dyn_cast<VarDecl>(decl_ref_expr->getDecl())) {
+        if (data.global_var_map.contains(var_decl)) {
+          auto addr = data.global_var_map[var_decl];
+          auto bytes = (uint64_t)data.Ctx.getTypeSizeInChars(var_decl->getType()).getQuantity();
+
+          switch (ctx.usage_kind) {
+          case Usage::Value: {
+            switch (bytes) {
+            case 1:
+              os << "ld8";
+              break;
+            case 4:
+              os << "ld32";
+              break;
+            case 8:
+              os << "lds 1";
+              break;
+            default:
+              return CreateRuntimeError(std::move(
+                  llvm::formatv("    at {0}\nUnsupported global variable size: {1} bytes",
+                                decl_ref_expr->getExprLoc().printToString(data.Ctx.getSourceManager()), bytes)));
+            }
+            // TODO add support for shared loads
+            os << llvm::formatv(" @base + {0}", addr);
+            break;
+          }
+          case Usage::Place: {
+            os << llvm::formatv("@base + {0}", addr);
+            break;
+          }
+          default:
+            return CreateRuntimeError(
+                std::move(llvm::formatv("    at {0}\nUnsupported usage kind for global variable: {1}",
+                                        decl_ref_expr->getExprLoc().printToString(data.Ctx.getSourceManager()),
+                                        static_cast<uint8_t>(ctx.usage_kind))));
+          }
+          os.flush();
+          return BuiltExpr(std::move(pre_stmts), final_expr, final_expr_type, true,
+                           (size_t)data.Ctx.getTypeAlignInChars(var_decl->getType()).getQuantity());
+        }
+
+        // local var
+        os << var_decl->getName();
+        os.flush();
+        return BuiltExpr(std::move(pre_stmts), final_expr, final_expr_type, false);
       }
-    } else if (auto *integer_literal = dyn_cast<IntegerLiteral>(expr)) {
+
+      return CreateRuntimeError(
+          std::move(llvm::formatv("    at {0}\nUnsupported declaration reference expression: {1}",
+                                  decl_ref_expr->getExprLoc().printToString(data.Ctx.getSourceManager()),
+                                  decl_ref_expr->getDecl()->getDeclKindName())));
+    }
+
+    if (auto *integer_literal = dyn_cast<IntegerLiteral>(expr)) {
       // pancake only supports base 10 integer literals
       llvm::SmallString<16> integer_literal_str;
       // reserve enough space for the decimal representation
-      integer_literal_str.reserve(integer_literal->getValue().getBitWidth() / 3 + 1);
+      integer_literal_str.reserve((integer_literal->getValue().getBitWidth() / 3) + 1);
       integer_literal->getValue().toString(integer_literal_str, 10, integer_literal->getType()->isSignedIntegerType());
       os << integer_literal_str;
-    } else if (auto *character_literal = dyn_cast<CharacterLiteral>(expr)) {
+      os.flush();
+      return BuiltExpr(std::move(pre_stmts), final_expr, final_expr_type, false);
+    }
+
+    if (auto *character_literal = dyn_cast<CharacterLiteral>(expr)) {
       // turn into integers because pancake doesn't support character literals
       llvm::APInt value(32, character_literal->getValue());
 
       llvm::SmallString<16> integer_literal_str;
       // reserve enough space for the decimal representation
-      integer_literal_str.reserve(value.getBitWidth() / 3 + 1);
+      integer_literal_str.reserve((value.getBitWidth() / 3) + 1);
       value.toString(integer_literal_str, 10, character_literal->getType()->isSignedIntegerType());
       os << integer_literal_str;
-    } else if (auto *c_style_cast_expr = dyn_cast<CStyleCastExpr>(expr)) {
+      os.flush();
+      return BuiltExpr(std::move(pre_stmts), final_expr, final_expr_type, false);
+    }
+
+    if (auto *c_style_cast_expr = dyn_cast<CStyleCastExpr>(expr)) {
       auto *sub_expr = c_style_cast_expr->getSubExpr();
       auto res = TraverseExpr(BuildExprCtx(sub_expr, Usage::Value));
       if (auto error = res.takeError()) {
@@ -261,7 +346,11 @@ public:
       // pancake doesn't have casts so we just ignore them
       os << res->final_expr;
       pre_stmts.insert(pre_stmts.end(), res->pre_stmts.begin(), res->pre_stmts.end());
-    } else if (auto *binary_operator = dyn_cast<BinaryOperator>(expr)) {
+      os.flush();
+      return BuiltExpr(std::move(pre_stmts), final_expr, final_expr_type, res->is_on_heap);
+    }
+
+    if (auto *binary_operator = dyn_cast<BinaryOperator>(expr)) {
       auto *lhs = binary_operator->getLHS()->IgnoreParenImpCasts();
       auto *rhs = binary_operator->getRHS()->IgnoreParenImpCasts();
 
@@ -282,7 +371,36 @@ public:
                                       binary_operator->getExprLoc().printToString(data.Ctx.getSourceManager()))));
         }
 
-        // TODO deal with arrays and other stuff
+        if (lhs_res->is_on_heap) {
+          if (!lhs_res->alignment.has_value()) {
+            return CreateRuntimeError(
+                std::move(llvm::formatv("    at {0}\nHeap variable has no alignment information",
+                                        binary_operator->getExprLoc().printToString(data.Ctx.getSourceManager()))));
+          }
+
+          switch (lhs_res->alignment.value()) {
+          case 1:
+            os << "st8";
+            break;
+          case 4:
+            os << "st32";
+            break;
+          case 8:
+            os << "st";
+            break;
+          default:
+            return CreateRuntimeError(std::move(llvm::formatv(
+                "    at {0}\nUnsupported global variable alignment: {1} bytes",
+                binary_operator->getExprLoc().printToString(data.Ctx.getSourceManager()), lhs_res->alignment.value())));
+          }
+          // TODO add support for shared stores
+          os << llvm::formatv(" {0}, {1}", lhs_res->final_expr, rhs_res->final_expr);
+
+          pre_stmts.insert(pre_stmts.end(), rhs_res->pre_stmts.begin(), rhs_res->pre_stmts.end());
+          pre_stmts.insert(pre_stmts.end(), lhs_res->pre_stmts.begin(), lhs_res->pre_stmts.end());
+          break;
+        }
+
         pre_stmts.push_back(llvm::formatv("{0} = {1};", lhs_res->final_expr, rhs_res->final_expr).str());
         if (ctx.usage_kind == Usage::Value) {
           os << lhs_res->final_expr;
@@ -350,7 +468,6 @@ public:
                                       binary_operator->getExprLoc().printToString(data.Ctx.getSourceManager()))));
         }
 
-        // don't return a pre stmt no matter what since these can be arbitrarily nested
         os << llvm::formatv("({0} {1} {2})", lhs_res->final_expr,
                             BinaryOperator::getOpcodeStr(binary_operator->getOpcode()), rhs_res->final_expr);
 
@@ -367,34 +484,57 @@ public:
         break;
       }
       }
-    } else if (auto *unary_operator = dyn_cast<UnaryOperator>(expr)) {
+
+      os.flush();
+      return BuiltExpr(std::move(pre_stmts), final_expr, final_expr_type, false);
+    }
+
+    if (auto *unary_operator = dyn_cast<UnaryOperator>(expr)) {
       auto *sub_expr = unary_operator->getSubExpr()->IgnoreParenImpCasts();
 
       switch (unary_operator->getOpcode()) {
       case UO_Deref: {
-        auto res = TraverseExpr(BuildExprCtx(sub_expr, Usage::Value));
-        if (auto error = res.takeError()) {
-          return std::move(error);
+        switch (ctx.usage_kind) {
+        case Usage::Value: {
+          break;
+        }
+        case Usage::Place: {
+          // this branch happens if you have something like *p = 3; where p is a pointer to a variable
+          // the *p is the expr here and the usage kind is place because it's the LHS of an assignment
+          // we basically treat the *p as &p - funny how that works out
+          break;
+        }
+        default: {
+          return CreateRuntimeError(
+              std::move(llvm::formatv("    at {0}\nUnsupported usage kind for dereference operator: {1}",
+                                      unary_operator->getExprLoc().printToString(data.Ctx.getSourceManager()),
+                                      static_cast<uint8_t>(ctx.usage_kind))));
+        }
         }
 
-        if (ctx.usage_kind == Usage::Place) {
-          // this expr is the LHS of an assignment
-          os << res->final_expr;
-        } else {
-          // extract into temp var
-          std::string const tmp_var_name = GetTempVarName("Deref");
+        // auto res = TraverseExpr(BuildExprCtx(sub_expr, Usage::Value));
+        // if (auto error = res.takeError()) {
+        //   return std::move(error);
+        // }
 
-          auto decl_type = final_expr_type;
-          if (final_expr_type->isArrayType()) {
-            // Can't copy-initialize an array object. Declare a pointer to the array's element type instead
-            const auto *array_type = data.Ctx.getAsArrayType(final_expr_type);
-            decl_type = data.Ctx.getPointerType(array_type->getElementType());
-          }
-          pre_stmts.push_back(llvm::formatv("{0} = *{1};", PrintType(decl_type, tmp_var_name), res->final_expr).str());
-          os << tmp_var_name;
-        }
+        // if (ctx.usage_kind == Usage::Place) {
+        //   // this expr is the LHS of an assignment
+        //   os << res->final_expr;
+        // } else {
+        //   // extract into temp var
+        //   std::string const tmp_var_name = GetTempVarName("Deref");
 
-        pre_stmts.insert(pre_stmts.end(), res->pre_stmts.begin(), res->pre_stmts.end());
+        //   auto decl_type = final_expr_type;
+        //   if (final_expr_type->isArrayType()) {
+        //     // Can't copy-initialize an array object. Declare a pointer to the array's element type instead
+        //     const auto *array_type = data.Ctx.getAsArrayType(final_expr_type);
+        //     decl_type = data.Ctx.getPointerType(array_type->getElementType());
+        //   }
+        //   pre_stmts.push_back(llvm::formatv("{0} = *{1};", PrintType(decl_type, tmp_var_name),
+        //   res->final_expr).str()); os << tmp_var_name;
+        // }
+
+        // pre_stmts.insert(pre_stmts.end(), res->pre_stmts.begin(), res->pre_stmts.end());
         break;
       }
 
