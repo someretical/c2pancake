@@ -146,7 +146,7 @@ public:
         // TODO replace with comment that includes the address
 
         data.replacements.emplace_back(
-            data.Ctx.getSourceManager(), var_decl->getSourceRange(),
+            data.Ctx.getSourceManager(), CharSourceRange::getTokenRange(var_decl->getSourceRange()),
             llvm::formatv("/* \"{0}\" at offset 0x{0:x} */", var_decl->getName(), addr).str(), data.Ctx.getLangOpts());
         continue;
       }
@@ -177,7 +177,7 @@ public:
         llvm::SmallVector<std::string> stmts;
         stmts.reserve(compound_stmt->size());
         for (auto *stmt : compound_stmt->body()) {
-          auto res = TraverseStmt(stmt);
+          auto res = BuildStmt(stmt);
           if (auto error = res.takeError()) {
             data.error = std::move(error);
             return false;
@@ -200,7 +200,8 @@ public:
         }
         os << "}\n";
         os.flush();
-        data.replacements.emplace_back(data.Ctx.getSourceManager(), func_decl->getSourceRange(), replacement_text,
+        data.replacements.emplace_back(data.Ctx.getSourceManager(),
+                                       CharSourceRange::getTokenRange(func_decl->getSourceRange()), replacement_text,
                                        data.Ctx.getLangOpts());
       } else {
         data.error = CreateRuntimeError("Function body is not a compound statement\n    at " +
@@ -212,12 +213,12 @@ public:
     return false;
   }
 
-  auto TraverseStmt(Stmt *stmt) -> Expected<std::string> {
+  auto BuildStmt(Stmt *stmt) -> Expected<std::string> {
     std::string replacement_text;
     llvm::raw_string_ostream os(replacement_text);
     if (auto *compound_stmt = llvm::dyn_cast<CompoundStmt>(stmt)) {
       for (auto *sub_stmt : compound_stmt->body()) {
-        auto result = TraverseStmt(sub_stmt);
+        auto result = BuildStmt(sub_stmt);
         if (auto error = result.takeError()) {
           return std::move(error);
         }
@@ -250,7 +251,7 @@ public:
                               stmt->getBeginLoc().printToString(data.Ctx.getSourceManager()));
   }
 
-  auto TraverseExpr(const BuildExprCtx &ctx) -> Expected<BuiltExpr> {
+  auto BuildExpr(const BuildExprCtx &ctx) -> Expected<BuiltExpr> {
     auto *expr = ctx.expr->IgnoreParenImpCasts();
 
     llvm::SmallVector<std::string, 8> pre_stmts;
@@ -338,7 +339,7 @@ public:
 
     if (auto *c_style_cast_expr = dyn_cast<CStyleCastExpr>(expr)) {
       auto *sub_expr = c_style_cast_expr->getSubExpr();
-      auto res = TraverseExpr(BuildExprCtx(sub_expr, Usage::Value));
+      auto res = BuildExpr(BuildExprCtx(sub_expr, Usage::Value));
       if (auto error = res.takeError()) {
         return std::move(error);
       }
@@ -356,11 +357,11 @@ public:
 
       switch (binary_operator->getOpcode()) {
       case BO_Assign: {
-        auto rhs_res = TraverseExpr(BuildExprCtx(rhs, Usage::Value));
+        auto rhs_res = BuildExpr(BuildExprCtx(rhs, Usage::Value));
         if (auto error = rhs_res.takeError()) {
           return std::move(error);
         }
-        auto lhs_res = TraverseExpr(BuildExprCtx(lhs, Usage::Place));
+        auto lhs_res = BuildExpr(BuildExprCtx(lhs, Usage::Place));
         if (auto error = lhs_res.takeError()) {
           return std::move(error);
         }
@@ -395,15 +396,11 @@ public:
           }
           // TODO add support for shared stores
           os << llvm::formatv(" {0}, {1}", lhs_res->final_expr, rhs_res->final_expr);
-
-          pre_stmts.insert(pre_stmts.end(), rhs_res->pre_stmts.begin(), rhs_res->pre_stmts.end());
-          pre_stmts.insert(pre_stmts.end(), lhs_res->pre_stmts.begin(), lhs_res->pre_stmts.end());
-          break;
-        }
-
-        pre_stmts.push_back(llvm::formatv("{0} = {1};", lhs_res->final_expr, rhs_res->final_expr).str());
-        if (ctx.usage_kind == Usage::Value) {
-          os << lhs_res->final_expr;
+        } else {
+          pre_stmts.push_back(llvm::formatv("{0} = {1};", lhs_res->final_expr, rhs_res->final_expr).str());
+          if (ctx.usage_kind == Usage::Value) {
+            os << lhs_res->final_expr;
+          }
         }
 
         pre_stmts.insert(pre_stmts.end(), rhs_res->pre_stmts.begin(), rhs_res->pre_stmts.end());
@@ -453,11 +450,11 @@ public:
       case BO_Xor:
         [[fallthrough]];
       case BO_Or: {
-        auto rhs_res = TraverseExpr(BuildExprCtx(rhs, Usage::Value));
+        auto rhs_res = BuildExpr(BuildExprCtx(rhs, Usage::Value));
         if (auto error = rhs_res.takeError()) {
           return std::move(error);
         }
-        auto lhs_res = TraverseExpr(BuildExprCtx(lhs, Usage::Value));
+        auto lhs_res = BuildExpr(BuildExprCtx(lhs, Usage::Value));
         if (auto error = lhs_res.takeError()) {
           return std::move(error);
         }
@@ -496,12 +493,46 @@ public:
       case UO_Deref: {
         switch (ctx.usage_kind) {
         case Usage::Value: {
+          auto sub_expr_res = BuildExpr(BuildExprCtx(sub_expr, Usage::Value));
+          if (auto error = sub_expr_res.takeError()) {
+            return std::move(error);
+          }
+          // get size and alignment of the dereferenced type
+          auto deref_type = sub_expr->getType()->getPointeeType();
+          // auto align_bytes = (uint64_t)data.Ctx.getTypeAlignInChars(deref_type).getQuantity();
+          auto size_bytes = (uint64_t)data.Ctx.getTypeSizeInChars(deref_type).getQuantity();
+          switch (size_bytes) {
+          case 1:
+            os << "ld8";
+            break;
+          case 4:
+            os << "ld32";
+            break;
+          case 8:
+            os << "lds 1";
+            break;
+          default:
+            return CreateRuntimeError(std::move(
+                llvm::formatv("    at {0}\nUnsupported dereferenced type size: {1} bytes",
+                              unary_operator->getExprLoc().printToString(data.Ctx.getSourceManager()), size_bytes)));
+          }
+          // TODO add support for shared loads
+          os << llvm::formatv(" {0}", sub_expr_res->final_expr);
+          pre_stmts.insert(pre_stmts.end(), sub_expr_res->pre_stmts.begin(), sub_expr_res->pre_stmts.end());
           break;
         }
+
         case Usage::Place: {
           // this branch happens if you have something like *p = 3; where p is a pointer to a variable
           // the *p is the expr here and the usage kind is place because it's the LHS of an assignment
           // we basically treat the *p as &p - funny how that works out
+
+          auto sub_expr_res = BuildExpr(BuildExprCtx(sub_expr, Usage::Place));
+          if (auto error = sub_expr_res.takeError()) {
+            return std::move(error);
+          }
+          os << sub_expr_res->final_expr;
+          pre_stmts.insert(pre_stmts.end(), sub_expr_res->pre_stmts.begin(), sub_expr_res->pre_stmts.end());
           break;
         }
         default: {
@@ -511,122 +542,150 @@ public:
                                       static_cast<uint8_t>(ctx.usage_kind))));
         }
         }
-
-        // auto res = TraverseExpr(BuildExprCtx(sub_expr, Usage::Value));
-        // if (auto error = res.takeError()) {
-        //   return std::move(error);
-        // }
-
-        // if (ctx.usage_kind == Usage::Place) {
-        //   // this expr is the LHS of an assignment
-        //   os << res->final_expr;
-        // } else {
-        //   // extract into temp var
-        //   std::string const tmp_var_name = GetTempVarName("Deref");
-
-        //   auto decl_type = final_expr_type;
-        //   if (final_expr_type->isArrayType()) {
-        //     // Can't copy-initialize an array object. Declare a pointer to the array's element type instead
-        //     const auto *array_type = data.Ctx.getAsArrayType(final_expr_type);
-        //     decl_type = data.Ctx.getPointerType(array_type->getElementType());
-        //   }
-        //   pre_stmts.push_back(llvm::formatv("{0} = *{1};", PrintType(decl_type, tmp_var_name),
-        //   res->final_expr).str()); os << tmp_var_name;
-        // }
-
-        // pre_stmts.insert(pre_stmts.end(), res->pre_stmts.begin(), res->pre_stmts.end());
         break;
       }
 
-      case UO_AddrOf:
-        [[fallthrough]];
-      case UO_Plus:
-        [[fallthrough]];
-      case UO_Minus:
-        [[fallthrough]];
-      case UO_Not:
-        [[fallthrough]];
-      case UO_LNot:
-        [[fallthrough]];
-      case UO_Real:
-        [[fallthrough]];
-      case UO_Imag:
-        [[fallthrough]];
-      case UO_Extension: {
-        auto sub_expr_usage = GetUsage(data.Ctx, sub_expr);
-        if (auto error = sub_expr_usage.takeError()) {
+      case UO_AddrOf: {
+        auto sub_expr_res = BuildExpr(BuildExprCtx(sub_expr, Usage::Place));
+        if (auto error = sub_expr_res.takeError()) {
           return std::move(error);
         }
-        auto res = BuildExpr(BuildExprCtx(sub_expr, *sub_expr_usage, ctx.deref_force_extract, ctx.assigned_to,
-                                          ctx.string_literal_usage_kind));
-        if (auto error = res.takeError()) {
-          return std::move(error);
-        }
-        os << llvm::formatv("{0}{1}", UnaryOperator::getOpcodeStr(unary_operator->getOpcode()).str(), res->final_expr);
-        pre_stmts.insert(pre_stmts.end(), res->pre_stmts.begin(), res->pre_stmts.end());
+        os << sub_expr_res->final_expr;
+        pre_stmts.insert(pre_stmts.end(), sub_expr_res->pre_stmts.begin(), sub_expr_res->pre_stmts.end());
         break;
       }
 
+      case UO_Plus: {
+        auto sub_expr_res = BuildExpr(BuildExprCtx(sub_expr, Usage::Value));
+        if (auto error = sub_expr_res.takeError()) {
+          return std::move(error);
+        }
+        os << "(0 + " << sub_expr_res->final_expr << ")";
+        pre_stmts.insert(pre_stmts.end(), sub_expr_res->pre_stmts.begin(), sub_expr_res->pre_stmts.end());
+        break;
+      }
+
+      case UO_Minus: {
+        auto sub_expr_res = BuildExpr(BuildExprCtx(sub_expr, Usage::Value));
+        if (auto error = sub_expr_res.takeError()) {
+          return std::move(error);
+        }
+        os << "(0 - " << sub_expr_res->final_expr << ")";
+        pre_stmts.insert(pre_stmts.end(), sub_expr_res->pre_stmts.begin(), sub_expr_res->pre_stmts.end());
+        break;
+      }
+
+      case UO_Not: {
+        auto sub_expr_res = BuildExpr(BuildExprCtx(sub_expr, Usage::Value));
+        if (auto error = sub_expr_res.takeError()) {
+          return std::move(error);
+        }
+        os << "(-1 ^ " << sub_expr_res->final_expr << ")";
+        pre_stmts.insert(pre_stmts.end(), sub_expr_res->pre_stmts.begin(), sub_expr_res->pre_stmts.end());
+        break;
+      }
+
+      case UO_LNot: {
+        auto sub_expr_res = BuildExpr(BuildExprCtx(sub_expr, Usage::Value));
+        if (auto error = sub_expr_res.takeError()) {
+          return std::move(error);
+        }
+        os << "!" << sub_expr_res->final_expr;
+        pre_stmts.insert(pre_stmts.end(), sub_expr_res->pre_stmts.begin(), sub_expr_res->pre_stmts.end());
+        break;
+      }
       default: {
-        if (ctx.usage_kind == Usage::Place) {
-          return CreateRuntimeError(
-              std::move(llvm::formatv("    at {0}\nUnary operator cannot be used as a place expression",
-                                      unary_operator->getExprLoc().printToString(data.Ctx.getSourceManager()))));
-        }
+        return CreateRuntimeError(
+            std::move(llvm::formatv("    at {0}\nUnhandled unary operator: {1}",
+                                    unary_operator->getExprLoc().printToString(data.Ctx.getSourceManager()),
+                                    UnaryOperator::getOpcodeStr(unary_operator->getOpcode()).str())));
         break;
       }
       }
-    } else if (auto *call_expr = dyn_cast<CallExpr>(expr)) {
+
+      os.flush();
+      return BuiltExpr(std::move(pre_stmts), final_expr, final_expr_type, false);
+    }
+
+    if (auto *call_expr = dyn_cast<CallExpr>(expr)) {
       llvm::SmallVector<BuiltExpr, 4> arg_built_exprs;
       for (auto *arg : call_expr->arguments()) {
-        auto res = BuildExpr(BuildExprCtx(arg->IgnoreParenImpCasts(), Usage::Value, ctx.deref_force_extract,
-                                          ctx.assigned_to, ctx.string_literal_usage_kind));
+        auto res = BuildExpr(BuildExprCtx(arg->IgnoreParenImpCasts(), Usage::Value));
         if (auto error = res.takeError()) {
           return error;
         }
         arg_built_exprs.push_back(std::move(*res));
       }
-      // TODO
-      // it's possible for getDirectCallee to return nullptr, but I don't know what to do in that case...
-      // TODO throw error on any function pointers
-      os << llvm::formatv("{0}({1})", call_expr->getDirectCallee()->getName().str(),
-                          llvm::join(arg_built_exprs | std::views::transform([](const BuiltExpr &e) -> std::string {
-                                       return e.final_expr;
-                                     }),
-                                     ", "));
+      auto args_str = llvm::join(
+          arg_built_exprs | std::views::transform([](const BuiltExpr &e) -> std::string { return e.final_expr; }),
+          ", ");
+
+      auto callee_name = call_expr->getDirectCallee() != nullptr ? call_expr->getDirectCallee()->getName().str() : "";
+      if (callee_name.empty()) {
+        return CreateRuntimeError(
+            std::move(llvm::formatv("    at {0}\nFunction pointer calls are not supported",
+                                    call_expr->getExprLoc().printToString(data.Ctx.getSourceManager()))));
+      }
+
+      if (callee_name.starts_with("__c2pnk_ffi_wrapper_")) {
+        os << llvm::formatv("@{0}({1})", callee_name, args_str);
+      } else {
+        os << llvm::formatv("{0}({1})", callee_name, args_str);
+      }
       for (auto &&built_expr : arg_built_exprs | std::views::reverse) {
         pre_stmts.insert(pre_stmts.end(), built_expr.pre_stmts.begin(), built_expr.pre_stmts.end());
       }
-    } else if (auto *member_expr = dyn_cast<MemberExpr>(expr)) {
-      if (member_expr->isArrow()) {
-        llvm::outs() << "member expr location: "
-                     << member_expr->getBeginLoc().printToString(data.Ctx.getSourceManager()) << "\n";
-      }
+
+      os.flush();
+      return BuiltExpr(std::move(pre_stmts), final_expr, final_expr_type, false);
+    }
+
+    if (auto *member_expr = dyn_cast<MemberExpr>(expr)) {
       if (member_expr->isArrow()) {
         return CreateRuntimeError(
             std::move(llvm::formatv("    at {0}\nArrow member access is not allowed here",
                                     member_expr->getBeginLoc().printToString(data.Ctx.getSourceManager()))));
       }
 
-      auto res = BuildExpr(BuildExprCtx(member_expr->getBase()->IgnoreParenImpCasts(), Usage::Place,
-                                        ctx.deref_force_extract, ctx.assigned_to, ctx.string_literal_usage_kind));
-      if (auto error = res.takeError()) {
-        return error;
+      // doesn't matter if the usage context is place or value, we just return the member offset
+      auto *member_decl = member_expr->getMemberDecl();
+      if (auto *field_decl = llvm::dyn_cast<FieldDecl>(member_decl)) {
+        auto *record_decl = field_decl->getParent();
+        const auto &layout = data.Ctx.getASTRecordLayout(record_decl);
+
+        auto offset_in_bits = layout.getFieldOffset(field_decl->getFieldIndex());
+        if (offset_in_bits % 8 != 0) {
+          return CreateRuntimeError(std::move(llvm::formatv(
+              "    at {0}\nUnsupported member access: {1} has an offset that is not a multiple of 8 bits",
+              member_expr->getBeginLoc().printToString(data.Ctx.getSourceManager()), field_decl->getName())));
+        }
+        auto offset_in_bytes = offset_in_bits / 8;
+
+        auto member_base_expr = BuildExpr(BuildExprCtx(member_expr->getBase()->IgnoreParenImpCasts(), Usage::Place));
+        if (auto error = member_base_expr.takeError()) {
+          return error;
+        }
+
+        os << llvm::formatv("{0} + {1}", member_base_expr->final_expr, offset_in_bytes);
+        os.flush();
+        pre_stmts.insert(pre_stmts.end(), member_base_expr->pre_stmts.begin(), member_base_expr->pre_stmts.end());
+        return BuiltExpr(std::move(pre_stmts), final_expr, final_expr_type, member_base_expr->is_on_heap,
+                         member_base_expr->alignment);
       }
-      os << llvm::formatv("({0}).{1}", res->final_expr, member_expr->getMemberNameInfo().getAsString());
-      pre_stmts.insert(pre_stmts.end(), res->pre_stmts.begin(), res->pre_stmts.end());
-    } else {
-      if (auto error = PrintSourceText(os, expr, data.Ctx)) {
-        return llvm::joinErrors(CreateRuntimeError(std::move(
-                                    llvm::formatv("\n    at {0}\nFailed to print source text for expression",
-                                                  expr->getBeginLoc().printToString(data.Ctx.getSourceManager())))),
-                                std::move(error));
-      }
+      return CreateRuntimeError(std::move(llvm::formatv(
+          "    at {0}\nUnsupported member access: {1}",
+          member_expr->getBeginLoc().printToString(data.Ctx.getSourceManager()), member_decl->getDeclKindName())));
     }
 
-  build_expr_end:
+    if (auto error = PrintSourceText(os, expr, data.Ctx)) {
+      return llvm::joinErrors(
+          CreateRuntimeError(std::move(llvm::formatv("\n    at {0}\nFailed to print source text for expression",
+                                                     expr->getBeginLoc().printToString(data.Ctx.getSourceManager())))),
+          std::move(error));
+    }
+
     os.flush();
-    return BuiltExpr(pre_stmts, final_expr, final_expr_type);
+    return BuiltExpr(std::move(pre_stmts), final_expr, final_expr_type, false);
   }
 };
 } // namespace
