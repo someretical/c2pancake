@@ -124,8 +124,9 @@ public:
 
       if (auto *var_decl = llvm::dyn_cast<VarDecl>(decl)) {
         if (!var_decl->hasGlobalStorage()) {
-          data.error = CreateRuntimeError("Non-global variable declaration at top-level\n    at " +
-                                          var_decl->getBeginLoc().printToString(data.Ctx.getSourceManager()));
+          data.error = CreateRuntimeError(std::move(
+              llvm::formatv("\n    at {0}\nNon-global variable declaration at top-level: {1}",
+                            var_decl->getBeginLoc().printToString(data.Ctx.getSourceManager()), var_decl->getName())));
           return false;
         }
 
@@ -137,8 +138,9 @@ public:
         data.next_global_var_addr = addr + size_bytes;
 
         if (data.global_var_map.contains(var_decl)) {
-          data.error = CreateRuntimeError("Duplicate global variable declaration at top-level\n    at " +
-                                          var_decl->getBeginLoc().printToString(data.Ctx.getSourceManager()));
+          data.error = CreateRuntimeError(std::move(
+              llvm::formatv("\n    at {0}\nDuplicate global variable declaration at top-level: {1}",
+                            var_decl->getBeginLoc().printToString(data.Ctx.getSourceManager()), var_decl->getName())));
           return false;
         }
 
@@ -147,12 +149,13 @@ public:
 
         data.replacements.emplace_back(
             data.Ctx.getSourceManager(), CharSourceRange::getTokenRange(var_decl->getSourceRange()),
-            llvm::formatv("/* \"{0}\" at offset 0x{0:x} */", var_decl->getName(), addr).str(), data.Ctx.getLangOpts());
+            llvm::formatv("/* \"{0}\" at offset {1:x} */", var_decl->getName(), addr).str(), data.Ctx.getLangOpts());
         continue;
       }
 
-      data.error = CreateRuntimeError("Unexpected top-level declaration\n    at " +
-                                      decl->getBeginLoc().printToString(data.Ctx.getSourceManager()));
+      data.error = CreateRuntimeError(std::move(
+          llvm::formatv("\n    at {0}\nUnexpected top-level declaration: {1}",
+                        decl->getBeginLoc().printToString(data.Ctx.getSourceManager()), decl->getDeclKindName())));
       return false;
     }
 
@@ -204,13 +207,14 @@ public:
                                        CharSourceRange::getTokenRange(func_decl->getSourceRange()), replacement_text,
                                        data.Ctx.getLangOpts());
       } else {
-        data.error = CreateRuntimeError("Function body is not a compound statement\n    at " +
-                                        body->getBeginLoc().printToString(data.Ctx.getSourceManager()));
+        data.error = CreateRuntimeError(std::move(
+            llvm::formatv("\n    at {0}\nFunction body is not a compound statement: {1}",
+                          body->getBeginLoc().printToString(data.Ctx.getSourceManager()), func_decl->getName())));
         return false;
       }
     }
 
-    return false;
+    return true;
   }
 
   auto BuildStmt(Stmt *stmt) -> Expected<std::string> {
@@ -235,20 +239,139 @@ public:
       llvm::raw_string_ostream os(replacement_text);
       for (auto *decl : decl_stmt->decls()) {
         if (auto *var_decl = llvm::dyn_cast<VarDecl>(decl)) {
-          // TODO handle shapes and stuff in the future...
-          os << "var 1 " << var_decl->getName() << ";\n";
+          if (var_decl->hasInit()) {
+            auto *init_expr = var_decl->getInit();
+            auto res = BuildExpr(BuildExprCtx(init_expr, Usage::Value));
+            if (auto error = res.takeError()) {
+              return std::move(error);
+            }
+
+            for (auto &&pre_stmt : res->pre_stmts) {
+              os << pre_stmt << "\n";
+            }
+            os << "var 1 " << var_decl->getName() << " = " << res->final_expr << ";";
+          } else {
+            // TODO handle shapes and stuff in the future...
+            os << "var 1 " << var_decl->getName() << " = 0;";
+          }
           continue;
         }
 
-        return CreateRuntimeError("Unexpected declaration statement\n    at " +
-                                  decl->getBeginLoc().printToString(data.Ctx.getSourceManager()));
+        return CreateRuntimeError(std::move(
+            llvm::formatv("\n    at {0}\nUnexpected declaration statement: {1}",
+                          decl->getBeginLoc().printToString(data.Ctx.getSourceManager()), decl->getDeclKindName())));
       }
 
       return replacement_text;
     }
 
-    return CreateRuntimeError("Unexpected statement\n    at " +
-                              stmt->getBeginLoc().printToString(data.Ctx.getSourceManager()));
+    if (auto *return_stmt = llvm::dyn_cast<ReturnStmt>(stmt)) {
+      auto *ret_expr = return_stmt->getRetValue();
+      if (ret_expr == nullptr) {
+        return CreateRuntimeError(
+            std::move(llvm::formatv("\n    at {0}\nReturn statement has no return value",
+                                    return_stmt->getBeginLoc().printToString(data.Ctx.getSourceManager()))));
+      }
+
+      auto res = BuildExpr(BuildExprCtx(ret_expr, Usage::Value));
+      if (auto error = res.takeError()) {
+        return std::move(error);
+      }
+
+      for (auto &&pre_stmt : res->pre_stmts) {
+        os << pre_stmt << "\n";
+      }
+      os << "return " << res->final_expr << ";\n";
+      os.flush();
+      return replacement_text;
+    }
+
+    if (auto *if_stmt = llvm::dyn_cast<IfStmt>(stmt)) {
+      auto *cond = if_stmt->getCond();
+      auto res = BuildExpr(BuildExprCtx(cond, Usage::Value));
+      if (auto error = res.takeError()) {
+        return std::move(error);
+      }
+
+      auto *then_stmt = if_stmt->getThen();
+      auto then_res = BuildStmt(then_stmt);
+      if (auto error = then_res.takeError()) {
+        return std::move(error);
+      }
+
+      for (auto &&pre_stmt : res->pre_stmts) {
+        os << pre_stmt << "\n";
+      }
+      os << "if (" << res->final_expr << ") {\n";
+      os << then_res.get();
+      os << "}\n";
+
+      if (auto *else_stmt = if_stmt->getElse()) {
+        auto else_res = BuildStmt(else_stmt);
+        if (auto error = else_res.takeError()) {
+          return std::move(error);
+        }
+
+        os << "else {\n";
+        os << else_res.get();
+        os << "}\n";
+      }
+
+      os.flush();
+      return replacement_text;
+    }
+
+    if (auto *while_stmt = llvm::dyn_cast<WhileStmt>(stmt)) {
+      auto *cond = while_stmt->getCond();
+      auto res = BuildExpr(BuildExprCtx(cond, Usage::Value));
+      if (auto error = res.takeError()) {
+        return std::move(error);
+      }
+
+      auto *body_stmt = while_stmt->getBody();
+      auto body_res = BuildStmt(body_stmt);
+      if (auto error = body_res.takeError()) {
+        return std::move(error);
+      }
+
+      for (auto &&pre_stmt : res->pre_stmts) {
+        os << pre_stmt << "\n";
+      }
+      os << "while (" << res->final_expr << ") {\n";
+      os << body_res.get();
+      os << "}\n";
+      os.flush();
+      return replacement_text;
+    }
+
+    if (auto *_ = llvm::dyn_cast<BreakStmt>(stmt)) {
+      os << "break;\n";
+      os.flush();
+      return replacement_text;
+    }
+
+    if (auto *_ = llvm::dyn_cast<NullStmt>(stmt)) {
+      return replacement_text;
+    }
+
+    if (auto *expr = llvm::dyn_cast<Expr>(stmt)) {
+      auto res = BuildExpr(BuildExprCtx(expr, Usage::Effect));
+      if (auto error = res.takeError()) {
+        return std::move(error);
+      }
+
+      for (auto &&pre_stmt : res->pre_stmts) {
+        os << pre_stmt << "\n";
+      }
+      if (!res->final_expr.empty()) {
+        os << res->final_expr << ";\n";
+      }
+      os.flush();
+      return replacement_text;
+    }
+
+    return CreateRuntimeError(llvm::formatv("\n    at {0}\nUnexpected statement {1}", stmt->getStmtClassName(),
+                                            stmt->getBeginLoc().printToString(data.Ctx.getSourceManager())));
   }
 
   auto BuildExpr(const BuildExprCtx &ctx) -> Expected<BuiltExpr> {
@@ -265,7 +388,13 @@ public:
           auto addr = data.global_var_map[var_decl];
           auto bytes = (uint64_t)data.Ctx.getTypeSizeInChars(var_decl->getType()).getQuantity();
 
-          switch (ctx.usage_kind) {
+          auto usage_kind = ctx.usage_kind;
+          // if type is array, just decay to pointer AKA place
+          if (final_expr_type->isArrayType()) {
+            usage_kind = Usage::Place;
+          }
+
+          switch (usage_kind) {
           case Usage::Value: {
             switch (bytes) {
             case 1:
@@ -278,9 +407,9 @@ public:
               os << "lds 1";
               break;
             default:
-              return CreateRuntimeError(std::move(
-                  llvm::formatv("    at {0}\nUnsupported global variable size: {1} bytes",
-                                decl_ref_expr->getExprLoc().printToString(data.Ctx.getSourceManager()), bytes)));
+              return CreateRuntimeError(std::move(llvm::formatv(
+                  "\n    at {0}\nUnsupported global variable {1} size: {2} bytes",
+                  decl_ref_expr->getExprLoc().printToString(data.Ctx.getSourceManager()), var_decl->getName(), bytes)));
             }
             // TODO add support for shared loads
             os << llvm::formatv(" @base + {0}", addr);
@@ -292,9 +421,9 @@ public:
           }
           default:
             return CreateRuntimeError(
-                std::move(llvm::formatv("    at {0}\nUnsupported usage kind for global variable: {1}",
+                std::move(llvm::formatv("\n    at {0}\nUnsupported usage kind for global variable ({1}): {2}",
                                         decl_ref_expr->getExprLoc().printToString(data.Ctx.getSourceManager()),
-                                        static_cast<uint8_t>(ctx.usage_kind))));
+                                        var_decl->getName(), static_cast<uint8_t>(ctx.usage_kind))));
           }
           os.flush();
           return BuiltExpr(std::move(pre_stmts), final_expr, final_expr_type, true,
@@ -308,7 +437,7 @@ public:
       }
 
       return CreateRuntimeError(
-          std::move(llvm::formatv("    at {0}\nUnsupported declaration reference expression: {1}",
+          std::move(llvm::formatv("\n    at {0}\nUnsupported declaration reference expression: {1}",
                                   decl_ref_expr->getExprLoc().printToString(data.Ctx.getSourceManager()),
                                   decl_ref_expr->getDecl()->getDeclKindName())));
     }
@@ -354,6 +483,7 @@ public:
     if (auto *binary_operator = dyn_cast<BinaryOperator>(expr)) {
       auto *lhs = binary_operator->getLHS()->IgnoreParenImpCasts();
       auto *rhs = binary_operator->getRHS()->IgnoreParenImpCasts();
+      auto is_on_heap = false;
 
       switch (binary_operator->getOpcode()) {
       case BO_Assign: {
@@ -368,15 +498,15 @@ public:
 
         if (ctx.usage_kind == Usage::Place) {
           return CreateRuntimeError(
-              std::move(llvm::formatv("    at {0}\nAssignment operator cannot be used as a place expression",
+              std::move(llvm::formatv("\n    at {0}\nAssignment operator cannot be used as a place expression",
                                       binary_operator->getExprLoc().printToString(data.Ctx.getSourceManager()))));
         }
 
-        if (lhs_res->is_on_heap) {
+        if (lhs_res->is_on_heap || lhs->getValueKind() == VK_LValue) {
           if (!lhs_res->alignment.has_value()) {
-            return CreateRuntimeError(
-                std::move(llvm::formatv("    at {0}\nHeap variable has no alignment information",
-                                        binary_operator->getExprLoc().printToString(data.Ctx.getSourceManager()))));
+            return CreateRuntimeError(std::move(llvm::formatv(
+                "\n    at {0}\nHeap variable ({1}) has no alignment information",
+                binary_operator->getExprLoc().printToString(data.Ctx.getSourceManager()), lhs_res->final_expr)));
           }
 
           switch (lhs_res->alignment.value()) {
@@ -391,7 +521,7 @@ public:
             break;
           default:
             return CreateRuntimeError(std::move(llvm::formatv(
-                "    at {0}\nUnsupported global variable alignment: {1} bytes",
+                "\n    at {0}\nUnsupported global variable alignment: {1} bytes",
                 binary_operator->getExprLoc().printToString(data.Ctx.getSourceManager()), lhs_res->alignment.value())));
           }
           // TODO add support for shared stores
@@ -410,12 +540,12 @@ public:
 
       case BO_Div: {
         return CreateRuntimeError(
-            std::move(llvm::formatv("    at {0}\nPancake does not support the division operator!",
+            std::move(llvm::formatv("\n    at {0}\nPancake does not support the division operator!",
                                     binary_operator->getExprLoc().printToString(data.Ctx.getSourceManager()))));
       }
       case BO_Rem: {
         return CreateRuntimeError(
-            std::move(llvm::formatv("    at {0}\nPancake does not support the modulo operator!",
+            std::move(llvm::formatv("\n    at {0}\nPancake does not support the modulo operator!",
                                     binary_operator->getExprLoc().printToString(data.Ctx.getSourceManager()))));
       }
 
@@ -460,13 +590,40 @@ public:
         }
 
         if (ctx.usage_kind == Usage::Place) {
-          return CreateRuntimeError(
-              std::move(llvm::formatv("    at {0}\nBinary operator cannot be used as a place expression",
-                                      binary_operator->getExprLoc().printToString(data.Ctx.getSourceManager()))));
+          if (!binary_operator->isAdditiveOp()) {
+            return CreateRuntimeError(std::move(
+                llvm::formatv("\n    at {0}\nNon-additive binary operator ({1}) cannot be used as a place expression",
+                              binary_operator->getExprLoc().printToString(data.Ctx.getSourceManager()),
+                              BinaryOperator::getOpcodeStr(binary_operator->getOpcode()))));
+          }
+          // Binary operator COULD be used as a place expression if it is a pointer arithmetic operation
         }
 
-        os << llvm::formatv("({0} {1} {2})", lhs_res->final_expr,
-                            BinaryOperator::getOpcodeStr(binary_operator->getOpcode()), rhs_res->final_expr);
+        /* pointer arithmetic cases:
+        int *p;
+        int *q;
+        p + 1; // valid
+        1 + p; // valid
+        p - 1; // valid
+        1 - p; // invalid
+        p + q; // invalid
+        p - q; // valid (BUT we cannot handle this case because pancake doesn't have division...)
+
+        // TODO for the last case, we technically can handle it if the size is a power of 2 because then we can just
+        shift right by log2(size) to get the number of elements between the two pointers
+        */
+
+        if (binary_operator->isAdditiveOp() &&
+            (lhs_res->final_expr_type->isPointerType() || rhs_res->final_expr_type->isPointerType())) {
+          // if either side is a pointer, we need to do pointer arithmetic
+          // get size of lhs type in bytes
+          os << llvm::formatv("({0} {1} ({2} * {3}))", lhs_res->final_expr,
+                              BinaryOperator::getOpcodeStr(binary_operator->getOpcode()), rhs_res->final_expr,
+                              lhs->getType());
+        } else {
+          os << llvm::formatv("({0} {1} {2})", lhs_res->final_expr,
+                              BinaryOperator::getOpcodeStr(binary_operator->getOpcode()), rhs_res->final_expr);
+        }
 
         pre_stmts.insert(pre_stmts.end(), rhs_res->pre_stmts.begin(), rhs_res->pre_stmts.end());
         pre_stmts.insert(pre_stmts.end(), lhs_res->pre_stmts.begin(), lhs_res->pre_stmts.end());
@@ -475,7 +632,7 @@ public:
 
       default: {
         return CreateRuntimeError(
-            std::move(llvm::formatv("    at {0}\nUnhandled binary operator: {1}",
+            std::move(llvm::formatv("\n    at {0}\nUnhandled binary operator: {1}",
                                     binary_operator->getExprLoc().printToString(data.Ctx.getSourceManager()),
                                     BinaryOperator::getOpcodeStr(binary_operator->getOpcode()))));
         break;
@@ -483,7 +640,7 @@ public:
       }
 
       os.flush();
-      return BuiltExpr(std::move(pre_stmts), final_expr, final_expr_type, false);
+      return BuiltExpr(std::move(pre_stmts), final_expr, final_expr_type, is_on_heap);
     }
 
     if (auto *unary_operator = dyn_cast<UnaryOperator>(expr)) {
@@ -513,7 +670,7 @@ public:
             break;
           default:
             return CreateRuntimeError(std::move(
-                llvm::formatv("    at {0}\nUnsupported dereferenced type size: {1} bytes",
+                llvm::formatv("\n    at {0}\nUnsupported dereferenced type size: {1} bytes",
                               unary_operator->getExprLoc().printToString(data.Ctx.getSourceManager()), size_bytes)));
           }
           // TODO add support for shared loads
@@ -537,7 +694,7 @@ public:
         }
         default: {
           return CreateRuntimeError(
-              std::move(llvm::formatv("    at {0}\nUnsupported usage kind for dereference operator: {1}",
+              std::move(llvm::formatv("\n    at {0}\nUnsupported usage kind for dereference operator: {1}",
                                       unary_operator->getExprLoc().printToString(data.Ctx.getSourceManager()),
                                       static_cast<uint8_t>(ctx.usage_kind))));
         }
@@ -596,7 +753,7 @@ public:
       }
       default: {
         return CreateRuntimeError(
-            std::move(llvm::formatv("    at {0}\nUnhandled unary operator: {1}",
+            std::move(llvm::formatv("\n    at {0}\nUnhandled unary operator: {1}",
                                     unary_operator->getExprLoc().printToString(data.Ctx.getSourceManager()),
                                     UnaryOperator::getOpcodeStr(unary_operator->getOpcode()).str())));
         break;
@@ -604,7 +761,7 @@ public:
       }
 
       os.flush();
-      return BuiltExpr(std::move(pre_stmts), final_expr, final_expr_type, false);
+      return BuiltExpr(std::move(pre_stmts), final_expr, final_expr_type, );
     }
 
     if (auto *call_expr = dyn_cast<CallExpr>(expr)) {
@@ -623,7 +780,7 @@ public:
       auto callee_name = call_expr->getDirectCallee() != nullptr ? call_expr->getDirectCallee()->getName().str() : "";
       if (callee_name.empty()) {
         return CreateRuntimeError(
-            std::move(llvm::formatv("    at {0}\nFunction pointer calls are not supported",
+            std::move(llvm::formatv("\n    at {0}\nFunction pointer calls are not supported",
                                     call_expr->getExprLoc().printToString(data.Ctx.getSourceManager()))));
       }
 
@@ -643,7 +800,7 @@ public:
     if (auto *member_expr = dyn_cast<MemberExpr>(expr)) {
       if (member_expr->isArrow()) {
         return CreateRuntimeError(
-            std::move(llvm::formatv("    at {0}\nArrow member access is not allowed here",
+            std::move(llvm::formatv("\n    at {0}\nArrow member access is not allowed here",
                                     member_expr->getBeginLoc().printToString(data.Ctx.getSourceManager()))));
       }
 
@@ -656,7 +813,7 @@ public:
         auto offset_in_bits = layout.getFieldOffset(field_decl->getFieldIndex());
         if (offset_in_bits % 8 != 0) {
           return CreateRuntimeError(std::move(llvm::formatv(
-              "    at {0}\nUnsupported member access: {1} has an offset that is not a multiple of 8 bits",
+              "\n    at {0}\nUnsupported member access: {1} has an offset that is not a multiple of 8 bits",
               member_expr->getBeginLoc().printToString(data.Ctx.getSourceManager()), field_decl->getName())));
         }
         auto offset_in_bytes = offset_in_bits / 8;
@@ -673,7 +830,7 @@ public:
                          member_base_expr->alignment);
       }
       return CreateRuntimeError(std::move(llvm::formatv(
-          "    at {0}\nUnsupported member access: {1}",
+          "\n    at {0}\nUnsupported member access: {1}",
           member_expr->getBeginLoc().printToString(data.Ctx.getSourceManager()), member_decl->getDeclKindName())));
     }
 

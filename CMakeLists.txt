@@ -42,18 +42,16 @@ add_executable(
   src/Utils.cpp
   src/Pipeline.cpp
   src/Pass_C2Pancake.cpp
-  src/Pass_InjectHeaders.cpp
   src/Pass_FunctionCalling.cpp
-  src/Pass_LowerBitfieldOps.cpp
-  src/Pass_IntegerConversion.cpp
-  src/Pass_TransformLogicalExpressions.cpp
-  src/Pass_NormaliseIfStatements.cpp
-  src/Pass_SwitchToIf.cpp
-  src/Pass_LoopsToWhile.cpp
-  src/Pass_PromoteRecords.cpp
   src/Pass_HoistArraysAndAddresses.cpp
-  src/CodeGen.cpp
-  src/IRBuilder.cpp
+  src/Pass_InjectHeaders.cpp
+  src/Pass_IntegerConversion.cpp
+  src/Pass_LoopsToWhile.cpp
+  src/Pass_LowerBitfieldOps.cpp
+  src/Pass_NormaliseIfStatements.cpp
+  src/Pass_PromoteRecords.cpp
+  src/Pass_SwitchToIf.cpp
+  src/Pass_TransformLogicalExpressions.cpp
   src/main.cpp)
 
 target_include_directories(c2pancake PRIVATE include)

@@ -10,7 +10,7 @@
             "request": "launch",
             "program": "${command:cmake.getLaunchTargetPath}",
             "args": [
-                "--end=RewriteFunctionCalling",
+                // "--end=RewriteFunctionCalling",
                 "${file}",
                 "--",
                 // "--target=aarch64-linux-gnu",
@@ -18,6 +18,9 @@
             ],
             "stopAtEntry": false,
             "cwd": "${workspaceFolder}",
+            "sourceFileMap": {
+                "/scratch/yankai/c2pancake": "${workspaceFolder}"
+            },
             "environment": [],
             "externalConsole": false,
             "MIMode": "gdb",
