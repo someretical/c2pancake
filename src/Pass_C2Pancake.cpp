@@ -80,12 +80,11 @@ struct BuiltExpr {
   llvm::SmallVector<std::string, 8> pre_stmts;
   clang::QualType final_expr_type;
   std::string final_expr;
-  bool is_on_heap;
-  std::optional<size_t> alignment;
+  std::optional<size_t> heap_alignment;
   explicit BuiltExpr(llvm::SmallVector<std::string, 8> pre_stmts, std::string final_expr,
-                     clang::QualType final_expr_type, bool is_on_heap, std::optional<size_t> alignment = std::nullopt)
+                     clang::QualType final_expr_type, std::optional<size_t> heap_alignment)
       : pre_stmts(std::move(pre_stmts)), final_expr_type(final_expr_type), final_expr(std::move(final_expr)),
-        is_on_heap(is_on_heap), alignment(alignment) {}
+        heap_alignment(heap_alignment) {}
 };
 
 class Worker : public RecursiveASTVisitor<Worker> {
@@ -394,6 +393,8 @@ public:
             usage_kind = Usage::Place;
           }
 
+          std::optional<size_t> heap_alignment = std::nullopt;
+
           switch (usage_kind) {
           case Usage::Value: {
             switch (bytes) {
@@ -426,14 +427,14 @@ public:
                                         var_decl->getName(), static_cast<uint8_t>(ctx.usage_kind))));
           }
           os.flush();
-          return BuiltExpr(std::move(pre_stmts), final_expr, final_expr_type, true,
+          return BuiltExpr(std::move(pre_stmts), final_expr, final_expr_type,
                            (size_t)data.Ctx.getTypeAlignInChars(var_decl->getType()).getQuantity());
         }
 
         // local var
         os << var_decl->getName();
         os.flush();
-        return BuiltExpr(std::move(pre_stmts), final_expr, final_expr_type, false);
+        return BuiltExpr(std::move(pre_stmts), final_expr, final_expr_type, std::nullopt);
       }
 
       return CreateRuntimeError(
@@ -450,7 +451,7 @@ public:
       integer_literal->getValue().toString(integer_literal_str, 10, integer_literal->getType()->isSignedIntegerType());
       os << integer_literal_str;
       os.flush();
-      return BuiltExpr(std::move(pre_stmts), final_expr, final_expr_type, false);
+      return BuiltExpr(std::move(pre_stmts), final_expr, final_expr_type, std::nullopt);
     }
 
     if (auto *character_literal = dyn_cast<CharacterLiteral>(expr)) {
@@ -463,12 +464,13 @@ public:
       value.toString(integer_literal_str, 10, character_literal->getType()->isSignedIntegerType());
       os << integer_literal_str;
       os.flush();
-      return BuiltExpr(std::move(pre_stmts), final_expr, final_expr_type, false);
+      return BuiltExpr(std::move(pre_stmts), final_expr, final_expr_type, std::nullopt);
     }
 
     if (auto *c_style_cast_expr = dyn_cast<CStyleCastExpr>(expr)) {
       auto *sub_expr = c_style_cast_expr->getSubExpr();
-      auto res = BuildExpr(BuildExprCtx(sub_expr, Usage::Value));
+      // pass the usage kind down
+      auto res = BuildExpr(BuildExprCtx(sub_expr, ctx.usage_kind));
       if (auto error = res.takeError()) {
         return std::move(error);
       }
@@ -477,13 +479,14 @@ public:
       os << res->final_expr;
       pre_stmts.insert(pre_stmts.end(), res->pre_stmts.begin(), res->pre_stmts.end());
       os.flush();
-      return BuiltExpr(std::move(pre_stmts), final_expr, final_expr_type, res->is_on_heap);
+      // pass the heap alignment back up
+      return BuiltExpr(std::move(pre_stmts), final_expr, final_expr_type, res->heap_alignment);
     }
 
     if (auto *binary_operator = dyn_cast<BinaryOperator>(expr)) {
       auto *lhs = binary_operator->getLHS()->IgnoreParenImpCasts();
       auto *rhs = binary_operator->getRHS()->IgnoreParenImpCasts();
-      auto is_on_heap = false;
+      std::optional<size_t> heap_alignment = std::nullopt;
 
       switch (binary_operator->getOpcode()) {
       case BO_Assign: {
@@ -502,14 +505,8 @@ public:
                                       binary_operator->getExprLoc().printToString(data.Ctx.getSourceManager()))));
         }
 
-        if (lhs_res->is_on_heap || lhs->getValueKind() == VK_LValue) {
-          if (!lhs_res->alignment.has_value()) {
-            return CreateRuntimeError(std::move(llvm::formatv(
-                "\n    at {0}\nHeap variable ({1}) has no alignment information",
-                binary_operator->getExprLoc().printToString(data.Ctx.getSourceManager()), lhs_res->final_expr)));
-          }
-
-          switch (lhs_res->alignment.value()) {
+        if (auto heap_alignment = lhs_res->heap_alignment) {
+          switch (heap_alignment.value()) {
           case 1:
             os << "st8";
             break;
@@ -520,9 +517,10 @@ public:
             os << "st";
             break;
           default:
-            return CreateRuntimeError(std::move(llvm::formatv(
-                "\n    at {0}\nUnsupported global variable alignment: {1} bytes",
-                binary_operator->getExprLoc().printToString(data.Ctx.getSourceManager()), lhs_res->alignment.value())));
+            return CreateRuntimeError(
+                std::move(llvm::formatv("\n    at {0}\nUnsupported global variable alignment: {1} bytes",
+                                        binary_operator->getExprLoc().printToString(data.Ctx.getSourceManager()),
+                                        lhs_res->heap_alignment.value())));
           }
           // TODO add support for shared stores
           os << llvm::formatv(" {0}, {1}", lhs_res->final_expr, rhs_res->final_expr);
@@ -549,15 +547,33 @@ public:
                                     binary_operator->getExprLoc().printToString(data.Ctx.getSourceManager()))));
       }
 
+      case BO_Add: {
+        auto res = BuildAddOp(expr, lhs, rhs, binary_operator);
+        if (auto error = res.takeError()) {
+          return std::move(error);
+        }
+        pre_stmts.insert(pre_stmts.end(), res->pre_stmts.begin(), res->pre_stmts.end());
+        os << res->final_expr;
+        heap_alignment = res->heap_alignment;
+        break;
+      }
+
+      case BO_Sub: {
+        auto res = BuildSubOp(expr, lhs, rhs, binary_operator);
+        if (auto error = res.takeError()) {
+          return std::move(error);
+        }
+        pre_stmts.insert(pre_stmts.end(), res->pre_stmts.begin(), res->pre_stmts.end());
+        os << res->final_expr;
+        heap_alignment = res->heap_alignment;
+        break;
+      }
+
       case BO_LAnd:
         [[fallthrough]];
       case BO_LOr:
         [[fallthrough]];
       case BO_Mul:
-        [[fallthrough]];
-      case BO_Add:
-        [[fallthrough]];
-      case BO_Sub:
         [[fallthrough]];
       case BO_Shl:
         [[fallthrough]];
@@ -599,34 +615,9 @@ public:
           // Binary operator COULD be used as a place expression if it is a pointer arithmetic operation
         }
 
-        /* pointer arithmetic cases:
-        int *p;
-        int *q;
-        p + 1; // valid
-        1 + p; // valid
-        p - 1; // valid
-        1 - p; // invalid
-        p + q; // invalid
-        p - q; // valid (BUT we cannot handle this case because pancake doesn't have division...)
-
-        // TODO for the last case, we technically can handle it if the size is a power of 2 because then we can just
-        shift right by log2(size) to get the number of elements between the two pointers
-        */
-
-        if (binary_operator->isAdditiveOp() &&
-            (lhs_res->final_expr_type->isPointerType() || rhs_res->final_expr_type->isPointerType())) {
-          // if either side is a pointer, we need to do pointer arithmetic
-          // get size of lhs type in bytes
-          os << llvm::formatv("({0} {1} ({2} * {3}))", lhs_res->final_expr,
-                              BinaryOperator::getOpcodeStr(binary_operator->getOpcode()), rhs_res->final_expr,
-                              lhs->getType());
-        } else {
-          os << llvm::formatv("({0} {1} {2})", lhs_res->final_expr,
-                              BinaryOperator::getOpcodeStr(binary_operator->getOpcode()), rhs_res->final_expr);
-        }
-
         pre_stmts.insert(pre_stmts.end(), rhs_res->pre_stmts.begin(), rhs_res->pre_stmts.end());
         pre_stmts.insert(pre_stmts.end(), lhs_res->pre_stmts.begin(), lhs_res->pre_stmts.end());
+        heap_alignment = std::nullopt;
         break;
       }
 
@@ -640,11 +631,12 @@ public:
       }
 
       os.flush();
-      return BuiltExpr(std::move(pre_stmts), final_expr, final_expr_type, is_on_heap);
+      return BuiltExpr(std::move(pre_stmts), final_expr, final_expr_type, heap_alignment);
     }
 
     if (auto *unary_operator = dyn_cast<UnaryOperator>(expr)) {
       auto *sub_expr = unary_operator->getSubExpr()->IgnoreParenImpCasts();
+      std::optional<size_t> heap_alignment = std::nullopt;
 
       switch (unary_operator->getOpcode()) {
       case UO_Deref: {
@@ -690,6 +682,7 @@ public:
           }
           os << sub_expr_res->final_expr;
           pre_stmts.insert(pre_stmts.end(), sub_expr_res->pre_stmts.begin(), sub_expr_res->pre_stmts.end());
+          heap_alignment = (size_t)data.Ctx.getTypeAlignInChars(sub_expr->getType()->getPointeeType()).getQuantity();
           break;
         }
         default: {
@@ -761,7 +754,7 @@ public:
       }
 
       os.flush();
-      return BuiltExpr(std::move(pre_stmts), final_expr, final_expr_type, );
+      return BuiltExpr(std::move(pre_stmts), final_expr, final_expr_type, heap_alignment);
     }
 
     if (auto *call_expr = dyn_cast<CallExpr>(expr)) {
@@ -794,7 +787,7 @@ public:
       }
 
       os.flush();
-      return BuiltExpr(std::move(pre_stmts), final_expr, final_expr_type, false);
+      return BuiltExpr(std::move(pre_stmts), final_expr, final_expr_type, std::nullopt);
     }
 
     if (auto *member_expr = dyn_cast<MemberExpr>(expr)) {
@@ -826,8 +819,7 @@ public:
         os << llvm::formatv("{0} + {1}", member_base_expr->final_expr, offset_in_bytes);
         os.flush();
         pre_stmts.insert(pre_stmts.end(), member_base_expr->pre_stmts.begin(), member_base_expr->pre_stmts.end());
-        return BuiltExpr(std::move(pre_stmts), final_expr, final_expr_type, member_base_expr->is_on_heap,
-                         member_base_expr->alignment);
+        return BuiltExpr(std::move(pre_stmts), final_expr, final_expr_type, member_base_expr->heap_alignment);
       }
       return CreateRuntimeError(std::move(llvm::formatv(
           "\n    at {0}\nUnsupported member access: {1}",
@@ -842,7 +834,147 @@ public:
     }
 
     os.flush();
-    return BuiltExpr(std::move(pre_stmts), final_expr, final_expr_type, false);
+    return BuiltExpr(std::move(pre_stmts), final_expr, final_expr_type, std::nullopt);
+  }
+
+  auto BuildAddOp(Expr *expr, Expr *lhs, Expr *rhs, const BinaryOperator *binary_operator) -> Expected<BuiltExpr> {
+    llvm::SmallVector<std::string, 8> pre_stmts;
+    std::string final_expr;
+    llvm::raw_string_ostream os(final_expr);
+    const auto final_expr_type = expr->getType();
+    std::optional<size_t> heap_alignment = std::nullopt;
+
+    if (lhs->getType()->isPointerType() && rhs->getType()->isIntegerType()) {
+      // p + 1 is valid
+
+      // strip pointer from lhs and get size of the type
+      auto width = data.Ctx.getTypeSizeInChars(lhs->getType()->getPointeeType()).getQuantity();
+
+      auto rhs_res = BuildExpr(BuildExprCtx(rhs, Usage::Place));
+      if (auto error = rhs_res.takeError()) {
+        return std::move(error);
+      }
+      auto lhs_res = BuildExpr(BuildExprCtx(lhs, Usage::Value));
+      if (auto error = lhs_res.takeError()) {
+        return std::move(error);
+      }
+      os << llvm::formatv("({0} + ({1} * {2}))", lhs_res->final_expr, rhs_res->final_expr, width);
+      pre_stmts.insert(pre_stmts.end(), rhs_res->pre_stmts.begin(), rhs_res->pre_stmts.end());
+      pre_stmts.insert(pre_stmts.end(), lhs_res->pre_stmts.begin(), lhs_res->pre_stmts.end());
+      heap_alignment = (size_t)data.Ctx.getTypeAlignInChars(lhs->getType()->getPointeeType()).getQuantity();
+    } else if (lhs->getType()->isIntegerType() && rhs->getType()->isPointerType()) {
+      // 1 + p is valid
+
+      // strip pointer from rhs and get size of the type
+      auto width = data.Ctx.getTypeSizeInChars(rhs->getType()->getPointeeType()).getQuantity();
+
+      auto rhs_res = BuildExpr(BuildExprCtx(rhs, Usage::Value));
+      if (auto error = rhs_res.takeError()) {
+        return std::move(error);
+      }
+      auto lhs_res = BuildExpr(BuildExprCtx(lhs, Usage::Place));
+      if (auto error = lhs_res.takeError()) {
+        return std::move(error);
+      }
+      os << llvm::formatv("({0} + ({1} * {2}))", rhs_res->final_expr, lhs_res->final_expr, width);
+      pre_stmts.insert(pre_stmts.end(), rhs_res->pre_stmts.begin(), rhs_res->pre_stmts.end());
+      pre_stmts.insert(pre_stmts.end(), lhs_res->pre_stmts.begin(), lhs_res->pre_stmts.end());
+      heap_alignment = (size_t)data.Ctx.getTypeAlignInChars(rhs->getType()->getPointeeType()).getQuantity();
+    } else if (lhs->getType()->isPointerType() && rhs->getType()->isPointerType()) {
+      return CreateRuntimeError(
+          std::move(llvm::formatv("\n    at {0}\nInvalid pointer arithmetic: pointer + pointer",
+                                  binary_operator->getExprLoc().printToString(data.Ctx.getSourceManager()))));
+    } else {
+      auto rhs_res = BuildExpr(BuildExprCtx(rhs, Usage::Value));
+      if (auto error = rhs_res.takeError()) {
+        return std::move(error);
+      }
+      auto lhs_res = BuildExpr(BuildExprCtx(lhs, Usage::Value));
+      if (auto error = lhs_res.takeError()) {
+        return std::move(error);
+      }
+      os << llvm::formatv("({0} + {1})", lhs_res->final_expr, rhs_res->final_expr);
+      pre_stmts.insert(pre_stmts.end(), rhs_res->pre_stmts.begin(), rhs_res->pre_stmts.end());
+      pre_stmts.insert(pre_stmts.end(), lhs_res->pre_stmts.begin(), lhs_res->pre_stmts.end());
+    }
+
+    os.flush();
+    return BuiltExpr(std::move(pre_stmts), final_expr, final_expr_type, heap_alignment);
+  }
+
+  auto BuildSubOp(Expr *expr, Expr *lhs, Expr *rhs, const BinaryOperator *binary_operator) -> Expected<BuiltExpr> {
+    llvm::SmallVector<std::string, 8> pre_stmts;
+    std::string final_expr;
+    llvm::raw_string_ostream os(final_expr);
+    const auto final_expr_type = expr->getType();
+    std::optional<size_t> heap_alignment = std::nullopt;
+
+    if (lhs->getType()->isPointerType() && rhs->getType()->isIntegerType()) {
+      // p - 1 is valid
+
+      // strip pointer from lhs and get size of the type
+      auto width = data.Ctx.getTypeSizeInChars(lhs->getType()->getPointeeType()).getQuantity();
+
+      auto rhs_res = BuildExpr(BuildExprCtx(rhs, Usage::Value));
+      if (auto error = rhs_res.takeError()) {
+        return std::move(error);
+      }
+      auto lhs_res = BuildExpr(BuildExprCtx(lhs, Usage::Place));
+      if (auto error = lhs_res.takeError()) {
+        return std::move(error);
+      }
+
+      os << llvm::formatv("({0} - ({1} * {2}))", lhs_res->final_expr, rhs_res->final_expr, width);
+      pre_stmts.insert(pre_stmts.end(), rhs_res->pre_stmts.begin(), rhs_res->pre_stmts.end());
+      pre_stmts.insert(pre_stmts.end(), lhs_res->pre_stmts.begin(), lhs_res->pre_stmts.end());
+      heap_alignment = (size_t)data.Ctx.getTypeAlignInChars(lhs->getType()->getPointeeType()).getQuantity();
+    } else if (lhs->getType()->isPointerType() && rhs->getType()->isPointerType()) {
+      // p - q is valid (but we cannot handle this case because pancake doesn't have division...)
+      // however, we can handle it if the size is a power of 2
+      // return type is meant to be a ptrdiff_t, but we don't have that type in pancake so we just return a uint
+
+      auto width = data.Ctx.getTypeSizeInChars(lhs->getType()->getPointeeType()).getQuantity();
+      if ((width & (width - 1)) != 0) {
+        return CreateRuntimeError(
+            std::move(llvm::formatv("\n    at {0}\nInvalid pointer arithmetic: pointer - pointer (unsupported size {1} "
+                                    "bytes, not a power of 2)",
+                                    binary_operator->getExprLoc().printToString(data.Ctx.getSourceManager()), width)));
+      }
+
+      auto rhs_res = BuildExpr(BuildExprCtx(rhs, Usage::Place));
+      if (auto error = rhs_res.takeError()) {
+        return std::move(error);
+      }
+      auto lhs_res = BuildExpr(BuildExprCtx(lhs, Usage::Place));
+      if (auto error = lhs_res.takeError()) {
+        return std::move(error);
+      }
+
+      auto shift_amount = llvm::Log2_64((uint64_t)width);
+      os << llvm::formatv("(({0} - {1}) >> {2})", lhs_res->final_expr, rhs_res->final_expr, shift_amount);
+      pre_stmts.insert(pre_stmts.end(), rhs_res->pre_stmts.begin(), rhs_res->pre_stmts.end());
+      pre_stmts.insert(pre_stmts.end(), lhs_res->pre_stmts.begin(), lhs_res->pre_stmts.end());
+      heap_alignment = (size_t)data.Ctx.getTypeAlignInChars(lhs->getType()->getPointeeType()).getQuantity();
+    } else if (lhs->getType()->isIntegerType() && rhs->getType()->isPointerType()) {
+      return CreateRuntimeError(
+          std::move(llvm::formatv("\n    at {0}\nInvalid pointer arithmetic: integer - pointer",
+                                  binary_operator->getExprLoc().printToString(data.Ctx.getSourceManager()))));
+    } else {
+      auto rhs_res = BuildExpr(BuildExprCtx(rhs, Usage::Value));
+      if (auto error = rhs_res.takeError()) {
+        return std::move(error);
+      }
+      auto lhs_res = BuildExpr(BuildExprCtx(lhs, Usage::Value));
+      if (auto error = lhs_res.takeError()) {
+        return std::move(error);
+      }
+      os << llvm::formatv("({0} - {1})", lhs_res->final_expr, rhs_res->final_expr);
+      pre_stmts.insert(pre_stmts.end(), rhs_res->pre_stmts.begin(), rhs_res->pre_stmts.end());
+      pre_stmts.insert(pre_stmts.end(), lhs_res->pre_stmts.begin(), lhs_res->pre_stmts.end());
+    }
+
+    os.flush();
+    return BuiltExpr(std::move(pre_stmts), final_expr, final_expr_type, heap_alignment);
   }
 };
 } // namespace
