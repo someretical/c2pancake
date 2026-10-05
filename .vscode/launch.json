@@ -10,7 +10,7 @@
             "request": "launch",
             "program": "${command:cmake.getLaunchTargetPath}",
             "args": [
-                // "--end=RewriteFunctionCalling",
+                "--start=C2Pancake",
                 "${file}",
                 "--",
                 // "--target=aarch64-linux-gnu",

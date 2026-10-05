@@ -189,6 +189,11 @@ public:
 
         std::string replacement_text;
         llvm::raw_string_ostream os(replacement_text);
+
+        if (func_decl->isInlineSpecified()) {
+          os << "inline ";
+        }
+
         os << "fun 1 " << func_decl->getName() << " (";
         for (auto &&param : func_decl->parameters()) {
           os << "1 " << param->getName();
@@ -280,7 +285,7 @@ public:
       for (auto &&pre_stmt : res->pre_stmts) {
         os << pre_stmt << "\n";
       }
-      os << "return " << res->final_expr << ";\n";
+      os << "return " << res->final_expr << ";";
       os.flush();
       return replacement_text;
     }
@@ -303,7 +308,7 @@ public:
       }
       os << "if (" << res->final_expr << ") {\n";
       os << then_res.get();
-      os << "}\n";
+      os << "}";
 
       if (auto *else_stmt = if_stmt->getElse()) {
         auto else_res = BuildStmt(else_stmt);
@@ -311,9 +316,9 @@ public:
           return std::move(error);
         }
 
-        os << "else {\n";
+        os << " else {\n";
         os << else_res.get();
-        os << "}\n";
+        os << "}";
       }
 
       os.flush();
@@ -338,13 +343,13 @@ public:
       }
       os << "while (" << res->final_expr << ") {\n";
       os << body_res.get();
-      os << "}\n";
+      os << "}";
       os.flush();
       return replacement_text;
     }
 
     if (auto *_ = llvm::dyn_cast<BreakStmt>(stmt)) {
-      os << "break;\n";
+      os << "break;";
       os.flush();
       return replacement_text;
     }
@@ -363,7 +368,7 @@ public:
         os << pre_stmt << "\n";
       }
       if (!res->final_expr.empty()) {
-        os << res->final_expr << ";\n";
+        os << res->final_expr << ";";
       }
       os.flush();
       return replacement_text;
@@ -548,7 +553,7 @@ public:
       }
 
       case BO_Add: {
-        auto res = BuildAddOp(expr, lhs, rhs, binary_operator);
+        auto res = BuildAddOp(expr, binary_operator);
         if (auto error = res.takeError()) {
           return std::move(error);
         }
@@ -559,7 +564,7 @@ public:
       }
 
       case BO_Sub: {
-        auto res = BuildSubOp(expr, lhs, rhs, binary_operator);
+        auto res = BuildSubOp(expr, binary_operator);
         if (auto error = res.takeError()) {
           return std::move(error);
         }
@@ -617,6 +622,8 @@ public:
 
         pre_stmts.insert(pre_stmts.end(), rhs_res->pre_stmts.begin(), rhs_res->pre_stmts.end());
         pre_stmts.insert(pre_stmts.end(), lhs_res->pre_stmts.begin(), lhs_res->pre_stmts.end());
+        os << llvm::formatv("({0} {1} {2})", lhs_res->final_expr,
+                            BinaryOperator::getOpcodeStr(binary_operator->getOpcode()), rhs_res->final_expr);
         heap_alignment = std::nullopt;
         break;
       }
@@ -837,13 +844,17 @@ public:
     return BuiltExpr(std::move(pre_stmts), final_expr, final_expr_type, std::nullopt);
   }
 
-  auto BuildAddOp(Expr *expr, Expr *lhs, Expr *rhs, const BinaryOperator *binary_operator) -> Expected<BuiltExpr> {
+  auto BuildAddOp(Expr *expr, const BinaryOperator *binary_operator) -> Expected<BuiltExpr> {
     llvm::SmallVector<std::string, 8> pre_stmts;
     std::string final_expr;
     llvm::raw_string_ostream os(final_expr);
     const auto final_expr_type = expr->getType();
     std::optional<size_t> heap_alignment = std::nullopt;
 
+    // it is very important that we do NOT call IgnoreParenImpCasts() on the lhs and rhs here
+    // as we do NOT want to strip the implicit cast from array to pointer
+    auto *lhs = binary_operator->getLHS();
+    auto *rhs = binary_operator->getRHS();
     if (lhs->getType()->isPointerType() && rhs->getType()->isIntegerType()) {
       // p + 1 is valid
 
@@ -902,13 +913,17 @@ public:
     return BuiltExpr(std::move(pre_stmts), final_expr, final_expr_type, heap_alignment);
   }
 
-  auto BuildSubOp(Expr *expr, Expr *lhs, Expr *rhs, const BinaryOperator *binary_operator) -> Expected<BuiltExpr> {
+  auto BuildSubOp(Expr *expr, const BinaryOperator *binary_operator) -> Expected<BuiltExpr> {
     llvm::SmallVector<std::string, 8> pre_stmts;
     std::string final_expr;
     llvm::raw_string_ostream os(final_expr);
     const auto final_expr_type = expr->getType();
     std::optional<size_t> heap_alignment = std::nullopt;
 
+    // it is very important that we do NOT call IgnoreParenImpCasts() on the lhs and rhs here
+    // as we do NOT want to strip the implicit cast from array to pointer
+    auto *lhs = binary_operator->getLHS();
+    auto *rhs = binary_operator->getRHS();
     if (lhs->getType()->isPointerType() && rhs->getType()->isIntegerType()) {
       // p - 1 is valid
 
