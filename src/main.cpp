@@ -59,8 +59,8 @@ llvm::cl::opt<uint64_t> stack_size_opt("stack-size",
                                        llvm::cl::desc("Override Pancake stack size (default: 0x10000 = 4096 * 16)"),
                                        llvm::cl::cat(c2_pancake_options), llvm::cl::init(0x10000UL));
 
-llvm::cl::opt<std::string> shell_path("shell-path", llvm::cl::desc("Override shell path (default: /bin/sh)"),
-                                      llvm::cl::cat(c2_pancake_options), llvm::cl::init("/bin/sh"));
+llvm::cl::opt<std::string> make_path("make-path", llvm::cl::desc("Override make path (default: make)"),
+                                     llvm::cl::cat(c2_pancake_options), llvm::cl::init("make"));
 
 llvm::cl::opt<std::string> cake_path("cake-path", llvm::cl::desc("Path to the Cake compiler (default: cake in PATH)"),
                                      llvm::cl::cat(c2_pancake_options), llvm::cl::init("cake"));

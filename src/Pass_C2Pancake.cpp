@@ -31,7 +31,7 @@ using namespace clang;
 using namespace clang::tooling;
 
 extern llvm::cl::opt<uint64_t> stack_size_opt;
-extern llvm::cl::opt<std::string> shell_path;
+extern llvm::cl::opt<std::string> make_path;
 extern llvm::cl::opt<std::string> cake_path;
 extern llvm::cl::opt<std::string> cake_options;
 
@@ -1179,6 +1179,7 @@ auto Finalizer::Write(StageContext &ctx, clang::CompilerInstance &compiler) -> l
   auto scaffold_file_path = ctx.next_file + ".scaffold.c";
   auto ffi_file_path = ctx.next_file + ".ffi.c";
   auto makefile_path = ctx.next_file + ".makefile";
+  auto bin_path = ctx.next_file + ".bin";
 
   std::error_code ec;
   llvm::raw_fd_ostream tu_out(tu_file_path, ec, llvm::sys::fs::OF_None);
@@ -1229,19 +1230,33 @@ auto Finalizer::Write(StageContext &ctx, clang::CompilerInstance &compiler) -> l
   std::optional<llvm::sys::ProcessStatistics> stats = std::nullopt;
   std::string error_message;
   bool execution_failed = true;
-  auto exit_code = llvm::sys::ExecuteAndWait(
-      shell_path, {llvm::formatv("{0} {1} < {2}.pancake > {2}.S", cake_path, cake_options, ctx.next_file).str()},
-      std::nullopt, {}, 0, 0, &error_message, &execution_failed, &stats);
+  auto exit_code = llvm::sys::ExecuteAndWait(make_path,
+                                             {
+                                                 "-f",
+                                                 makefile_path,
+                                                 "all",
+                                             },
+                                             std::nullopt, {}, 0, 0, &error_message, &execution_failed, &stats);
 
   if (execution_failed) {
-    return CreateRuntimeError(llvm::formatv("Failed to execute cake ({0}): {1}", exit_code, error_message));
+    return CreateRuntimeError(llvm::formatv("Failed to execute make ({0}): {1}", exit_code, error_message));
   }
 
   PrintLogBegin(llvm::outs(), ctx);
-  llvm::outs() << "Executed cake successfully, total time: "
+  llvm::outs() << "Executed make successfully, total time: "
                << (stats ? stats->TotalTime : std::chrono::microseconds(0)).count()
                << " us, user time: " << (stats ? stats->UserTime : std::chrono::microseconds(0)).count()
                << " us, peak memory: " << (stats ? stats->PeakMemory : 0) << " KiB\n";
+
+  auto error = llvm::sys::fs::setPermissions(
+      bin_path, llvm::sys::fs::perms::owner_all | llvm::sys::fs::perms::group_read | llvm::sys::fs::perms::group_exe |
+                    llvm::sys::fs::perms::others_read | llvm::sys::fs::perms::others_exe);
+  if (error) {
+    return CreateRuntimeError(llvm::formatv("Failed to set permissions on binary {0}: {1}", bin_path, error.message()));
+  }
+
+  PrintLogBegin(llvm::outs(), ctx);
+  llvm::outs() << "Binary at " << bin_path << "\n";
 
   return llvm::Error::success();
 }
