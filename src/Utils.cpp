@@ -18,10 +18,10 @@
 #include <vector>
 
 namespace pancake {
-auto PrintLogBegin(llvm::raw_ostream &os, const PipelineStageCtx &ctx) -> void {
-  const auto action_name = ctx.action_name ? llvm::StringRef(*ctx.action_name) : llvm::StringRef("UnknownAction");
-  os << llvm::formatv("[c2pancake] [{0:02}-{1:02}] {2}: {3}: ", ctx.major_pass_number, ctx.minor_pass_number,
-                      ctx.current_file, action_name);
+auto PrintLogBegin(llvm::raw_ostream &os, const StageContext &ctx) -> void {
+  const auto stage_name = ctx.stage_name ? llvm::StringRef(*ctx.stage_name) : llvm::StringRef("UnknownStage");
+  os << llvm::formatv("[c2pancake] [{0:02}-{1:02}] {2}: {3}: ", ctx.stage_index, ctx.attempt_index,
+                      ctx.current_file, stage_name);
 }
 
 auto PrintLogBeginShort(llvm::raw_ostream &os, const llvm::StringRef in_file) -> void {

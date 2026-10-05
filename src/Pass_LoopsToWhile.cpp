@@ -79,7 +79,7 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
 
   if (error) {
     ps_ctx.error = llvm::joinErrors(CreateRuntimeError("Error during transformation"), std::move(error));
-    ps_ctx.whats_next = WhatsNext::MoveToNextFile;
+    ps_ctx.SetControl(StageControl::NextFile);
     return;
   }
 
@@ -94,14 +94,14 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
   }
 
   if (errors == 0 && changes.empty()) {
-    ps_ctx.whats_next = WhatsNext::MoveToNextPass;
+    ps_ctx.SetControl(StageControl::Continue);
     return;
   }
   if (errors > 0) {
     PrintLogBegin(llvm::outs(), ps_ctx);
     llvm::outs() << llvm::formatv("Couldn't add {0} replacement{1}\n", errors, errors != 1 ? "s" : "");
   }
-  ps_ctx.whats_next = WhatsNext::RepeatPass;
+  ps_ctx.SetControl(StageControl::Repeat);
 }
 } // namespace pancake::pass_normalise_while_loops
 
@@ -174,7 +174,7 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
 
   if (error) {
     ps_ctx.error = llvm::joinErrors(CreateRuntimeError("Error during transformation"), std::move(error));
-    ps_ctx.whats_next = WhatsNext::MoveToNextFile;
+    ps_ctx.SetControl(StageControl::NextFile);
     return;
   }
 
@@ -182,13 +182,13 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
     for (const auto &r : change.getReplacements()) {
       if (auto error = ps_ctx.replacements.add(r)) {
         ps_ctx.error = llvm::joinErrors(CreateRuntimeError("Add replacement conflict"), std::move(error));
-        ps_ctx.whats_next = WhatsNext::MoveToNextFile;
+        ps_ctx.SetControl(StageControl::NextFile);
         return;
       }
     }
   }
 
-  ps_ctx.whats_next = WhatsNext::MoveToNextPass;
+  ps_ctx.SetControl(StageControl::Continue);
 }
 } // namespace pancake::pass_process_continue_in_for_loops
 
@@ -275,7 +275,7 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
 
   if (error) {
     ps_ctx.error = llvm::joinErrors(CreateRuntimeError("Error during transformation"), std::move(error));
-    ps_ctx.whats_next = WhatsNext::MoveToNextFile;
+    ps_ctx.SetControl(StageControl::NextFile);
     return;
   }
 
@@ -290,14 +290,14 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
   }
 
   if (errors == 0 && changes.empty()) {
-    ps_ctx.whats_next = WhatsNext::MoveToNextPass;
+    ps_ctx.SetControl(StageControl::Continue);
     return;
   }
   if (errors > 0) {
     PrintLogBegin(llvm::outs(), ps_ctx);
     llvm::outs() << llvm::formatv("Couldn't add {0} replacement{1}\n", errors, errors != 1 ? "s" : "");
   }
-  ps_ctx.whats_next = WhatsNext::RepeatPass;
+  ps_ctx.SetControl(StageControl::Repeat);
 }
 } // namespace pancake::pass_for_to_while
 
@@ -389,7 +389,7 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
 
   if (error) {
     ps_ctx.error = llvm::joinErrors(CreateRuntimeError("Error during transformation"), std::move(error));
-    ps_ctx.whats_next = WhatsNext::MoveToNextFile;
+    ps_ctx.SetControl(StageControl::NextFile);
     return;
   }
 
@@ -397,13 +397,13 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
     for (const auto &r : change.getReplacements()) {
       if (auto error = ps_ctx.replacements.add(r)) {
         ps_ctx.error = llvm::joinErrors(CreateRuntimeError("Add replacement conflict"), std::move(error));
-        ps_ctx.whats_next = WhatsNext::MoveToNextFile;
+        ps_ctx.SetControl(StageControl::NextFile);
         return;
       }
     }
   }
 
-  ps_ctx.whats_next = WhatsNext::MoveToNextPass;
+  ps_ctx.SetControl(StageControl::Continue);
 }
 } // namespace pancake::pass_process_continue_in_do_while_loops
 
@@ -467,7 +467,7 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
 
   if (error) {
     ps_ctx.error = llvm::joinErrors(CreateRuntimeError("Error during transformation"), std::move(error));
-    ps_ctx.whats_next = WhatsNext::MoveToNextFile;
+    ps_ctx.SetControl(StageControl::NextFile);
     return;
   }
 
@@ -482,13 +482,13 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
   }
 
   if (errors == 0 && changes.empty()) {
-    ps_ctx.whats_next = WhatsNext::MoveToNextPass;
+    ps_ctx.SetControl(StageControl::Continue);
     return;
   }
   if (errors > 0) {
     PrintLogBegin(llvm::outs(), ps_ctx);
     llvm::outs() << llvm::formatv("Couldn't add {0} replacement{1}\n", errors, errors != 1 ? "s" : "");
   }
-  ps_ctx.whats_next = WhatsNext::RepeatPass;
+  ps_ctx.SetControl(StageControl::Repeat);
 }
 }; // namespace pancake::pass_do_while_to_while

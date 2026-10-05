@@ -85,8 +85,11 @@ auto main(int argc, const char **argv) -> int {
   To add a new stage to the pipeline, use the following code.
   Consumer::HandleTranslationUnit is the entry point and must be implemented.
 
-  The main thing HandleTranslationUnit should do is add Replacements to ps_ctx.replacements
-  The Pipeline will take care of applying the replacements and writing the output file
+  The main thing HandleTranslationUnit should do is add Replacements to ps_ctx.replacements.
+  The default finalizer applies them, formats the result, and writes the next pipeline file.
+  Stages can share typed data through ps_ctx.run.artifacts. A non-Clang stage can instead
+  be registered with pipeline.AddFileStage<T>(); T must construct from StageContext&
+  and implement auto Run() -> llvm::Error, setting the stage control with ctx.SetControl().
 
   class Consumer : public C2PancakePass {
   public:
@@ -94,10 +97,10 @@ auto main(int argc, const char **argv) -> int {
     void HandleTranslationUnit(clang::ASTContext &Ctx) override;
   };
 
-  class Action : public PipelineAction<Consumer> {
+  class Action : public ClangStage<Consumer> {
   public:
-    explicit Action(PipelineActionCtx &ctx) : PipelineAction<Consumer>(ctx) {
-      ctx.action_name = "<name of pass>";
+    explicit Action(StageContext &ctx) : ClangStage<Consumer>(ctx) {
+      ctx.stage_name = "<name of pass>";
     }
   };
   */

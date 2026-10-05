@@ -10,9 +10,9 @@ public:
   void HandleTranslationUnit(clang::ASTContext &Ctx) override;
 };
 
-class Action : public PipelineStage<Consumer> {
+class Action : public ClangStage<Consumer> {
 public:
-  explicit Action(PipelineStageCtx &ctx) : PipelineStage<Consumer>(ctx) { ctx.action_name = "NameAnonymousRecords"; }
+  explicit Action(StageContext &ctx) : ClangStage<Consumer>(ctx) { ctx.stage_name = "NameAnonymousRecords"; }
 };
 } // namespace pancake::pass_name_anon_records
 
@@ -23,10 +23,10 @@ public:
   void HandleTranslationUnit(clang::ASTContext &Ctx) override;
 };
 
-class Action : public PipelineStage<Consumer> {
+class Action : public ClangStage<Consumer> {
 public:
-  explicit Action(PipelineStageCtx &ctx) : PipelineStage<Consumer>(ctx) {
-    ctx.action_name = "RenameToBePromotedRecords";
+  explicit Action(StageContext &ctx) : ClangStage<Consumer>(ctx) {
+    ctx.stage_name = "RenameToBePromotedRecords";
   }
 };
 } // namespace pancake::pass_rename_to_be_promoted_records
@@ -40,9 +40,9 @@ public:
   void HandleTranslationUnit(clang::ASTContext &Ctx) override;
 };
 
-class Action : public PipelineStage<Consumer> {
+class Action : public ClangStage<Consumer> {
 public:
-  explicit Action(PipelineStageCtx &ctx) : PipelineStage<Consumer>(ctx) { ctx.action_name = "PromoteRecords"; }
+  explicit Action(StageContext &ctx) : ClangStage<Consumer>(ctx) { ctx.stage_name = "PromoteRecords"; }
 };
 } // namespace pancake::pass_promote_records
 

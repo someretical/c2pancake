@@ -105,7 +105,7 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
 
   if (error) {
     ps_ctx.error = llvm::joinErrors(CreateRuntimeError("Error during transformation"), std::move(error));
-    ps_ctx.whats_next = WhatsNext::MoveToNextFile;
+    ps_ctx.SetControl(StageControl::NextFile);
     return;
   }
 
@@ -120,14 +120,14 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
   }
 
   if (errors == 0 && changes.empty()) {
-    ps_ctx.whats_next = WhatsNext::MoveToNextPass;
+    ps_ctx.SetControl(StageControl::Continue);
     return;
   }
   if (errors > 0) {
     PrintLogBegin(llvm::outs(), ps_ctx);
     llvm::outs() << llvm::formatv("Couldn't add {0} replacement{1}\n", errors, errors != 1 ? "s" : "");
   }
-  ps_ctx.whats_next = WhatsNext::RepeatPass;
+  ps_ctx.SetControl(StageControl::Repeat);
 }
 } // namespace pancake::pass_implicit_to_explicit_casts
 
@@ -654,7 +654,7 @@ static inline uint32_t __c2pnk_trunc_u32_to_i8(uint32_t x) {
 
 struct WorkerData {
   ASTContext &Ctx;
-  PipelineStageCtx &ps_ctx;
+  StageContext &ps_ctx;
   llvm::SmallVector<Replacement, 64> &replacements;
   size_t tmp_var_counter = 0;
   llvm::Error error = llvm::Error::success();
@@ -671,7 +671,7 @@ public:
   static auto shouldTraversePostOrder() -> bool { return false; }
 
   auto GetTempVarName(std::string hint) -> auto {
-    return llvm::formatv("__c2pnk_{0}_{1}_{2}_{3}", hint, data.ps_ctx.major_pass_number, data.ps_ctx.minor_pass_number,
+    return llvm::formatv("__c2pnk_{0}_{1}_{2}_{3}", hint, data.ps_ctx.stage_index, data.ps_ctx.attempt_index,
                          data.tmp_var_counter++);
   }
 
@@ -1367,7 +1367,7 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
 
   if (auto error = std::move(data.error)) {
     ps_ctx.error = std::move(error);
-    ps_ctx.whats_next = WhatsNext::MoveToNextFile;
+    ps_ctx.SetControl(StageControl::NextFile);
     return;
   }
 
@@ -1387,11 +1387,11 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
 
     if (auto error = ps_ctx.replacements.add(r)) {
       ps_ctx.error = llvm::joinErrors(CreateRuntimeError("Add replacement conflict"), std::move(error));
-      ps_ctx.whats_next = WhatsNext::MoveToNextFile;
+      ps_ctx.SetControl(StageControl::NextFile);
       return;
     }
   }
 
-  ps_ctx.whats_next = WhatsNext::MoveToNextPass;
+  ps_ctx.SetControl(StageControl::Continue);
 }
 } // namespace pancake::pass_integer_conversion

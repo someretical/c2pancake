@@ -10,9 +10,9 @@ public:
   void HandleTranslationUnit(clang::ASTContext &Ctx) override;
 };
 
-class Action : public PipelineStage<Consumer> {
+class Action : public ClangStage<Consumer> {
 public:
-  explicit Action(PipelineStageCtx &ctx) : PipelineStage<Consumer>(ctx) { ctx.action_name = "AddSwitchFallthroughs"; }
+  explicit Action(StageContext &ctx) : ClangStage<Consumer>(ctx) { ctx.stage_name = "AddSwitchFallthroughs"; }
 };
 } // namespace pancake::pass_add_switch_fallthrough
 
@@ -23,9 +23,9 @@ public:
   void HandleTranslationUnit(clang::ASTContext &Ctx) override;
 };
 
-class Action : public PipelineStage<Consumer> {
+class Action : public ClangStage<Consumer> {
 public:
-  explicit Action(PipelineStageCtx &ctx) : PipelineStage<Consumer>(ctx) { ctx.action_name = "NormaliseSwitches"; }
+  explicit Action(StageContext &ctx) : ClangStage<Consumer>(ctx) { ctx.stage_name = "NormaliseSwitches"; }
 };
 } // namespace pancake::pass_normalise_switches
 
@@ -36,10 +36,10 @@ public:
   void HandleTranslationUnit(clang::ASTContext &Ctx) override;
 };
 
-class Action : public PipelineStage<Consumer> {
+class Action : public ClangStage<Consumer> {
 public:
-  explicit Action(PipelineStageCtx &ctx) : PipelineStage<Consumer>(ctx) {
-    ctx.action_name = "RewriteSwitchesToIfStatements";
+  explicit Action(StageContext &ctx) : ClangStage<Consumer>(ctx) {
+    ctx.stage_name = "RewriteSwitchesToIfStatements";
   }
 };
 } // namespace pancake::pass_switch_to_if

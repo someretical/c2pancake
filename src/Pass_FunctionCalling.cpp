@@ -59,10 +59,10 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
   if (auto error = ps_ctx.replacements.add({sm, sm.getLocForStartOfFile(sm.getMainFileID()), 0,
                                             llvm::formatv(memcpy_polyfill_code, GetPointerWidth(Ctx)).str()})) {
     ps_ctx.error = llvm::joinErrors(CreateRuntimeError("Add replacement conflict"), std::move(error));
-    ps_ctx.whats_next = WhatsNext::MoveToNextFile;
+    ps_ctx.SetControl(StageControl::NextFile);
     return;
   }
-  ps_ctx.whats_next = WhatsNext::MoveToNextPass;
+  ps_ctx.SetControl(StageControl::Continue);
 }
 } // namespace pancake::pass_inject_memcpy_polyfill
 
@@ -86,7 +86,7 @@ using FFIVariadicFunctionRewrites = llvm::MapVector<CallExpr *, Replacements>;
 namespace CollectFunctionInfo {
 struct WorkerData {
   ASTContext &Ctx;
-  PipelineStageCtx &ps_ctx;
+  StageContext &ps_ctx;
 
   struct ReturnInfo {
     QualType return_type; // COULD be void
@@ -127,7 +127,7 @@ public:
   static auto shouldTraversePostOrder() -> bool { return false; }
 
   auto GetTempVarName(std::string hint) -> auto {
-    return llvm::formatv("__c2pnk_{0}_{1}_{2}_{3}", hint, data.ps_ctx.major_pass_number, data.ps_ctx.minor_pass_number,
+    return llvm::formatv("__c2pnk_{0}_{1}_{2}_{3}", hint, data.ps_ctx.stage_index, data.ps_ctx.attempt_index,
                          data.tmp_var_counter++);
   }
 
@@ -283,7 +283,7 @@ struct FFIFunctionWrapperInfo {
 
 struct WorkerData {
   ASTContext &Ctx;
-  PipelineStageCtx &ps_ctx;
+  StageContext &ps_ctx;
   FunctionMap &function_map;
   NonFFIFunctionRewrites &non_ffi_rewrites;
   FFIFunctionRewrites &ffi_rewrites;
@@ -295,7 +295,7 @@ struct WorkerData {
   size_t tmp_var_counter = 0;
   FunctionDecl *current_function_decl = nullptr;
 
-  explicit WorkerData(ASTContext &Ctx, PipelineStageCtx &ps_ctx, FunctionMap &function_map,
+  explicit WorkerData(ASTContext &Ctx, StageContext &ps_ctx, FunctionMap &function_map,
                       NonFFIFunctionRewrites &non_ffi_rewrites, FFIFunctionRewrites &ffi_rewrites,
                       FFIVariadicFunctionRewrites &ffi_variadic_rewrites)
       : Ctx(Ctx), ps_ctx(ps_ctx), function_map(function_map), non_ffi_rewrites(non_ffi_rewrites),
@@ -312,7 +312,7 @@ public:
   static auto shouldTraversePostOrder() -> bool { return false; }
 
   auto GetTempVarName(std::string hint) -> auto {
-    return llvm::formatv("__c2pnk_{0}_{1}_{2}_{3}", hint, data.ps_ctx.major_pass_number, data.ps_ctx.minor_pass_number,
+    return llvm::formatv("__c2pnk_{0}_{1}_{2}_{3}", hint, data.ps_ctx.stage_index, data.ps_ctx.attempt_index,
                          data.tmp_var_counter++);
   }
 
@@ -1299,7 +1299,7 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
 
     if (data.error) {
       ps_ctx.error = std::move(data.error);
-      ps_ctx.whats_next = WhatsNext::MoveToNextFile;
+      ps_ctx.SetControl(StageControl::NextFile);
       return;
     }
   }
@@ -1314,7 +1314,7 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
 
     if (data.error) {
       ps_ctx.error = std::move(data.error);
-      ps_ctx.whats_next = WhatsNext::MoveToNextFile;
+      ps_ctx.SetControl(StageControl::NextFile);
       return;
     }
   }
@@ -1332,7 +1332,7 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
   } else {
     // we want to apply ALL ffi rewrites first, AND THEN apply the non-ffi rewrites,
     // otherwise the non-ffi rewrites might obscure the conditions required to apply ffi rewrites.
-    ps_ctx.whats_next = WhatsNext::RepeatPass;
+    ps_ctx.SetControl(StageControl::Repeat);
   }
 
   std::ranges::sort(merged_groups, [](const auto &a, const auto &b) -> auto {
@@ -1358,11 +1358,11 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
   }
 
   ps_ctx.replacements = std::move(merged_output);
-  if (!ps_ctx.whats_next.has_value()) {
+  if (!ps_ctx.HasControl()) {
     if (all_ok) {
-      ps_ctx.whats_next = WhatsNext::MoveToNextPass;
+      ps_ctx.SetControl(StageControl::Continue);
     } else {
-      ps_ctx.whats_next = WhatsNext::RepeatPass;
+      ps_ctx.SetControl(StageControl::Repeat);
     }
   }
 }

@@ -10,9 +10,9 @@ public:
   void HandleTranslationUnit(clang::ASTContext &Ctx) override;
 };
 
-class Action : public PipelineStage<Consumer> {
+class Action : public ClangStage<Consumer> {
 public:
-  explicit Action(PipelineStageCtx &ctx) : PipelineStage<Consumer>(ctx) { ctx.action_name = "LowerBitfieldOps"; }
+  explicit Action(StageContext &ctx) : ClangStage<Consumer>(ctx) { ctx.stage_name = "LowerBitfieldOps"; }
 };
 } // namespace pancake::pass_lower_bitfield_ops
 
@@ -23,10 +23,10 @@ public:
   void HandleTranslationUnit(clang::ASTContext &Ctx) override;
 };
 
-class Action : public PipelineStage<Consumer> {
+class Action : public ClangStage<Consumer> {
 public:
-  explicit Action(PipelineStageCtx &ctx) : PipelineStage<Consumer>(ctx) {
-    ctx.action_name = "SimplifyAddressOfFollowedByDereference";
+  explicit Action(StageContext &ctx) : ClangStage<Consumer>(ctx) {
+    ctx.stage_name = "SimplifyAddressOfFollowedByDereference";
   }
 };
 } // namespace pancake::pass_simplify_addrof_deref

@@ -39,7 +39,7 @@ namespace pancake::pass_rename_to_be_hoisted_globals {
 namespace {
 struct WorkerData {
   ASTContext &Ctx;
-  PipelineStageCtx &ps_ctx;
+  StageContext &ps_ctx;
   llvm::DenseMap<VarDecl *, Replacements> &hoisted_vars;
   size_t tmp_var_counter = 0;
   FunctionDecl *current_function_decl = nullptr;
@@ -58,12 +58,12 @@ public:
   auto GetTempVarName(const StringRef original_name, const StringRef func_name, const SourceLocation loc) -> auto {
     return llvm::formatv("__c2pnk_local_{0}_{1}_L{2}C{3}_{4}_{5}_{6}", original_name.str(), func_name.str(),
                          data.Ctx.getSourceManager().getSpellingLineNumber(loc),
-                         data.Ctx.getSourceManager().getSpellingColumnNumber(loc), data.ps_ctx.major_pass_number,
-                         data.ps_ctx.minor_pass_number, data.tmp_var_counter++);
+                         data.Ctx.getSourceManager().getSpellingColumnNumber(loc), data.ps_ctx.stage_index,
+                         data.ps_ctx.attempt_index, data.tmp_var_counter++);
   }
 
   auto GetTempVarName(const std::string &hint) const {
-    return llvm::formatv("__c2pnk_{0}_{1}_{2}_{3}", hint, data.ps_ctx.major_pass_number, data.ps_ctx.minor_pass_number,
+    return llvm::formatv("__c2pnk_{0}_{1}_{2}_{3}", hint, data.ps_ctx.stage_index, data.ps_ctx.attempt_index,
                          data.tmp_var_counter++);
   }
 
@@ -235,12 +235,12 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
 
   if (data.error) {
     ps_ctx.error = std::move(data.error);
-    ps_ctx.whats_next = WhatsNext::MoveToNextFile;
+    ps_ctx.SetControl(StageControl::NextFile);
     return;
   }
 
   if (hoisted_vars.empty()) {
-    ps_ctx.whats_next = WhatsNext::MoveToNextPass;
+    ps_ctx.SetControl(StageControl::Continue);
     return;
   }
 
@@ -253,14 +253,14 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
                 "\n    at {0}\nFailed to add rewrite for to-be-hoisted variable {1}",
                 var_decl->getBeginLoc().printToString(data.Ctx.getSourceManager()), var_decl->getName()))),
             std::move(error));
-        ps_ctx.whats_next = WhatsNext::MoveToNextFile;
+        ps_ctx.SetControl(StageControl::NextFile);
         return;
       }
     }
   }
 
   ps_ctx.replacements = std::move(replacements);
-  ps_ctx.whats_next = WhatsNext::MoveToNextPass;
+  ps_ctx.SetControl(StageControl::Continue);
 }
 } // namespace pancake::pass_rename_to_be_hoisted_globals
 
@@ -268,7 +268,7 @@ namespace pancake::pass_hoist_locals {
 namespace {
 struct WorkerData {
   ASTContext &Ctx;
-  PipelineStageCtx &ps_ctx;
+  StageContext &ps_ctx;
   llvm::DenseMap<FunctionDecl *, Replacements> &replacements;
   llvm::DenseMap<FunctionDecl *, llvm::SmallVector<VarDecl *, 16>> function_prologues;
   llvm::Error error = llvm::Error::success();
@@ -400,7 +400,7 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
 
   if (data.error) {
     ps_ctx.error = std::move(data.error);
-    ps_ctx.whats_next = WhatsNext::MoveToNextFile;
+    ps_ctx.SetControl(StageControl::NextFile);
     return;
   }
 
@@ -413,13 +413,13 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
                 "\n    at {0}\nFailed to add rewrite for hoisted variable in function {1}",
                 func_decl->getBeginLoc().printToString(data.Ctx.getSourceManager()), func_decl->getName()))),
             std::move(error));
-        ps_ctx.whats_next = WhatsNext::MoveToNextFile;
+        ps_ctx.SetControl(StageControl::NextFile);
         return;
       }
     }
   }
 
   ps_ctx.replacements = std::move(replacements);
-  ps_ctx.whats_next = WhatsNext::MoveToNextPass;
+  ps_ctx.SetControl(StageControl::Continue);
 }
 } // namespace pancake::pass_hoist_locals

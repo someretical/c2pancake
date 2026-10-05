@@ -10,9 +10,9 @@ public:
   void HandleTranslationUnit(clang::ASTContext &Ctx) override;
 };
 
-class Action : public PipelineStage<Consumer> {
+class Action : public ClangStage<Consumer> {
 public:
-  explicit Action(PipelineStageCtx &ctx) : PipelineStage<Consumer>(ctx) { ctx.action_name = "InjectMemcpyPolyfill"; }
+  explicit Action(StageContext &ctx) : ClangStage<Consumer>(ctx) { ctx.stage_name = "InjectMemcpyPolyfill"; }
 };
 } // namespace pancake::pass_inject_memcpy_polyfill
 
@@ -23,9 +23,9 @@ public:
   void HandleTranslationUnit(clang::ASTContext &Ctx) override;
 };
 
-class Action : public PipelineStage<Consumer> {
+class Action : public ClangStage<Consumer> {
 public:
-  explicit Action(PipelineStageCtx &ctx) : PipelineStage<Consumer>(ctx) { ctx.action_name = "RewriteFunctionCalling"; }
+  explicit Action(StageContext &ctx) : ClangStage<Consumer>(ctx) { ctx.stage_name = "RewriteFunctionCalling"; }
 };
 } // namespace pancake::pass_function_calling
 

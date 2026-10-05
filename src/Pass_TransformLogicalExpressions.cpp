@@ -46,7 +46,7 @@ namespace pancake::pass_hoist_condition_expressions {
 namespace {
 struct WorkerData {
   ASTContext &Ctx;
-  PipelineStageCtx &ps_ctx;
+  StageContext &ps_ctx;
   llvm::SmallVector<Replacement, 64> &replacements;
   llvm::Error error = llvm::Error::success();
   size_t tmp_var_counter = 0;
@@ -62,7 +62,7 @@ public:
   static auto shouldTraversePostOrder() -> bool { return false; }
 
   auto GetTempVarName(std::string hint) -> auto {
-    return llvm::formatv("__c2pnk_{0}_{1}_{2}_{3}", hint, data.ps_ctx.major_pass_number, data.ps_ctx.minor_pass_number,
+    return llvm::formatv("__c2pnk_{0}_{1}_{2}_{3}", hint, data.ps_ctx.stage_index, data.ps_ctx.attempt_index,
                          data.tmp_var_counter++);
   }
 
@@ -160,7 +160,7 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
 
   if (data.error) {
     ps_ctx.error = std::move(data.error);
-    ps_ctx.whats_next = WhatsNext::MoveToNextFile;
+    ps_ctx.SetControl(StageControl::NextFile);
     return;
   }
 
@@ -173,14 +173,14 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
   }
 
   if (errors == 0 && replacements.empty()) {
-    ps_ctx.whats_next = WhatsNext::MoveToNextPass;
+    ps_ctx.SetControl(StageControl::Continue);
     return;
   }
   if (errors > 0) {
     PrintLogBegin(llvm::outs(), ps_ctx);
     llvm::outs() << llvm::formatv("Couldn't add {0} replacement{1}\n", errors, errors != 1 ? "s" : "");
   }
-  ps_ctx.whats_next = WhatsNext::RepeatPass;
+  ps_ctx.SetControl(StageControl::Repeat);
 }
 } // namespace pancake::pass_hoist_condition_expressions
 
@@ -213,7 +213,7 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
 
   if (error) {
     ps_ctx.error = llvm::joinErrors(CreateRuntimeError("Error during transformation"), std::move(error));
-    ps_ctx.whats_next = WhatsNext::MoveToNextFile;
+    ps_ctx.SetControl(StageControl::NextFile);
     return;
   }
 
@@ -228,14 +228,14 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
   }
 
   if (errors == 0 && changes.empty()) {
-    ps_ctx.whats_next = WhatsNext::MoveToNextPass;
+    ps_ctx.SetControl(StageControl::Continue);
     return;
   }
   if (errors > 0) {
     PrintLogBegin(llvm::outs(), ps_ctx);
     llvm::outs() << llvm::formatv("Couldn't add {0} replacement{1}\n", errors, errors != 1 ? "s" : "");
   }
-  ps_ctx.whats_next = WhatsNext::RepeatPass;
+  ps_ctx.SetControl(StageControl::Repeat);
 }
 } // namespace pancake::pass_rewrite_array_indexing
 
@@ -268,7 +268,7 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
 
   if (error) {
     ps_ctx.error = llvm::joinErrors(CreateRuntimeError("Error during transformation"), std::move(error));
-    ps_ctx.whats_next = WhatsNext::MoveToNextFile;
+    ps_ctx.SetControl(StageControl::NextFile);
     return;
   }
 
@@ -283,14 +283,14 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
   }
 
   if (errors == 0 && changes.empty()) {
-    ps_ctx.whats_next = WhatsNext::MoveToNextPass;
+    ps_ctx.SetControl(StageControl::Continue);
     return;
   }
   if (errors > 0) {
     PrintLogBegin(llvm::outs(), ps_ctx);
     llvm::outs() << llvm::formatv("Couldn't add {0} replacement{1}\n", errors, errors != 1 ? "s" : "");
   }
-  ps_ctx.whats_next = WhatsNext::RepeatPass;
+  ps_ctx.SetControl(StageControl::Repeat);
 }
 } // namespace pancake::pass_rewrite_struct_stabs
 
@@ -438,7 +438,7 @@ auto GetUsage(const ASTContext &ctx, const Expr *expr) -> Expected<Usage> {
 namespace {
 struct WorkerData {
   ASTContext &Ctx;
-  PipelineStageCtx &ps_ctx;
+  StageContext &ps_ctx;
   llvm::SmallVector<Replacement, 64> &replacements;
   llvm::Error error = llvm::Error::success();
   size_t tmp_var_counter = 0;
@@ -451,7 +451,7 @@ public:
   explicit Worker(struct WorkerData &data) : data(data) {}
 
   auto GetTempVarName(std::string hint) -> auto {
-    return llvm::formatv("__c2pnk_{0}_{1}_{2}_{3}", hint, data.ps_ctx.major_pass_number, data.ps_ctx.minor_pass_number,
+    return llvm::formatv("__c2pnk_{0}_{1}_{2}_{3}", hint, data.ps_ctx.stage_index, data.ps_ctx.attempt_index,
                          data.tmp_var_counter++);
   }
 
@@ -563,7 +563,7 @@ public:
                                       std::to_underlying(usage_kind))));
         }
         }
-        data.ps_ctx.whats_next = WhatsNext::RepeatPass;
+        data.ps_ctx.SetControl(StageControl::Repeat);
       } else {
         if (auto error = PrintSourceText(os, string_literal, data.Ctx)) {
           return llvm::joinErrors(CreateRuntimeError(std::move(llvm::formatv(
@@ -845,7 +845,7 @@ public:
           PrintType(compound_literal->getType(), tmp_var_name), tmp_var_name, *compound_literal_initializer));
       os << tmp_var_name;
       // we need to rerun this pass to process the compound literal initializer expression
-      data.ps_ctx.whats_next = WhatsNext::RepeatPass;
+      data.ps_ctx.SetControl(StageControl::Repeat);
     } else if (auto *statement_expr = dyn_cast<StmtExpr>(expr)) {
       // StmtExpr is a GNU extension that allows a block of statements to be used as an expression
       // The value of the expression is the value of the last statement in the block
@@ -883,7 +883,7 @@ public:
           }
           os2 << "\n";
           // we need to rerun this pass to process the statements in the block
-          data.ps_ctx.whats_next = WhatsNext::RepeatPass;
+          data.ps_ctx.SetControl(StageControl::Repeat);
         }
         os2 << "}\n";
         // don't add anything to os
@@ -925,7 +925,7 @@ public:
             }
             os2 << "\n";
             // we need to rerun this pass to process the statements in the block
-            data.ps_ctx.whats_next = WhatsNext::RepeatPass;
+            data.ps_ctx.SetControl(StageControl::Repeat);
           }
         }
         os2 << "}\n";
@@ -1692,7 +1692,7 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
 
   if (data.error) {
     ps_ctx.error = std::move(data.error);
-    ps_ctx.whats_next = WhatsNext::MoveToNextFile;
+    ps_ctx.SetControl(StageControl::NextFile);
     return;
   }
 
@@ -1707,7 +1707,7 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
 
     if (auto error = ps_ctx.replacements.add(r)) {
       ps_ctx.error = llvm::joinErrors(CreateRuntimeError("Error adding replacement"), std::move(error));
-      ps_ctx.whats_next = WhatsNext::MoveToNextFile;
+      ps_ctx.SetControl(StageControl::NextFile);
       return;
     }
   }
@@ -1716,8 +1716,8 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
   // The statment expr contains a block of statements which are not recursively traversed by the AST visitor in
   // this pass. By running this pass again, we can ensure that any nested expressions within the statement expression
   // are also transformed.
-  if (!ps_ctx.whats_next.has_value()) {
-    ps_ctx.whats_next = WhatsNext::MoveToNextPass;
+  if (!ps_ctx.HasControl()) {
+    ps_ctx.SetControl(StageControl::Continue);
   }
 }
 } // namespace pancake::pass_lower_nested_expressions
@@ -1753,7 +1753,7 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
 
   if (error) {
     ps_ctx.error = llvm::joinErrors(CreateRuntimeError("Error during transformation"), std::move(error));
-    ps_ctx.whats_next = WhatsNext::MoveToNextFile;
+    ps_ctx.SetControl(StageControl::NextFile);
     return;
   }
 
@@ -1768,13 +1768,13 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
   }
 
   if (errors == 0 && changes.empty()) {
-    ps_ctx.whats_next = WhatsNext::MoveToNextPass;
+    ps_ctx.SetControl(StageControl::Continue);
     return;
   }
   if (errors > 0) {
     PrintLogBegin(llvm::outs(), ps_ctx);
     llvm::outs() << llvm::formatv("Couldn't add {0} replacement{1}\n", errors, errors != 1 ? "s" : "");
   }
-  ps_ctx.whats_next = WhatsNext::RepeatPass;
+  ps_ctx.SetControl(StageControl::Repeat);
 }
 } // namespace pancake::pass_simplify_double_negation

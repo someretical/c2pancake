@@ -4,15 +4,19 @@
 #include "Pipeline.h"
 
 namespace pancake::pass_c2pancake {
+struct Finalizer {
+  static auto Write(StageContext &ctx, clang::CompilerInstance &compiler) -> llvm::Error;
+};
+
 class Consumer : public C2PancakePass {
 public:
   using C2PancakePass::C2PancakePass; // inherit constructor
   void HandleTranslationUnit(clang::ASTContext &Ctx) override;
 };
 
-class Action : public PipelineStage<Consumer> {
+class Action : public ClangStage<Consumer> {
 public:
-  explicit Action(PipelineStageCtx &ctx) : PipelineStage<Consumer>(ctx) { ctx.action_name = "C2Pancake"; }
+  explicit Action(StageContext &ctx) : ClangStage<Consumer>(ctx) { ctx.stage_name = "C2Pancake"; }
 };
 } // namespace pancake::pass_c2pancake
 

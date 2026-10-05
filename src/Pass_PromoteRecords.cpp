@@ -120,7 +120,7 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
 
   if (error) {
     ps_ctx.error = llvm::joinErrors(CreateRuntimeError("Error during transformation"), std::move(error));
-    ps_ctx.whats_next = WhatsNext::MoveToNextFile;
+    ps_ctx.SetControl(StageControl::NextFile);
     return;
   }
 
@@ -135,14 +135,14 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
   }
 
   if (errors == 0 && changes.empty()) {
-    ps_ctx.whats_next = WhatsNext::MoveToNextPass;
+    ps_ctx.SetControl(StageControl::Continue);
     return;
   }
   if (errors > 0) {
     PrintLogBegin(llvm::outs(), ps_ctx);
     llvm::outs() << llvm::formatv("Couldn't add {0} replacement{1}\n", errors, errors != 1 ? "s" : "");
   }
-  ps_ctx.whats_next = WhatsNext::RepeatPass;
+  ps_ctx.SetControl(StageControl::Repeat);
 }
 }; // namespace pancake::pass_name_anon_records
 
@@ -241,7 +241,7 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
 
   if (error) {
     ps_ctx.error = llvm::joinErrors(CreateRuntimeError("Error during transformation"), std::move(error));
-    ps_ctx.whats_next = WhatsNext::MoveToNextFile;
+    ps_ctx.SetControl(StageControl::NextFile);
     return;
   }
 
@@ -256,14 +256,14 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
   }
 
   if (errors == 0 && changes.empty()) {
-    ps_ctx.whats_next = WhatsNext::MoveToNextPass;
+    ps_ctx.SetControl(StageControl::Continue);
     return;
   }
   if (errors > 0) {
     PrintLogBegin(llvm::outs(), ps_ctx);
     llvm::outs() << llvm::formatv("Couldn't add {0} replacement{1}\n", errors, errors != 1 ? "s" : "");
   }
-  ps_ctx.whats_next = WhatsNext::RepeatPass;
+  ps_ctx.SetControl(StageControl::Repeat);
 }
 } // namespace pancake::pass_rename_to_be_promoted_records
 
@@ -271,7 +271,7 @@ namespace pancake::pass_promote_records {
 namespace {
 struct WorkerData {
   ASTContext &Ctx;
-  PipelineStageCtx &ps_ctx;
+  StageContext &ps_ctx;
   llvm::SmallVector<Replacement, 64> &replacements;
   llvm::Error error = llvm::Error::success();
   FunctionDecl *current_function_decl = nullptr;
@@ -415,18 +415,18 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
 
   if (data.error) {
     ps_ctx.error = std::move(data.error);
-    ps_ctx.whats_next = WhatsNext::MoveToNextFile;
+    ps_ctx.SetControl(StageControl::NextFile);
     return;
   }
 
   for (const auto &r : replacements) {
     if (auto error = ps_ctx.replacements.add(r)) {
       ps_ctx.error = llvm::joinErrors(CreateRuntimeError("Add replacement conflict"), std::move(error));
-      ps_ctx.whats_next = WhatsNext::MoveToNextFile;
+      ps_ctx.SetControl(StageControl::NextFile);
       return;
     }
   }
 
-  ps_ctx.whats_next = WhatsNext::MoveToNextPass;
+  ps_ctx.SetControl(StageControl::Continue);
 }
 } // namespace pancake::pass_promote_records

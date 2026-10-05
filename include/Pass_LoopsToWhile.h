@@ -10,9 +10,9 @@ public:
   void HandleTranslationUnit(clang::ASTContext &Ctx) override;
 };
 
-class Action : public PipelineStage<Consumer> {
+class Action : public ClangStage<Consumer> {
 public:
-  explicit Action(PipelineStageCtx &ctx) : PipelineStage<Consumer>(ctx) { ctx.action_name = "NormaliseWhileLoops"; }
+  explicit Action(StageContext &ctx) : ClangStage<Consumer>(ctx) { ctx.stage_name = "NormaliseWhileLoops"; }
 };
 } // namespace pancake::pass_normalise_while_loops
 
@@ -23,10 +23,10 @@ public:
   void HandleTranslationUnit(clang::ASTContext &Ctx) override;
 };
 
-class Action : public PipelineStage<Consumer> {
+class Action : public ClangStage<Consumer> {
 public:
-  explicit Action(PipelineStageCtx &ctx) : PipelineStage<Consumer>(ctx) {
-    ctx.action_name = "RewriteContinueInForLoops";
+  explicit Action(StageContext &ctx) : ClangStage<Consumer>(ctx) {
+    ctx.stage_name = "RewriteContinueInForLoops";
   }
 };
 } // namespace pancake::pass_process_continue_in_for_loops
@@ -38,9 +38,9 @@ public:
   void HandleTranslationUnit(clang::ASTContext &Ctx) override;
 };
 
-class Action : public PipelineStage<Consumer> {
+class Action : public ClangStage<Consumer> {
 public:
-  explicit Action(PipelineStageCtx &ctx) : PipelineStage<Consumer>(ctx) { ctx.action_name = "RewriteForToWhile"; }
+  explicit Action(StageContext &ctx) : ClangStage<Consumer>(ctx) { ctx.stage_name = "RewriteForToWhile"; }
 };
 } // namespace pancake::pass_for_to_while
 
@@ -51,10 +51,10 @@ public:
   void HandleTranslationUnit(clang::ASTContext &Ctx) override;
 };
 
-class Action : public PipelineStage<Consumer> {
+class Action : public ClangStage<Consumer> {
 public:
-  explicit Action(PipelineStageCtx &ctx) : PipelineStage<Consumer>(ctx) {
-    ctx.action_name = "RewriteContinueInDoWhileLoops";
+  explicit Action(StageContext &ctx) : ClangStage<Consumer>(ctx) {
+    ctx.stage_name = "RewriteContinueInDoWhileLoops";
   }
 };
 } // namespace pancake::pass_process_continue_in_do_while_loops
@@ -66,9 +66,9 @@ public:
   void HandleTranslationUnit(clang::ASTContext &Ctx) override;
 };
 
-class Action : public PipelineStage<Consumer> {
+class Action : public ClangStage<Consumer> {
 public:
-  explicit Action(PipelineStageCtx &ctx) : PipelineStage<Consumer>(ctx) { ctx.action_name = "RewriteDoWhileToWhile"; }
+  explicit Action(StageContext &ctx) : ClangStage<Consumer>(ctx) { ctx.stage_name = "RewriteDoWhileToWhile"; }
 };
 } // namespace pancake::pass_do_while_to_while
 #endif // C2PANCAKE_PASS_LOOPSTOWHILE_H

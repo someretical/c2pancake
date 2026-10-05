@@ -31,7 +31,7 @@ namespace pancake::pass_normalise_if_statements {
 namespace {
 struct WorkerData {
   ASTContext &Ctx;
-  PipelineStageCtx &ps_ctx;
+  StageContext &ps_ctx;
   llvm::SmallVector<Replacement, 64> &replacements;
   llvm::Error error = llvm::Error::success();
   size_t if_cond_tmp_var_counter = 0;
@@ -47,8 +47,8 @@ public:
   static auto shouldTraversePostOrder() -> bool { return true; }
 
   auto GetIfCondTempVarName() -> auto {
-    return llvm::formatv("__c2pnk_if_cond_tmp_var_{0}_{1}_{2}", data.ps_ctx.major_pass_number,
-                         data.ps_ctx.minor_pass_number, data.if_cond_tmp_var_counter++);
+    return llvm::formatv("__c2pnk_if_cond_tmp_var_{0}_{1}_{2}", data.ps_ctx.stage_index,
+                         data.ps_ctx.attempt_index, data.if_cond_tmp_var_counter++);
   }
 
   auto IsPartOfElseIfChain(const IfStmt *if_stmt) -> bool {
@@ -196,7 +196,7 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
 
   if (data.error) {
     ps_ctx.error = std::move(data.error);
-    ps_ctx.whats_next = WhatsNext::MoveToNextFile;
+    ps_ctx.SetControl(StageControl::NextFile);
     return;
   }
 
@@ -209,13 +209,13 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
   }
 
   if (errors == 0 && replacements.empty()) {
-    ps_ctx.whats_next = WhatsNext::MoveToNextPass;
+    ps_ctx.SetControl(StageControl::Continue);
     return;
   }
   if (errors > 0) {
     PrintLogBegin(llvm::outs(), ps_ctx);
     llvm::outs() << llvm::formatv("Couldn't add {0} replacement{1}\n", errors, errors != 1 ? "s" : "");
   }
-  ps_ctx.whats_next = WhatsNext::RepeatPass;
+  ps_ctx.SetControl(StageControl::Repeat);
 }
 } // namespace pancake::pass_normalise_if_statements

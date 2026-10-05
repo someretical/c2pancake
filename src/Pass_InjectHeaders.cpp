@@ -33,7 +33,7 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
   const auto *file_entry = sm.getFileEntryForID(sm.getMainFileID());
   if (file_entry == nullptr) {
     ps_ctx.error = CreateRuntimeError("Main file entry is null");
-    ps_ctx.whats_next = WhatsNext::MoveToNextFile;
+    ps_ctx.SetControl(StageControl::NextFile);
     return;
   }
 
@@ -54,10 +54,10 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
   for (const auto &r : replacements) {
     if (auto error = ps_ctx.replacements.add(r)) {
       ps_ctx.error = llvm::joinErrors(CreateRuntimeError("Add replacement conflict"), std::move(error));
-      ps_ctx.whats_next = WhatsNext::MoveToNextFile;
+      ps_ctx.SetControl(StageControl::NextFile);
       return;
     }
   }
-  ps_ctx.whats_next = WhatsNext::MoveToNextPass;
+  ps_ctx.SetControl(StageControl::Continue);
 }
 } // namespace pancake::pass_inject_headers

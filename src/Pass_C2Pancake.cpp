@@ -32,7 +32,7 @@ namespace pancake::pass_c2pancake {
 namespace {
 struct WorkerData {
   ASTContext &Ctx;
-  PipelineStageCtx &ps_ctx;
+  StageContext &ps_ctx;
   llvm::DenseMap<VarDecl *, uint64_t> &global_var_map;
   llvm::SmallVector<Replacement, 64> &replacements;
   llvm::Error error = llvm::Error::success();
@@ -1003,18 +1003,18 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
 
   if (data.error) {
     ps_ctx.error = std::move(data.error);
-    ps_ctx.whats_next = WhatsNext::MoveToNextFile;
+    ps_ctx.SetControl(StageControl::NextFile);
     return;
   }
 
   for (const auto &r : replacements) {
     if (auto error = ps_ctx.replacements.add(r)) {
       ps_ctx.error = llvm::joinErrors(CreateRuntimeError("Add replacement conflict"), std::move(error));
-      ps_ctx.whats_next = WhatsNext::MoveToNextFile;
+      ps_ctx.SetControl(StageControl::NextFile);
       return;
     }
   }
 
-  ps_ctx.whats_next = WhatsNext::MoveToNextPass;
+  ps_ctx.SetControl(StageControl::Continue);
 }
 } // namespace pancake::pass_c2pancake

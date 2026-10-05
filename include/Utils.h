@@ -25,6 +25,10 @@
 #include <llvm/Support/raw_ostream.h>
 
 #include <source_location>
+#include <any>
+#include <optional>
+#include <typeindex>
+#include <unordered_map>
 #include <string>
 #include <utility>
 
@@ -72,42 +76,93 @@ public:
 };
 
 /*
-A new ASTFrontendAction is created for each TU for each pass
-So there's a 1-1 relationship between PipelineAction and C2PancakePass
-The Ctx is created inside of Pipeline::Run and passed by reference to each PipelineAction and then C2PancakePass
+Each stage receives a fresh StageContext for every attempt. The per-input
+PipelineRunCtx owns state and artifacts shared by all stages for that input.
 */
-enum class WhatsNext : uint8_t { MoveToNextPass, RepeatPass, MoveToNextFile, Abort, FinalPass };
-enum class RunResult : uint8_t { Success, RepeatPass, Fail };
-struct PipelineStageCtx {
-  const size_t major_pass_number;             // provided by Pipeline::Run
-  const size_t minor_pass_number;             // provided by Pipeline::Run
-  const std::string &current_file;            // provided by Pipeline::Run
-  const std::string &current_suffix;          // provided by Pipeline::Run
-  const std::string &next_file;               // provided by Pipeline::Run
-  const std::string &next_suffix;             // provided by Pipeline::Run
-  clang::tooling::Replacements &replacements; // provided by Pipeline::Run, the pass adds to it
+enum class StageControl : uint8_t { Continue, Repeat, NextFile, Abort };
+enum class StageKind : uint8_t { Clang, File };
 
-  std::optional<std::string> action_name = std::nullopt; // set by the PipelineAction constructor
-  std::optional<WhatsNext> whats_next = std::nullopt;    // set by the PipelineAction inside of HandleTranslationUnit
-  llvm::Error error = llvm::Error::success();            // set by the pass itself if an error occurs
-  llvm::Error end_src_file_action_error =
-      llvm::Error::success(); // set by PipelineAction::EndSourceFileAction if an error occurs at that stage. These
-                              // errors are always result in an abort...
-  bool file_modified = false; // set by EndSourceFileAction if the file was modified by the pass
-
-  explicit PipelineStageCtx(const size_t pass_number, const size_t minor_pass_number,
-                            clang::tooling::Replacements &replacements, const std::string &current_file,
-                            const std::string &current_suffix, const std::string &next_file,
-                            const std::string &next_suffix)
-      : major_pass_number(pass_number), minor_pass_number(minor_pass_number), current_file(current_file),
-        current_suffix(current_suffix), next_file(next_file), next_suffix(next_suffix), replacements(replacements) {}
+struct StageResult {
+  StageControl control = StageControl::Continue;
+  bool file_modified = false;
+  std::optional<std::string> next_source_file;
+  std::vector<std::string> generated_files;
 };
 
-auto PrintLogBegin(llvm::raw_ostream &os, const PipelineStageCtx &ctx) -> void;
+inline auto CreateRuntimeError(const std::string &msg,
+                               const std::source_location loc = std::source_location::current()) -> llvm::Error;
+
+class PipelineArtifacts {
+  std::unordered_map<std::type_index, std::any> values;
+
+public:
+  template <typename T> void Set(T value) { values.insert_or_assign(typeid(T), std::move(value)); }
+
+  template <typename T> auto Get() -> T * {
+    const auto it = values.find(typeid(T));
+    return it == values.end() ? nullptr : std::any_cast<T>(&it->second);
+  }
+
+  template <typename T> auto Require() -> llvm::Expected<T &> {
+    auto *value = Get<T>();
+    if (value == nullptr) {
+      return CreateRuntimeError("Required pipeline artifact is missing");
+    }
+    return *value;
+  }
+};
+
+struct PipelineRunCtx {
+  const std::string &initial_file;
+  PipelineArtifacts artifacts;
+  std::vector<std::string> generated_files;
+
+  explicit PipelineRunCtx(const std::string &initial_file) : initial_file(initial_file) {}
+};
+
+struct StageInput {
+  PipelineRunCtx &run;
+  const size_t stage_index;
+  const size_t attempt_index;
+  const std::string &current_file;
+  const std::string &current_suffix;
+  const std::string &next_file;
+  const std::string &next_suffix;
+
+  StageInput(PipelineRunCtx &run, size_t stage_index, size_t attempt_index, const std::string &current_file,
+             const std::string &current_suffix, const std::string &next_file, const std::string &next_suffix)
+      : run(run), stage_index(stage_index), attempt_index(attempt_index), current_file(current_file),
+        current_suffix(current_suffix), next_file(next_file), next_suffix(next_suffix) {}
+};
+
+struct StageOutput {
+  clang::tooling::Replacements replacements;
+  std::optional<std::string> stage_name;
+  llvm::Error error = llvm::Error::success();
+  StageResult result;
+  bool control_set = false;
+
+  void SetControl(StageControl control) {
+    result.control = control;
+    control_set = true;
+  }
+  auto HasControl() const -> bool { return control_set; }
+  void MarkModified() { result.file_modified = true; }
+  void SetOutputFile(std::string path) { result.next_source_file = std::move(path); }
+  void AddGeneratedFile(std::string path) { result.generated_files.emplace_back(std::move(path)); }
+};
+
+struct StageContext : StageInput, StageOutput {
+  StageContext(PipelineRunCtx &run, size_t stage_index, size_t attempt_index, const std::string &current_file,
+               const std::string &current_suffix, const std::string &next_file, const std::string &next_suffix)
+      : StageInput(run, stage_index, attempt_index, current_file, current_suffix, next_file, next_suffix) {}
+};
+
+auto PrintLogBegin(llvm::raw_ostream &os, const StageContext &ctx) -> void;
 
 auto PrintLogBeginShort(llvm::raw_ostream &os, llvm::StringRef in_file) -> void;
 
-inline auto CreateRuntimeError(const std::string &msg, const std::source_location loc = std::source_location::current())
+inline auto CreateRuntimeError(const std::string &msg, const std::source_location loc)
     -> llvm::Error {
   std::string base;
   llvm::raw_string_ostream os(base);
