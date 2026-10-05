@@ -24,12 +24,12 @@
 #include <llvm/Support/FormatVariadic.h>
 #include <llvm/Support/raw_ostream.h>
 
-#include <source_location>
 #include <any>
 #include <optional>
-#include <typeindex>
-#include <unordered_map>
+#include <source_location>
 #include <string>
+#include <string_view>
+#include <unordered_map>
 #include <utility>
 
 namespace clang::ast_matchers {
@@ -89,26 +89,48 @@ struct StageResult {
   std::vector<std::string> generated_files;
 };
 
-inline auto CreateRuntimeError(const std::string &msg,
-                               const std::source_location loc = std::source_location::current()) -> llvm::Error;
+inline auto CreateRuntimeError(const std::string &msg, std::source_location loc = std::source_location::current())
+    -> llvm::Error;
+
+template <typename T> struct ArtifactKey {
+  std::string_view name;
+};
 
 class PipelineArtifacts {
-  std::unordered_map<std::type_index, std::any> values;
+  std::unordered_map<std::string, std::any> values;
 
 public:
-  template <typename T> void Set(T value) { values.insert_or_assign(typeid(T), std::move(value)); }
+  template <typename T> auto Set(const ArtifactKey<T> key, T value) -> llvm::Error {
+    const auto [it, inserted] = values.try_emplace(std::string(key.name), std::move(value));
+    if (!inserted) {
+      return CreateRuntimeError(llvm::formatv("Pipeline artifact \"{0}\" was already published", key.name));
+    }
+    return llvm::Error::success();
+  }
 
-  template <typename T> auto Get() -> T * {
-    const auto it = values.find(typeid(T));
+  template <typename T> auto Get(const ArtifactKey<T> key) -> T * {
+    const auto it = values.find(std::string(key.name));
     return it == values.end() ? nullptr : std::any_cast<T>(&it->second);
   }
 
-  template <typename T> auto Require() -> llvm::Expected<T &> {
-    auto *value = Get<T>();
+  template <typename T> auto Require(const ArtifactKey<T> key) -> llvm::Expected<T &> {
+    auto *value = Get(key);
     if (value == nullptr) {
-      return CreateRuntimeError("Required pipeline artifact is missing");
+      return CreateRuntimeError(llvm::formatv("Required pipeline artifact \"{0}\" is missing", key.name));
     }
     return *value;
+  }
+
+  template <typename T> auto Replace(const ArtifactKey<T> key, T value) -> llvm::Error {
+    const auto it = values.find(std::string(key.name));
+    if (it == values.end()) {
+      return CreateRuntimeError(llvm::formatv("Cannot replace missing pipeline artifact \"{0}\"", key.name));
+    }
+    if (!std::any_cast<T>(&it->second)) {
+      return CreateRuntimeError(llvm::formatv("Pipeline artifact \"{0}\" has an unexpected type", key.name));
+    }
+    it->second = std::move(value);
+    return llvm::Error::success();
   }
 };
 
@@ -162,8 +184,7 @@ auto PrintLogBegin(llvm::raw_ostream &os, const StageContext &ctx) -> void;
 
 auto PrintLogBeginShort(llvm::raw_ostream &os, llvm::StringRef in_file) -> void;
 
-inline auto CreateRuntimeError(const std::string &msg, const std::source_location loc)
-    -> llvm::Error {
+inline auto CreateRuntimeError(const std::string &msg, const std::source_location loc) -> llvm::Error {
   std::string base;
   llvm::raw_string_ostream os(base);
   os << llvm::formatv("Runtime error:\n    at {0}:{1}:{2}: ", loc.file_name(), loc.line(), loc.column());

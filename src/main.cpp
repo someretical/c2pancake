@@ -55,6 +55,21 @@ llvm::cl::opt<PointerWidth> pointer_bits("pointer-bits", llvm::cl::desc("Overrid
                                                           clEnumValN(PointerWidth::W64, "64", "64-bit")),
                                          llvm::cl::init(PointerWidth::None));
 
+llvm::cl::opt<uint64_t> stack_size_opt("stack-size",
+                                       llvm::cl::desc("Override Pancake stack size (default: 0x10000 = 4096 * 16)"),
+                                       llvm::cl::cat(c2_pancake_options), llvm::cl::init(0x10000UL));
+
+llvm::cl::opt<std::string> shell_path("shell-path", llvm::cl::desc("Override shell path (default: /bin/sh)"),
+                                      llvm::cl::cat(c2_pancake_options), llvm::cl::init("/bin/sh"));
+
+llvm::cl::opt<std::string> cake_path("cake-path", llvm::cl::desc("Path to the Cake compiler (default: cake in PATH)"),
+                                     llvm::cl::cat(c2_pancake_options), llvm::cl::init("cake"));
+
+llvm::cl::opt<std::string>
+    cake_options("cake-options",
+                 llvm::cl::desc("Override Cake compiler options (default: --pancake --main_return=true)"),
+                 llvm::cl::cat(c2_pancake_options), llvm::cl::init("--pancake --main_return=true"));
+
 llvm::cl::opt<size_t> max_pass_retries(
     "max-pass-retries",
     llvm::cl::desc("Maximum number of retries for a pass before moving to the next pass (default: 20)"),
@@ -87,7 +102,9 @@ auto main(int argc, const char **argv) -> int {
 
   The main thing HandleTranslationUnit should do is add Replacements to ps_ctx.replacements.
   The default finalizer applies them, formats the result, and writes the next pipeline file.
-  Stages can share typed data through ps_ctx.run.artifacts. A non-Clang stage can instead
+  Stages can share named typed data through ps_ctx.run.artifacts.Set(key, value) and
+  artifacts.Require(key). Publication is single-assignment; use Replace only for intentional updates.
+  A non-Clang stage can instead
   be registered with pipeline.AddFileStage<T>(); T must construct from StageContext&
   and implement auto Run() -> llvm::Error, setting the stage control with ctx.SetControl().
 

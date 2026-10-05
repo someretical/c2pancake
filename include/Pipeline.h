@@ -13,8 +13,8 @@
 #include <clang/Tooling/CompilationDatabase.h>
 #include <clang/Tooling/Core/Replacement.h>
 #include <clang/Tooling/Tooling.h>
-#include <llvm-22/llvm/Support/ErrorHandling.h>
 #include <llvm/ADT/StringRef.h>
+#include <llvm/Support/ErrorHandling.h>
 #include <llvm/Support/FormatAdapters.h>
 #include <llvm/Support/FormatVariadic.h>
 
@@ -60,6 +60,7 @@ public:
   void HandleTranslationUnit(clang::ASTContext &Ctx) override = 0;
 };
 
+// Default finalizer for clang stages. Applies replacements, formats the result, and writes the next pipeline file.
 struct ReplacementOutputFinalizer {
   static auto Write(StageContext &ctx, clang::CompilerInstance &compiler) -> llvm::Error {
     if (ctx.replacements.empty()) {

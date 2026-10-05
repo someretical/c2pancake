@@ -21,20 +21,28 @@
 #include <llvm/ADT/StringRef.h>
 #include <llvm/Support/Error.h>
 #include <llvm/Support/ErrorHandling.h>
+#include <llvm/Support/Program.h>
 #include <llvm/Support/raw_ostream.h>
+
 #include <string>
 #include <utility>
 
 using namespace clang;
 using namespace clang::tooling;
 
+extern llvm::cl::opt<uint64_t> stack_size_opt;
+extern llvm::cl::opt<std::string> shell_path;
+extern llvm::cl::opt<std::string> cake_path;
+extern llvm::cl::opt<std::string> cake_options;
+
 namespace pancake::pass_c2pancake {
 namespace {
 struct WorkerData {
   ASTContext &Ctx;
   StageContext &ps_ctx;
+  llvm::raw_string_ostream &tu_os;
+  llvm::raw_ostream &ffi_os;
   llvm::DenseMap<VarDecl *, uint64_t> &global_var_map;
-  llvm::SmallVector<Replacement, 64> &replacements;
   llvm::Error error = llvm::Error::success();
   uint64_t next_global_var_addr = 0x0UL;
   size_t tmp_var_counter = 0;
@@ -146,15 +154,18 @@ public:
         data.global_var_map[var_decl] = addr;
         // TODO replace with comment that includes the address
 
-        data.replacements.emplace_back(
-            data.Ctx.getSourceManager(), CharSourceRange::getTokenRange(var_decl->getSourceRange()),
-            llvm::formatv("/* \"{0}\" at offset {1:x} */", var_decl->getName(), addr).str(), data.Ctx.getLangOpts());
+        data.tu_os << llvm::formatv("/* \"{0}\" at offset {1:x} */\n", var_decl->getName(), addr);
         continue;
       }
 
       data.error = CreateRuntimeError(std::move(
           llvm::formatv("\n    at {0}\nUnexpected top-level declaration: {1}",
                         decl->getBeginLoc().printToString(data.Ctx.getSourceManager()), decl->getDeclKindName())));
+      return false;
+    }
+
+    if (auto error = data.ps_ctx.run.artifacts.Set(heap_size_key, HeapSize{data.next_global_var_addr})) {
+      data.error = std::move(error);
       return false;
     }
 
@@ -170,8 +181,21 @@ public:
       return true;
     }
 
-    // TODO check function attributes
-    // func_decl->getAttrs();
+    if (FuncIsFFIWrapper(func_decl)) {
+      // grab annotation containing the include path
+      auto include_path = GetFFIFuncIncludePath(func_decl);
+      if (auto error = include_path.takeError()) {
+        data.error = std::move(error);
+        return false;
+      }
+      data.ffi_os << llvm::formatv("#include <{0}>\n", include_path.get());
+
+      // grab src code for func_decl and write to ffi_os
+      data.ffi_os << Lexer::getSourceText(CharSourceRange::getTokenRange(func_decl->getSourceRange()),
+                                          data.Ctx.getSourceManager(), data.Ctx.getLangOpts())
+                  << "\n";
+      return true;
+    }
 
     auto *body = func_decl->getBody();
     if (body != nullptr) {
@@ -207,9 +231,8 @@ public:
         }
         os << "}\n";
         os.flush();
-        data.replacements.emplace_back(data.Ctx.getSourceManager(),
-                                       CharSourceRange::getTokenRange(func_decl->getSourceRange()), replacement_text,
-                                       data.Ctx.getLangOpts());
+
+        data.tu_os << replacement_text;
       } else {
         data.error = CreateRuntimeError(std::move(
             llvm::formatv("\n    at {0}\nFunction body is not a compound statement: {1}",
@@ -219,6 +242,25 @@ public:
     }
 
     return true;
+  }
+
+  auto GetFFIFuncIncludePath(FunctionDecl *func_decl) -> Expected<std::string> {
+    auto &attrs = func_decl->getAttrs();
+    for (auto *attr : attrs) {
+      if (auto *annotate_attr = llvm::dyn_cast<AnnotateAttr>(attr)) {
+        auto annotation = annotate_attr->getAnnotation();
+        if (annotation.starts_with("__c2pnk_ffi_include_path_")) {
+          return annotation.substr(strlen("__c2pnk_ffi_include_path_")).str();
+        }
+      }
+    }
+    return CreateRuntimeError(std::move(
+        llvm::formatv("\n    at {0}\nFunction {1} does not have an include path annotation",
+                      func_decl->getBeginLoc().printToString(data.Ctx.getSourceManager()), func_decl->getName())));
+  }
+
+  static auto FuncIsFFIWrapper(FunctionDecl *func_decl) -> bool {
+    return func_decl->getName().starts_with("__c2pnk_ffi_wrapper_");
   }
 
   auto BuildStmt(Stmt *stmt) -> Expected<std::string> {
@@ -398,7 +440,7 @@ public:
             usage_kind = Usage::Place;
           }
 
-          std::optional<size_t> heap_alignment = std::nullopt;
+          // std::optional<size_t> heap_alignment = std::nullopt;
 
           switch (usage_kind) {
           case Usage::Value: {
@@ -995,11 +1037,18 @@ public:
 } // namespace
 
 auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
-  llvm::SmallVector<Replacement, 64> replacements;
+  std::string tu_replacement_text;
+  std::string ffi_replacement_text;
+  llvm::raw_string_ostream tu_os(tu_replacement_text);
+  llvm::raw_string_ostream ffi_os(ffi_replacement_text);
+
   llvm::DenseMap<VarDecl *, uint64_t> global_var_map;
-  WorkerData data{.Ctx = Ctx, .ps_ctx = ps_ctx, .global_var_map = global_var_map, .replacements = replacements};
+  WorkerData data{.Ctx = Ctx, .ps_ctx = ps_ctx, .tu_os = tu_os, .ffi_os = ffi_os, .global_var_map = global_var_map};
   Worker w(data);
   w.TraverseDecl(Ctx.getTranslationUnitDecl());
+
+  tu_os.flush();
+  ffi_os.flush();
 
   if (data.error) {
     ps_ctx.error = std::move(data.error);
@@ -1007,14 +1056,193 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
     return;
   }
 
-  for (const auto &r : replacements) {
-    if (auto error = ps_ctx.replacements.add(r)) {
-      ps_ctx.error = llvm::joinErrors(CreateRuntimeError("Add replacement conflict"), std::move(error));
-      ps_ctx.SetControl(StageControl::NextFile);
-      return;
-    }
+  if (auto error = ps_ctx.run.artifacts.Set(translation_unit_output_key,
+                                            TranslationUnitOutput{.content = std::move(tu_replacement_text)})) {
+    ps_ctx.error = std::move(error);
+    ps_ctx.SetControl(StageControl::NextFile);
+    return;
+  }
+  if (auto error = ps_ctx.run.artifacts.Set(ffi_output_key, FFIOutput{.content = std::move(ffi_replacement_text)})) {
+    ps_ctx.error = std::move(error);
+    ps_ctx.SetControl(StageControl::NextFile);
+    return;
   }
 
   ps_ctx.SetControl(StageControl::Continue);
+}
+
+namespace {
+/*
+Variables to replace:
+- {0} total memory
+- {1} heap size
+- {2} stack size
+*/
+const char *SCAFFOLD_TEMPLATE = R"(
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <string.h>
+
+static char cml_memory[{0}];
+extern void *cml_heap;
+extern void *cml_stack;
+extern void *cml_stackend;
+extern void cml_main(void);
+
+void cml_exit(int arg) {{
+  exit(arg);
+}
+
+void cml_err(int arg) {{
+  if (arg == 3) {{
+    fprintf(stderr,
+      "Memory not ready for entry. "
+      "You may have not run the init code yet, "
+      "or be trying to enter during an FFI call.\\n");
+  }
+  cml_exit(arg);
+}
+
+void cml_clear() {{}
+
+static void init_pancake_mem(void) {{
+  unsigned long cml_heap_sz  = {1};
+  unsigned long cml_stack_sz = {2};
+  cml_heap     = cml_memory;
+  cml_stack    = cml_heap + cml_heap_sz;
+  cml_stackend = cml_stack + cml_stack_sz;
+}
+
+int main(void) {{
+  init_pancake_mem();
+  cml_main();
+  return 0;
+}
+)";
+
+/*
+Variables to replace:
+- {0} FFI functions
+*/
+const char *FFI_TEMPLATE = R"(
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+
+{0}
+)";
+
+/*
+Variables to replace:
+- {0} cake path
+- {1} cake options
+- {2} name
+*/
+const char *MAKEFILE_TEMPLATE = R"(
+CAKE   ?= {0}
+CC     ?= cc
+
+CAKE_FLAGS = {1}
+
+PANCAKE_SRC = {2}.pancake
+SCAFFOLD    = {2}.scaffold.c
+FFI         = {2}.ffi.c
+ASM         = {2}.S
+BIN         = {2}.bin
+
+.PHONY: all run clean
+
+all: $(BIN)
+
+$(ASM): $(PANCAKE_SRC)
+  cpp -P < $< | $(CAKE) $(CAKE_FLAGS) > $@
+
+$(BIN): $(ASM) $(SCAFFOLD)
+  $(CC) -o $@ $^
+
+run: $(BIN)
+  ./$(BIN)
+
+clean:
+  rm -f $(ASM) $(BIN)
+)";
+} // namespace
+
+auto Finalizer::Write(StageContext &ctx, clang::CompilerInstance &compiler) -> llvm::Error {
+  auto &tu_str = ctx.run.artifacts.Get(translation_unit_output_key)->content;
+  auto &ffi_str = ctx.run.artifacts.Get(ffi_output_key)->content;
+  auto heap_size = ctx.run.artifacts.Get(heap_size_key)->size;
+  auto &stack_size = stack_size_opt;
+
+  auto tu_file_path = ctx.next_file + ".pancake";
+  auto scaffold_file_path = ctx.next_file + ".scaffold.c";
+  auto ffi_file_path = ctx.next_file + ".ffi.c";
+  auto makefile_path = ctx.next_file + ".makefile";
+
+  std::error_code ec;
+  llvm::raw_fd_ostream tu_out(tu_file_path, ec, llvm::sys::fs::OF_None);
+  if (ec) {
+    return CreateRuntimeError(llvm::formatv("Failed to open TU output file {0}: {1}", tu_file_path, ec.message()));
+  }
+
+  llvm::raw_fd_ostream scaffold_out(scaffold_file_path, ec, llvm::sys::fs::OF_None);
+  if (ec) {
+    return CreateRuntimeError(
+        llvm::formatv("Failed to open scaffold output file {0}: {1}", scaffold_file_path, ec.message()));
+  }
+
+  llvm::raw_fd_ostream ffi_out(ffi_file_path, ec, llvm::sys::fs::OF_None);
+  if (ec) {
+    return CreateRuntimeError(llvm::formatv("Failed to open FFI output file {0}: {1}", ffi_file_path, ec.message()));
+  }
+
+  llvm::raw_fd_ostream makefile_out(makefile_path, ec, llvm::sys::fs::OF_None);
+  if (ec) {
+    return CreateRuntimeError(
+        llvm::formatv("Failed to open Makefile output file {0}: {1}", makefile_path, ec.message()));
+  }
+
+  tu_out << tu_str;
+  tu_out.flush();
+  PrintLogBegin(llvm::outs(), ctx);
+  llvm::outs() << "Wrote pancake translation unit to " << tu_file_path << "\n";
+
+  scaffold_out << llvm::formatv(SCAFFOLD_TEMPLATE, heap_size + stack_size, heap_size, stack_size);
+  scaffold_out.flush();
+  PrintLogBegin(llvm::outs(), ctx);
+  llvm::outs() << "Wrote pancake scaffold to " << scaffold_file_path << "\n";
+
+  ffi_out << ffi_str;
+  ffi_out.flush();
+  PrintLogBegin(llvm::outs(), ctx);
+  llvm::outs() << "Wrote pancake FFI to " << ffi_file_path << "\n";
+
+  makefile_out << llvm::formatv(MAKEFILE_TEMPLATE, cake_path, cake_options, ctx.next_file);
+  makefile_out.flush();
+  PrintLogBegin(llvm::outs(), ctx);
+  llvm::outs() << "Wrote pancake Makefile to " << makefile_path << "\n";
+
+  // see https://github.com/CakeML/cakeml/blob/pan_howto/pancake/how-to.md
+  // run cake --pancake < name.pancake > name.S
+
+  std::optional<llvm::sys::ProcessStatistics> stats = std::nullopt;
+  std::string error_message;
+  bool execution_failed = true;
+  auto exit_code = llvm::sys::ExecuteAndWait(
+      shell_path, {llvm::formatv("{0} {1} < {2}.pancake > {2}.S", cake_path, cake_options, ctx.next_file).str()},
+      std::nullopt, {}, 0, 0, &error_message, &execution_failed, &stats);
+
+  if (execution_failed) {
+    return CreateRuntimeError(llvm::formatv("Failed to execute cake ({0}): {1}", exit_code, error_message));
+  }
+
+  PrintLogBegin(llvm::outs(), ctx);
+  llvm::outs() << "Executed cake successfully, total time: "
+               << (stats ? stats->TotalTime : std::chrono::microseconds(0)).count()
+               << " us, user time: " << (stats ? stats->UserTime : std::chrono::microseconds(0)).count()
+               << " us, peak memory: " << (stats ? stats->PeakMemory : 0) << " KiB\n";
+
+  return llvm::Error::success();
 }
 } // namespace pancake::pass_c2pancake

@@ -429,6 +429,7 @@ public:
     auto &sm = data.Ctx.getSourceManager();
     auto loc = sm.getFileLoc(func_decl->getLocation());
     auto file_id = sm.getFileID(loc);
+    std::string include_path_annotation;
     if (file_id != sm.getMainFileID()) {
       // sometimes external func decls can appear in the same file and only be specified during link time...
       // return CreateRuntimeError(std::move(
@@ -442,7 +443,9 @@ public:
                                     func_decl->getBeginLoc().printToString(data.Ctx.getSourceManager()), func_name)));
       }
       auto &file_manager = sm.getFileManager();
-      os << llvm::formatv("#include <{0}>\n", file_manager.getCanonicalName(*file_entry));
+      auto include_path = file_manager.getCanonicalName(*file_entry);
+      include_path_annotation = llvm::formatv("[[clang::annotate(\"__c2pnk_ffi_include_path_{0}\")]]", include_path);
+      os << llvm::formatv("#include <{0}>\n", include_path);
       os << llvm::formatv("#include <stdint.h>\n#include <string.h>\n");
     }
 
@@ -462,6 +465,7 @@ public:
     }
 
     // emit the wrapper function signature
+    os << include_path_annotation << "\n";
     os << "void " << wrapper_name << "(uintptr_t arg0, uintptr_t arg1, uintptr_t arg2, uintptr_t arg3) {\n";
 
     // pull out the reserved slots, if present
