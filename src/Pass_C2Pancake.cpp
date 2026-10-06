@@ -129,6 +129,10 @@ public:
         continue;
       }
 
+      if (auto *_ = llvm::dyn_cast<EnumDecl>(decl)) {
+        continue;
+      }
+
       if (auto *var_decl = llvm::dyn_cast<VarDecl>(decl)) {
         if (!var_decl->hasGlobalStorage()) {
           data.error = CreateRuntimeError(std::move(
@@ -190,10 +194,18 @@ public:
       }
       data.ffi_os << llvm::formatv("#include <{0}>\n", include_path.get());
 
+      auto src_text = Lexer::getSourceText(CharSourceRange::getTokenRange(func_decl->getSourceRange()),
+                                           data.Ctx.getSourceManager(), data.Ctx.getLangOpts())
+                          .str();
+      // append all __c2pnk_ffi_wrapper with "ffi" in front
+      size_t pos = 0;
+      while ((pos = src_text.find("__c2pnk_ffi_wrapper_", pos)) != std::string::npos) {
+        src_text.replace(pos, strlen("__c2pnk_ffi_wrapper_"), "ffi__c2pnk_ffi_wrapper_");
+        pos += strlen("ffi__c2pnk_ffi_wrapper_");
+      }
+
       // grab src code for func_decl and write to ffi_os
-      data.ffi_os << Lexer::getSourceText(CharSourceRange::getTokenRange(func_decl->getSourceRange()),
-                                          data.Ctx.getSourceManager(), data.Ctx.getLangOpts())
-                  << "\n";
+      data.ffi_os << src_text << "\n";
       return true;
     }
 
@@ -208,17 +220,20 @@ public:
             data.error = std::move(error);
             return false;
           }
-          stmts.emplace_back(res.get());
+          if (!res.get().empty()) {
+            stmts.emplace_back(res.get());
+          }
         }
 
         std::string replacement_text;
         llvm::raw_string_ostream os(replacement_text);
 
+        // TODO Pancake playground does not support this yet!
         if (func_decl->isInlineSpecified()) {
           os << "inline ";
         }
 
-        os << "fun 1 " << func_decl->getName() << " (";
+        os << "fun 1 " << func_decl->getName() << "(";
         for (auto &&param : func_decl->parameters()) {
           os << "1 " << param->getName();
           if (param != func_decl->parameters().back()) {
@@ -401,6 +416,11 @@ public:
     }
 
     if (auto *expr = llvm::dyn_cast<Expr>(stmt)) {
+      if (!expr->HasSideEffects(data.Ctx)) {
+        // Ignore the unused result
+        return replacement_text;
+      }
+
       auto res = BuildExpr(BuildExprCtx(expr, Usage::Effect));
       if (auto error = res.takeError()) {
         return std::move(error);
@@ -460,7 +480,7 @@ public:
                   decl_ref_expr->getExprLoc().printToString(data.Ctx.getSourceManager()), var_decl->getName(), bytes)));
             }
             // TODO add support for shared loads
-            os << llvm::formatv(" @base + {0}", addr);
+            os << llvm::formatv(" (@base + {0})", addr);
             break;
           }
           case Usage::Place: {
@@ -715,7 +735,7 @@ public:
                               unary_operator->getExprLoc().printToString(data.Ctx.getSourceManager()), size_bytes)));
           }
           // TODO add support for shared loads
-          os << llvm::formatv(" {0}", sub_expr_res->final_expr);
+          os << llvm::formatv(" ({0})", sub_expr_res->final_expr);
           pre_stmts.insert(pre_stmts.end(), sub_expr_res->pre_stmts.begin(), sub_expr_res->pre_stmts.end());
           break;
         }
@@ -1110,8 +1130,8 @@ static void init_pancake_mem(void) {{
   unsigned long cml_heap_sz  = {1};
   unsigned long cml_stack_sz = {2};
   cml_heap     = cml_memory;
-  cml_stack    = cml_heap + cml_heap_sz;
-  cml_stackend = cml_stack + cml_stack_sz;
+  cml_stack    = (unsigned char *)cml_heap + cml_heap_sz;
+  cml_stackend = (unsigned char *)cml_stack + cml_stack_sz;
 }
 
 int main(void) {{
@@ -1134,6 +1154,8 @@ const char *FFI_TEMPLATE = R"(
 )";
 
 /*
+Note: recipe lines must begin with a literal tab, not spaces.
+
 Variables to replace:
 - {0} cake path
 - {1} cake options
@@ -1156,16 +1178,16 @@ BIN         = {2}.bin
 all: $(BIN)
 
 $(ASM): $(PANCAKE_SRC)
-  cpp -P < $< | $(CAKE) $(CAKE_FLAGS) > $@
+	cpp -P < $< | $(CAKE) $(CAKE_FLAGS) > $@
 
-$(BIN): $(ASM) $(SCAFFOLD)
-  $(CC) -o $@ $^
+$(BIN): $(ASM) $(SCAFFOLD) $(FFI)
+	$(CC) -o $@ $^
 
 run: $(BIN)
-  ./$(BIN)
+	./$(BIN)
 
 clean:
-  rm -f $(ASM) $(BIN)
+	rm -f $(ASM) $(BIN)
 )";
 } // namespace
 
@@ -1180,28 +1202,29 @@ auto Finalizer::Write(StageContext &ctx, clang::CompilerInstance &compiler) -> l
   auto ffi_file_path = ctx.next_file + ".ffi.c";
   auto makefile_path = ctx.next_file + ".makefile";
   auto bin_path = ctx.next_file + ".bin";
+  auto asm_path = ctx.next_file + ".S";
 
   std::error_code ec;
   llvm::raw_fd_ostream tu_out(tu_file_path, ec, llvm::sys::fs::OF_None);
   if (ec) {
-    return CreateRuntimeError(llvm::formatv("Failed to open TU output file {0}: {1}", tu_file_path, ec.message()));
+    return CreateRuntimeError(llvm::formatv("\nFailed to open TU output file {0}: {1}", tu_file_path, ec.message()));
   }
 
   llvm::raw_fd_ostream scaffold_out(scaffold_file_path, ec, llvm::sys::fs::OF_None);
   if (ec) {
     return CreateRuntimeError(
-        llvm::formatv("Failed to open scaffold output file {0}: {1}", scaffold_file_path, ec.message()));
+        llvm::formatv("\nFailed to open scaffold output file {0}: {1}", scaffold_file_path, ec.message()));
   }
 
   llvm::raw_fd_ostream ffi_out(ffi_file_path, ec, llvm::sys::fs::OF_None);
   if (ec) {
-    return CreateRuntimeError(llvm::formatv("Failed to open FFI output file {0}: {1}", ffi_file_path, ec.message()));
+    return CreateRuntimeError(llvm::formatv("\nFailed to open FFI output file {0}: {1}", ffi_file_path, ec.message()));
   }
 
   llvm::raw_fd_ostream makefile_out(makefile_path, ec, llvm::sys::fs::OF_None);
   if (ec) {
     return CreateRuntimeError(
-        llvm::formatv("Failed to open Makefile output file {0}: {1}", makefile_path, ec.message()));
+        llvm::formatv("\nFailed to open Makefile output file {0}: {1}", makefile_path, ec.message()));
   }
 
   tu_out << tu_str;
@@ -1214,7 +1237,7 @@ auto Finalizer::Write(StageContext &ctx, clang::CompilerInstance &compiler) -> l
   PrintLogBegin(llvm::outs(), ctx);
   llvm::outs() << "Wrote pancake scaffold to " << scaffold_file_path << "\n";
 
-  ffi_out << ffi_str;
+  ffi_out << llvm::formatv(FFI_TEMPLATE, ffi_str);
   ffi_out.flush();
   PrintLogBegin(llvm::outs(), ctx);
   llvm::outs() << "Wrote pancake FFI to " << ffi_file_path << "\n";
@@ -1227,19 +1250,31 @@ auto Finalizer::Write(StageContext &ctx, clang::CompilerInstance &compiler) -> l
   // see https://github.com/CakeML/cakeml/blob/pan_howto/pancake/how-to.md
   // run cake --pancake < name.pancake > name.S
 
+  auto real_make_path = llvm::sys::findProgramByName(make_path);
+  if (!real_make_path) {
+    return CreateRuntimeError(
+        llvm::formatv("\nFailed to find 'make' in PATH: {0}", real_make_path.getError().message()));
+  }
+
   std::optional<llvm::sys::ProcessStatistics> stats = std::nullopt;
   std::string error_message;
   bool execution_failed = true;
-  auto exit_code = llvm::sys::ExecuteAndWait(make_path,
+  auto exit_code = llvm::sys::ExecuteAndWait(real_make_path.get(),
                                              {
+                                                 real_make_path.get(),
                                                  "-f",
                                                  makefile_path,
                                                  "all",
                                              },
                                              std::nullopt, {}, 0, 0, &error_message, &execution_failed, &stats);
 
-  if (execution_failed) {
-    return CreateRuntimeError(llvm::formatv("Failed to execute make ({0}): {1}", exit_code, error_message));
+  if (execution_failed || exit_code != 0) {
+    llvm::SmallString<64> pwd;
+    return CreateRuntimeError(llvm::formatv("\nFailed to execute make ({0}): {1}\n\ncake command: cpp "
+                                            "-P < {2} | cake --pancake --main_return=true "
+                                            "> {3}\nmake all command: {4} -f {5} all",
+                                            exit_code, error_message, tu_file_path, asm_path, real_make_path.get(),
+                                            makefile_path));
   }
 
   PrintLogBegin(llvm::outs(), ctx);
@@ -1252,7 +1287,8 @@ auto Finalizer::Write(StageContext &ctx, clang::CompilerInstance &compiler) -> l
       bin_path, llvm::sys::fs::perms::owner_all | llvm::sys::fs::perms::group_read | llvm::sys::fs::perms::group_exe |
                     llvm::sys::fs::perms::others_read | llvm::sys::fs::perms::others_exe);
   if (error) {
-    return CreateRuntimeError(llvm::formatv("Failed to set permissions on binary {0}: {1}", bin_path, error.message()));
+    return CreateRuntimeError(
+        llvm::formatv("\nFailed to set permissions on binary {0}: {1}", bin_path, error.message()));
   }
 
   PrintLogBegin(llvm::outs(), ctx);

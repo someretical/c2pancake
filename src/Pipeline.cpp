@@ -24,6 +24,7 @@ using namespace pancake;
 extern llvm::cl::opt<size_t> max_pass_retries;
 extern llvm::cl::opt<std::string> start_at_pass;
 extern llvm::cl::opt<std::string> end_at_pass;
+extern llvm::cl::list<std::string> skipped_passes;
 
 auto Pipeline::Run() -> int {
   const auto &initial_files = options_parser.getSourcePathList();
@@ -48,8 +49,7 @@ auto Pipeline::Run() -> int {
         std::vector<clang::tooling::CompileCommand> commands;
         std::unique_ptr<clang::tooling::ClangTool> tool;
         if (factory->Kind() == StageKind::Clang) {
-          tool = std::make_unique<clang::tooling::ClangTool>(
-              db, llvm::SmallVector<std::string, 1>{current_file});
+          tool = std::make_unique<clang::tooling::ClangTool>(db, llvm::SmallVector<std::string, 1>{current_file});
           commands = db.getCompileCommands(current_file);
           if (commands.empty()) {
             PrintLogBeginShort(llvm::errs(), current_file);
@@ -79,6 +79,13 @@ auto Pipeline::Run() -> int {
           return 1;
         }
 
+        if (!skipped_passes.empty() && std::ranges::find(skipped_passes, *ctx.stage_name) != skipped_passes.end()) {
+          PrintLogBegin(llvm::outs(), ctx);
+          llvm::outs() << "Skipping pass because name matched \"skip\" option\n";
+          advance_pass = true;
+          break;
+        }
+
         if (!start_at_pass_found) {
           if (*ctx.stage_name == start_at_pass) {
             start_at_pass_found = true;
@@ -91,8 +98,7 @@ auto Pipeline::Run() -> int {
         }
 
         if (factory->Kind() == StageKind::Clang) {
-          clang::tooling::ToolInvocation invocation(commands.front().CommandLine, std::move(action),
-                                                    &tool->getFiles());
+          clang::tooling::ToolInvocation invocation(commands.front().CommandLine, std::move(action), &tool->getFiles());
           if (!invocation.run()) {
             PrintLogBegin(llvm::errs(), ctx);
             llvm::errs() << llvm::formatv("FATAL: ToolInvocation.run() failed\n");
@@ -178,9 +184,8 @@ auto Pipeline::Run() -> int {
       }
     }
 
-    const std::string final_file = run_ctx.generated_files.empty()
-                                        ? llvm::formatv("{0}.c2pnk.c", initial_file).str()
-                                        : run_ctx.generated_files.back();
+    const std::string final_file = run_ctx.generated_files.empty() ? llvm::formatv("{0}.c2pnk.c", initial_file).str()
+                                                                   : run_ctx.generated_files.back();
     if (!run_ctx.generated_files.empty()) {
       PrintLogBeginShort(llvm::outs(), initial_file);
       llvm::outs() << llvm::formatv("All passes complete, final output at {0}\n", final_file);

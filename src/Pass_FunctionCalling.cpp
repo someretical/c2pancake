@@ -148,6 +148,7 @@ public:
       return false;
     }
 
+    auto policy = data.Ctx.getPrintingPolicy();
     auto it = data.function_map.find(func_decl);
     if (it == data.function_map.end()) {
       // process the function decl
@@ -157,7 +158,7 @@ public:
         data.error = CreateRuntimeError(
             llvm::formatv("\n    at {0}\nFunctionDecl {1} has integer return type {2} larger than pointer width",
                           func_decl->getBeginLoc().printToString(data.Ctx.getSourceManager()), func_decl->getName(),
-                          return_type.getAsString()));
+                          return_type.getAsString(policy)));
         return false;
       }
 
@@ -185,7 +186,7 @@ public:
           data.error = CreateRuntimeError(std::move(llvm::formatv(
               "\n    at {0}\nFunctionDecl {1} has integer parameter {2} of type {3} larger than pointer width",
               param_decl->getBeginLoc().printToString(data.Ctx.getSourceManager()), func_decl->getName(),
-              param_decl->getName(), param_type.getAsString())));
+              param_decl->getName(), param_type.getAsString(policy))));
           return false;
         }
 
@@ -508,8 +509,8 @@ public:
       auto ret_ptr_type = data.Ctx.getPointerType(info.return_info.original_return_type);
       auto idx = info.OutputBufSlotIndex().value();
       os << " /* output_buf = arg" << idx << " */\n";
-      os << "*(" << ret_ptr_type.getAsString(data.Ctx.getPrintingPolicy()) << ")arg" << idx << " = "
-         << func_decl->getNameAsString() << "(" << call_args << ");\n";
+      os << "*(" << ret_ptr_type.getAsString(policy) << ")arg" << idx << " = " << func_decl->getNameAsString() << "("
+         << call_args << ");\n";
     }
 
     os << "}\n";
@@ -525,7 +526,9 @@ public:
 
     auto wrapper_name = "__c2pnk_ffi_wrapper_" + func_decl->getName();
     bool is_void_return = info.return_info.original_return_type->isVoidType();
-    auto return_type = info.return_info.original_return_type;
+    // sometimes this can be __size_t which doesn't actually exist!!! (only __ssize_t exists)
+    // in this case, we need the canonical type :(
+    auto return_type = info.return_info.original_return_type.getCanonicalType();
 
     // build the 4 wrapper call arguments up front
     std::array<std::string, 4> slot_args = {"0UL", "0UL", "0UL", "0UL"};
@@ -611,6 +614,7 @@ public:
   }
 
   auto TraverseFunctionDecl(FunctionDecl *func_decl) -> bool {
+    auto policy = data.Ctx.getPrintingPolicy();
     auto *tmp_function_decl = data.current_function_decl;
     data.current_function_decl = func_decl;
     auto cleanup =
@@ -729,7 +733,7 @@ public:
           // but the function ret types still need to be a uint32/64_t as per pancake rules
           os << GetWordTypeStr(data.Ctx) << " ";
         } else {
-          os << return_info.return_type.getAsString() << " ";
+          os << return_info.return_type.getAsString(policy) << " ";
         }
       } else {
         // void return type becomes a uint32/64_t as per pancake rules
@@ -895,7 +899,7 @@ public:
           // but the function ret types still need to be a uint32/64_t as per pancake rules
           os << GetWordTypeStr(data.Ctx) << " ";
         } else {
-          os << return_info.return_type.getAsString() << " ";
+          os << return_info.return_type.getAsString(policy) << " ";
         }
       } else {
         // void return type becomes a uint32/64_t as per pancake rules

@@ -29,9 +29,9 @@ public:
   void HandleTranslationUnit(clang::ASTContext &Ctx) override;
 };
 
-class Action : public ClangStage<Consumer> {
+class Action : public ClangStage<Consumer, Finalizer> {
 public:
-  explicit Action(StageContext &ctx) : ClangStage<Consumer>(ctx) { ctx.stage_name = "C2Pancake"; }
+  explicit Action(StageContext &ctx) : ClangStage<Consumer, Finalizer>(ctx) { ctx.stage_name = "C2Pancake"; }
 };
 } // namespace pancake::pass_c2pancake
 

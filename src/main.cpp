@@ -85,6 +85,10 @@ llvm::cl::opt<std::string> end_at_pass(
     llvm::cl::desc(
         "End the pipeline after this pass (including retries) (default: empty, meaning end after last pass)"),
     llvm::cl::cat(c2_pancake_options), llvm::cl::init(""));
+
+llvm::cl::list<std::string>
+    skipped_passes("skip", llvm::cl::desc("Passes to skip (default: empty, meaning no passes are skipped)"),
+                   llvm::cl::CommaSeparated, llvm::cl::ZeroOrMore, llvm::cl::cat(c2_pancake_options));
 // NOLINTEND(misc-use-internal-linkage)
 
 auto main(int argc, const char **argv) -> int {

@@ -15,14 +15,19 @@ Generic Options:
 
 c2pancake options:
 
+  --cake-options=<string>     - Override Cake compiler options (default: --pancake --main_return=true)
+  --cake-path=<string>        - Path to the Cake compiler (default: cake in PATH)
   --end=<string>              - End the pipeline after this pass (including retries) (default: empty, meaning end after last pass)
   --extra-arg=<string>        - Additional argument to append to the compiler command line
   --extra-arg-before=<string> - Additional argument to prepend to the compiler command line
-  --max-pass-retries=<ulong>  - Maximum number of retries for a pass before moving to the next pass (default: 10)
+  --make-path=<string>        - Override make path (default: make)
+  --max-pass-retries=<ulong>  - Maximum number of retries for a pass before moving to the next pass (default: 20)
   -p <string>                 - Build path
   --pointer-bits=<value>      - Override pointer width
     =32                       -   32-bit
     =64                       -   64-bit
+  --skip=<string>             - Passes to skip (default: empty, meaning no passes are skipped)
+  --stack-size=<ulong>        - Override Pancake stack size (default: 0x10000 = 4096 * 16)
   --start=<string>            - Start the pipeline at this pass (default: empty, meaning start at beginning)
 
 -p <build-path> is used to read a compile command database.
@@ -43,12 +48,15 @@ c2pancake options:
         working directory. "./" prefixes in the relative files will be
         automatically removed, but the rest of a relative path must be a
         suffix of a path in the compile command database.
+
+Documentation:
+  https://github.com/someretical/c2pancake
 ```
 
 ## Examples
 
 ```
-c2pancake tests/arith.c --
+c2pancake tests/arith.c --skip ConvertIntegerTypes --
 ```
 
 Note if see a warning in the output like `WARNING: Maximum number of passes (X) reached, consider increasing the limit`, use `--max-pass-retries=` option as described above!
