@@ -278,18 +278,38 @@ public:
     return func_decl->getName().starts_with("__c2pnk_ffi_wrapper_");
   }
 
-  auto BuildStmt(Stmt *stmt) -> Expected<std::string> {
+  auto BuildStmt(Stmt *stmt, bool needs_semicolon = true) -> Expected<std::string> {
     std::string replacement_text;
     llvm::raw_string_ostream os(replacement_text);
     if (auto *compound_stmt = llvm::dyn_cast<CompoundStmt>(stmt)) {
+      bool add_curly_braces = true;
+
+      if (compound_stmt->size() == 1) {
+        if (llvm::isa<CompoundStmt>(compound_stmt->body_front())) {
+          add_curly_braces = false;
+        }
+      }
+
+      if (add_curly_braces) {
+        os << "{\n";
+      }
       for (auto *sub_stmt : compound_stmt->body()) {
         auto result = BuildStmt(sub_stmt);
         if (auto error = result.takeError()) {
           return std::move(error);
         }
 
-        os << result.get();
+        os << result.get() << "\n";
       }
+      if (add_curly_braces) {
+        os << "}";
+      }
+      // pancake is special because standalone block scopes need semi colons after
+      // but if the block is part of a control flow statement, it doesn't need a semi colon after
+      if (needs_semicolon) {
+        os << ";";
+      }
+      os << "\n";
       os.flush();
 
       return replacement_text;
@@ -355,7 +375,7 @@ public:
       }
 
       auto *then_stmt = if_stmt->getThen();
-      auto then_res = BuildStmt(then_stmt);
+      auto then_res = BuildStmt(then_stmt, false);
       if (auto error = then_res.takeError()) {
         return std::move(error);
       }
@@ -363,19 +383,29 @@ public:
       for (auto &&pre_stmt : res->pre_stmts) {
         os << pre_stmt << "\n";
       }
-      os << "if (" << res->final_expr << ") {\n";
-      os << then_res.get();
-      os << "}";
+      if (llvm::isa<CompoundStmt>(then_stmt)) {
+        os << "if (" << res->final_expr << ") ";
+        os << then_res.get();
+      } else {
+        os << "if (" << res->final_expr << ") {\n";
+        os << then_res.get();
+        os << "\n}";
+      }
 
       if (auto *else_stmt = if_stmt->getElse()) {
-        auto else_res = BuildStmt(else_stmt);
+        auto else_res = BuildStmt(else_stmt, false);
         if (auto error = else_res.takeError()) {
           return std::move(error);
         }
 
-        os << " else {\n";
-        os << else_res.get();
-        os << "}";
+        if (llvm::isa<CompoundStmt>(else_stmt)) {
+          os << " else ";
+          os << else_res.get();
+        } else {
+          os << " else {\n";
+          os << else_res.get();
+          os << "\n}";
+        }
       }
 
       os.flush();
@@ -390,7 +420,7 @@ public:
       }
 
       auto *body_stmt = while_stmt->getBody();
-      auto body_res = BuildStmt(body_stmt);
+      auto body_res = BuildStmt(body_stmt, false);
       if (auto error = body_res.takeError()) {
         return std::move(error);
       }
@@ -398,9 +428,14 @@ public:
       for (auto &&pre_stmt : res->pre_stmts) {
         os << pre_stmt << "\n";
       }
-      os << "while (" << res->final_expr << ") {\n";
-      os << body_res.get();
-      os << "}";
+      if (llvm::isa<CompoundStmt>(body_stmt)) {
+        os << "while (" << res->final_expr << ") ";
+        os << body_res.get();
+      } else {
+        os << "while (" << res->final_expr << ") {\n";
+        os << body_res.get();
+        os << "\n}";
+      }
       os.flush();
       return replacement_text;
     }
@@ -709,9 +744,24 @@ public:
 
       switch (unary_operator->getOpcode()) {
       case UO_Deref: {
+        // An array-valued dereference decays to the address of the first
+        // element when it is used as a value. It must not be emitted as a
+        // scalar load: arrays cannot be loaded as a single Pancake value.
+        const auto usage_kind = final_expr_type->isArrayType() ? Usage::Place : ctx.usage_kind;
         switch (ctx.usage_kind) {
         case Usage::Value: {
-          auto sub_expr_res = BuildExpr(BuildExprCtx(sub_expr, Usage::Value));
+          if (usage_kind == Usage::Place) {
+            auto sub_expr_res = BuildExpr(BuildExprCtx(sub_expr, Usage::Place));
+            if (auto error = sub_expr_res.takeError()) {
+              return std::move(error);
+            }
+            os << sub_expr_res->final_expr;
+            pre_stmts.insert(pre_stmts.end(), sub_expr_res->pre_stmts.begin(), sub_expr_res->pre_stmts.end());
+            heap_alignment =
+                (size_t)data.Ctx.getTypeAlignInChars(sub_expr->getType()->getPointeeType()).getQuantity();
+            break;
+          }
+          auto sub_expr_res = BuildExpr(BuildExprCtx(sub_expr, Usage::Place));
           if (auto error = sub_expr_res.takeError()) {
             return std::move(error);
           }

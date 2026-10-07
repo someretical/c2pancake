@@ -47,8 +47,8 @@ public:
   static auto shouldTraversePostOrder() -> bool { return true; }
 
   auto GetIfCondTempVarName() -> auto {
-    return llvm::formatv("__c2pnk_if_cond_tmp_var_{0}_{1}_{2}", data.ps_ctx.stage_index,
-                         data.ps_ctx.attempt_index, data.if_cond_tmp_var_counter++);
+    return llvm::formatv("__c2pnk_if_cond_tmp_var_{0}_{1}_{2}", data.ps_ctx.stage_index, data.ps_ctx.attempt_index,
+                         data.if_cond_tmp_var_counter++);
   }
 
   auto IsPartOfElseIfChain(const IfStmt *if_stmt) -> bool {
@@ -87,14 +87,19 @@ public:
       needs_cond_hoist = true;
     }
 
-    // no else statement, no need to rewrite
-    if (else_stmt == nullptr) {
-      needs_rewrite = false;
-    }
-
-    // else statement is not an else-if statement, no need to rewrite
-    if (else_stmt != nullptr && !isa<clang::IfStmt>(else_stmt)) {
-      needs_rewrite = false;
+    if (llvm::isa<CompoundStmt>(then_stmt)) {
+      if (else_stmt == nullptr) {
+        // then is compound, else is null, no need to rewrite
+        needs_rewrite = false;
+      } else {
+        if (llvm::isa<CompoundStmt>(else_stmt)) {
+          // both then and else are compound statements, no need to rewrite
+          needs_rewrite = false;
+        } else {
+          // then is compound, else is not, need to rewrite
+          needs_rewrite = true;
+        }
+      }
     }
 
     if (!needs_rewrite && !needs_cond_hoist) {
@@ -157,7 +162,7 @@ public:
                                       else_stmt->getBeginLoc().printToString(data.Ctx.getSourceManager())))),
                                   std::move(error));
         }
-        os << "\n}";
+        os << ";\n}";
       }
     }
 

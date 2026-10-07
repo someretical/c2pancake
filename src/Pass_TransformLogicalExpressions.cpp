@@ -1485,8 +1485,13 @@ if ({4}) {
     } else if (auto *call_expr = dyn_cast<CallExpr>(expr)) {
       llvm::SmallVector<BuiltExpr, 4> arg_built_exprs;
       for (auto *arg : call_expr->arguments()) {
+        std::optional<BuildExprCtx::StringLiteralUsageKind> string_literal_usage_kind = ctx.string_literal_usage_kind;
+        if (auto *_ = dyn_cast<StringLiteral>(arg->IgnoreParenCasts())) {
+          string_literal_usage_kind = BuildExprCtx::StringLiteralUsageKind::AsPointer;
+        }
+
         auto res = BuildExpr(BuildExprCtx(arg->IgnoreParenImpCasts(), Usage::Value, ctx.deref_force_extract,
-                                          ctx.assigned_to, ctx.string_literal_usage_kind));
+                                          ctx.assigned_to, string_literal_usage_kind));
         if (auto error = res.takeError()) {
           return error;
         }

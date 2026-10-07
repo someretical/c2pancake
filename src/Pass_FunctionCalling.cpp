@@ -448,6 +448,14 @@ public:
       include_path_annotation = llvm::formatv("[[clang::annotate(\"__c2pnk_ffi_include_path_{0}\")]]", include_path);
       os << llvm::formatv("#include <{0}>\n", include_path);
       os << llvm::formatv("#include <stdint.h>\n#include <string.h>\n");
+
+      // add #ifdef for the cursed __size_t type
+      // clang's qualifying type will output __size_t instead of size_t when converting to a string form
+      // this is broken because __size_t doesn't actually exist, only __ssize_t exists
+
+      os << "#ifndef __size_t\n"
+         << "  #define __size_t size_t\n"
+         << "#endif\n";
     }
 
     // create the global buffers for the non-fastpath params and return value, if needed
