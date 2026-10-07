@@ -533,7 +533,28 @@ public:
         llvm::raw_string_ostream os2(expanded);
         os2 << "{ ";
         for (auto c : string_literal->getString()) {
-          os2 << "'" << c << "', ";
+          switch (c) {
+          case '\n':
+            os2 << "'\\n'";
+            break;
+          case '\t':
+            os2 << "'\\t'";
+            break;
+          case '\r':
+            os2 << "'\\r'";
+            break;
+          case '\\':
+            os2 << "'\\\\'";
+            break;
+          case '\'':
+            os2 << "'\\''";
+            break;
+          default:
+            os2 << "'" << c << "'";
+            break;
+          }
+
+          os2 << ", ";
         }
         os2 << "'\\0' }";
         os2.flush();
