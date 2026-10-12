@@ -757,8 +757,7 @@ public:
             }
             os << sub_expr_res->final_expr;
             pre_stmts.insert(pre_stmts.end(), sub_expr_res->pre_stmts.begin(), sub_expr_res->pre_stmts.end());
-            heap_alignment =
-                (size_t)data.Ctx.getTypeAlignInChars(sub_expr->getType()->getPointeeType()).getQuantity();
+            heap_alignment = (size_t)data.Ctx.getTypeAlignInChars(sub_expr->getType()->getPointeeType()).getQuantity();
             break;
           }
           auto sub_expr_res = BuildExpr(BuildExprCtx(sub_expr, Usage::Place));
@@ -784,9 +783,15 @@ public:
                 llvm::formatv("\n    at {0}\nUnsupported dereferenced type size: {1} bytes",
                               unary_operator->getExprLoc().printToString(data.Ctx.getSourceManager()), size_bytes)));
           }
-          // TODO add support for shared loads
-          os << llvm::formatv(" ({0})", sub_expr_res->final_expr);
           pre_stmts.insert(pre_stmts.end(), sub_expr_res->pre_stmts.begin(), sub_expr_res->pre_stmts.end());
+          // Materialize loads before they are used in another load or address
+          // expression. Nested `lds` expressions are not handled reliably by
+          // the Pancake compiler.
+          auto load_expr = llvm::formatv("{0} ({1})", os.str(), sub_expr_res->final_expr).str();
+          auto deref_tmp = llvm::formatv("__c2pnk_deref_tmp_{0}", data.tmp_var_counter++).str();
+          pre_stmts.push_back(llvm::formatv("var 1 {0} = {1};", deref_tmp, load_expr).str());
+          final_expr.clear();
+          os << deref_tmp;
           break;
         }
 
@@ -795,7 +800,9 @@ public:
           // the *p is the expr here and the usage kind is place because it's the LHS of an assignment
           // we basically treat the *p as &p - funny how that works out
 
-          auto sub_expr_res = BuildExpr(BuildExprCtx(sub_expr, Usage::Place));
+          // The place of *p is the address held by p, so p itself must be
+          // evaluated as a value rather than as the address of its storage.
+          auto sub_expr_res = BuildExpr(BuildExprCtx(sub_expr, Usage::Value));
           if (auto error = sub_expr_res.takeError()) {
             return std::move(error);
           }
@@ -935,7 +942,31 @@ public:
           return error;
         }
 
-        os << llvm::formatv("{0} + {1}", member_base_expr->final_expr, offset_in_bytes);
+        // Keep the complete address together when the base is a computed
+        // pointer load; otherwise `st` can parse the load and offset as
+        // separate operands.
+        auto member_address = llvm::formatv("({0} + {1})", member_base_expr->final_expr, offset_in_bytes).str();
+        if (ctx.usage_kind == Usage::Value && !final_expr_type->isArrayType()) {
+          const auto member_size = (uint64_t)data.Ctx.getTypeSizeInChars(final_expr_type).getQuantity();
+          switch (member_size) {
+          case 1:
+            os << "ld8";
+            break;
+          case 4:
+            os << "ld32";
+            break;
+          case 8:
+            os << "lds 1";
+            break;
+          default:
+            return CreateRuntimeError(std::move(
+                llvm::formatv("\n    at {0}\nUnsupported member value size: {1} bytes",
+                              member_expr->getExprLoc().printToString(data.Ctx.getSourceManager()), member_size)));
+          }
+          os << llvm::formatv(" ({0})", member_address);
+        } else {
+          os << member_address;
+        }
         os.flush();
         pre_stmts.insert(pre_stmts.end(), member_base_expr->pre_stmts.begin(), member_base_expr->pre_stmts.end());
         return BuiltExpr(std::move(pre_stmts), final_expr, final_expr_type, member_base_expr->heap_alignment);

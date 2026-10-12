@@ -613,7 +613,7 @@ public:
 
     if (!is_void_return) {
       auto return_type_pointer = data.Ctx.getPointerType(return_type).getAsString(policy);
-      os << llvm::formatv("*({0})__c2pnk_ffi_output_buf_{1};\n", return_type_pointer, func_name);
+      os << llvm::formatv("__c2pnk_ffi_output_buf_{1};\n", return_type_pointer, func_name);
     }
     os << "})";
     os.flush();
@@ -1151,8 +1151,13 @@ public:
       auto *it = data.ffi_rewrites.find(callee_decl);
       if (callee_decl->isVariadic()) {
         // TODO variadic functions...
-        // create a new name mangled variadic version of the function every time...
-      } else if (it == data.ffi_rewrites.end()) {
+        data.error = CreateRuntimeError(std::move(llvm::formatv(
+            "\n    at {0}\nVariadic function {1} is not supported by c2pancake",
+            callee_decl->getBeginLoc().printToString(data.Ctx.getSourceManager()), callee_decl->getName())));
+        return false;
+      }
+
+      if (it == data.ffi_rewrites.end()) {
         // create ffi "stub" for this function
         auto wrapper_info = ConstructFunctionWrapperInfo(callee_decl);
         data.ffi_function_info.insert({callee_decl, FFIFunctionWrapperInfo(wrapper_info)});

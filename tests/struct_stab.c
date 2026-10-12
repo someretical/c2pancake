@@ -1,34 +1,90 @@
 #include <assert.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 struct d {
-  int v;
-  int u;
+  uint64_t v;
+  uint64_t u;
 };
 
 struct c {
-  int z;
+  uint64_t z;
   struct d *d;
 };
 
 struct z {
-  int w;
+  uint64_t w;
   struct c *c;
 };
 
 struct b {
-  int y;
+  uint64_t y;
   struct z z;
 };
 
 struct a {
-  int x;
+  uint64_t x;
   struct b *b;
 };
 
-int main(void) {
+char *itoa_no_div(uint64_t value, char *buf) {
+  uint64_t n;
+  char *p = buf;
+
+  if (value < 0) {
+    *p++ = '-';
+    n = -(uint64_t)value;
+  } else {
+    n = value;
+  }
+
+  uint64_t place = 1000000000;
+  uint64_t started = 0;
+
+  for (;;) {
+    uint64_t digit = 0;
+
+    while (n >= place) {
+      n -= place;
+      digit++;
+    }
+
+    if (digit || started || place == 1) {
+      *p++ = '0' + digit;
+      started = 1;
+    }
+
+    if (place == 1) {
+      break;
+    }
+
+    if (place == 1000000000)
+      place = 100000000;
+    else if (place == 100000000)
+      place = 10000000;
+    else if (place == 10000000)
+      place = 1000000;
+    else if (place == 1000000)
+      place = 100000;
+    else if (place == 100000)
+      place = 10000;
+    else if (place == 10000)
+      place = 1000;
+    else if (place == 1000)
+      place = 100;
+    else if (place == 100)
+      place = 10;
+    else
+      place = 1;
+  }
+
+  *p = '\0';
+  return buf;
+}
+
+uint64_t main(void) {
   struct d d;
   d.v = 16;
   d.u = 42;
@@ -49,7 +105,7 @@ int main(void) {
   a.b->z.c->d->v = 10;
   a.b->z.c->d->u++;
 
-  int abc[10];
+  uint64_t abc[10];
   abc[0] = 1;
   abc[1] = 2;
   abc[2] = 3;
@@ -63,8 +119,14 @@ int main(void) {
 
   (a.b->z.c->d->u -= abc[a.b->y++]++, a.b->z.c->d->v += abc[a.b->y--]--, a.b->z.c->z += abc[a.b->y++]++);
 
-  printf("a.b->z.c->d->v = %d\n", a.b->z.c->d->v);
-  printf("a.b->z.c->d->u = %d\n", a.b->z.c->d->u);
+  puts("a.b->z.c->d->v = ");
+  char numbuf[32];
+  itoa_no_div((uint64_t)a.b->z.c->d->v, numbuf);
+  puts(numbuf);
+
+  puts("a.b->z.c->d->u = ");
+  itoa_no_div((uint64_t)a.b->z.c->d->u, numbuf);
+  puts(numbuf);
 
   return 0;
 }

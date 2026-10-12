@@ -245,7 +245,7 @@ auto MakeRule() -> RewriteRule {
   return makeRule(memberExpr(isExpansionInMainFile(), isArrow(), hasObjectExpression(expr().bind("base")),
                              member(fieldDecl().bind("field")))
                       .bind("member"),
-                  changeTo(node("member"), cat("(*", node("base"), ").", name("field"))));
+                  changeTo(node("member"), cat("(*(", node("base"), ")).", name("field"))));
 }
 } // namespace
 
@@ -488,6 +488,37 @@ public:
       return CreateRuntimeError(std::move(llvm::formatv("Unhandled compound assignment operator: {0}",
                                                         BinaryOperator::getOpcodeStr(compound_assign_op).str())));
     }
+  }
+
+  auto BuildRecordAssignments(const std::string &lhs, const std::string &rhs, const RecordDecl *record_decl) const
+      -> Expected<std::string> {
+    std::string assignments;
+    llvm::raw_string_ostream os(assignments);
+
+    for (const auto *field_decl : record_decl->fields()) {
+      if (field_decl->isAnonymousStructOrUnion()) {
+        const auto *field_record_decl = field_decl->getType()->getAsRecordDecl();
+        if (field_record_decl == nullptr) {
+          return CreateRuntimeError(std::move(llvm::formatv(
+              "    at {0}\nAnonymous record field does not have a record type",
+              field_decl->getLocation().printToString(data.Ctx.getSourceManager()))));
+        }
+        auto nested_assignments = BuildRecordAssignments(lhs, rhs, field_record_decl);
+        if (auto error = nested_assignments.takeError()) {
+          return std::move(error);
+        }
+        os << *nested_assignments;
+        continue;
+      }
+
+      const auto field_name = field_decl->getNameAsString();
+      if (!field_name.empty()) {
+        os << llvm::formatv("({0}).{1} = ({2}).{1};\n", lhs, field_name, rhs);
+      }
+    }
+
+    os.flush();
+    return assignments;
   }
 
   auto BuildExpr(const BuildExprCtx &ctx) -> Expected<BuiltExpr> {
@@ -1225,13 +1256,42 @@ if ({4}) {
                                       binary_operator->getExprLoc().printToString(data.Ctx.getSourceManager()))));
         }
 
-        pre_stmts.push_back(llvm::formatv("{0} = {1};", lhs_res->final_expr, rhs_res->final_expr).str());
-        if (ctx.usage_kind == Usage::Value) {
-          os << lhs_res->final_expr;
-        }
+        if (lhs->getType()->isRecordType() && rhs->getType()->isRecordType()) {
+          const auto *record_decl = lhs->getType()->getAsRecordDecl();
+          if (record_decl == nullptr) {
+            return CreateRuntimeError(std::move(llvm::formatv(
+                "    at {0}\nRecord assignment target does not have a record declaration",
+                lhs->getExprLoc().printToString(data.Ctx.getSourceManager()))));
+          }
 
-        pre_stmts.insert(pre_stmts.end(), rhs_res->pre_stmts.begin(), rhs_res->pre_stmts.end());
-        pre_stmts.insert(pre_stmts.end(), lhs_res->pre_stmts.begin(), lhs_res->pre_stmts.end());
+          // A record assignment must not reevaluate a side-effecting destination for every field.
+          const auto lhs_pointer_type = data.Ctx.getPointerType(lhs->getType());
+          const std::string lhs_tmp_var_name = GetTempVarName("RecordAssignmentTarget");
+          const std::string lhs_tmp_var =
+              PrintType(lhs_pointer_type, lhs_tmp_var_name) + " = &(" + lhs_res->final_expr + ");";
+          auto record_assignments =
+              BuildRecordAssignments("*" + lhs_tmp_var_name, rhs_res->final_expr, record_decl);
+          if (auto error = record_assignments.takeError()) {
+            return std::move(error);
+          }
+
+          pre_stmts.push_back(*record_assignments);
+          pre_stmts.insert(pre_stmts.end(), rhs_res->pre_stmts.begin(), rhs_res->pre_stmts.end());
+          pre_stmts.push_back(lhs_tmp_var);
+          pre_stmts.insert(pre_stmts.end(), lhs_res->pre_stmts.begin(), lhs_res->pre_stmts.end());
+          data.ps_ctx.SetControl(StageControl::Repeat);
+          if (ctx.usage_kind == Usage::Value) {
+            os << "*" << lhs_tmp_var_name;
+          }
+        } else {
+          pre_stmts.push_back(llvm::formatv("{0} = {1};", lhs_res->final_expr, rhs_res->final_expr).str());
+          if (ctx.usage_kind == Usage::Value) {
+            os << lhs_res->final_expr;
+          }
+
+          pre_stmts.insert(pre_stmts.end(), rhs_res->pre_stmts.begin(), rhs_res->pre_stmts.end());
+          pre_stmts.insert(pre_stmts.end(), lhs_res->pre_stmts.begin(), lhs_res->pre_stmts.end());
+        }
         break;
       }
 
@@ -1638,9 +1698,31 @@ if ({4}) {
           if (res->final_expr.empty()) {
             os << PrintType(var_decl->getType(), var_decl->getName()) << ";";
           }
-          os << llvm::join(res->pre_stmts | std::views::reverse, "\n");
+          if (var_decl->getType()->isRecordType() && init_expr->getType()->isRecordType() &&
+              !res->final_expr.empty()) {
+            const auto *record_decl = var_decl->getType()->getAsRecordDecl();
+            if (record_decl == nullptr) {
+              data.error = CreateRuntimeError(std::move(llvm::formatv(
+                  "\n    at {0}\nRecord initializer target does not have a record declaration",
+                  var_decl->getBeginLoc().printToString(data.Ctx.getSourceManager()))));
+              return false;
+            }
 
-          if (!res->final_expr.empty()) {
+            os << PrintType(var_decl->getType(), var_decl->getName()) << ";\n";
+            auto record_assignments = BuildRecordAssignments(var_decl->getNameAsString(), res->final_expr,
+                                                              record_decl);
+            if (auto error = record_assignments.takeError()) {
+              data.error = std::move(error);
+              return false;
+            }
+            os << llvm::join(res->pre_stmts | std::views::reverse, "\n");
+            os << *record_assignments;
+          } else {
+            os << llvm::join(res->pre_stmts | std::views::reverse, "\n");
+          }
+
+          if (!res->final_expr.empty() &&
+              !(var_decl->getType()->isRecordType() && init_expr->getType()->isRecordType())) {
             // assign whatever final value there is...
             os << llvm::formatv("{0} = {1};", PrintType(var_decl->getType(), var_decl->getName()), res->final_expr);
           }
