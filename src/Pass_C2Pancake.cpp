@@ -158,7 +158,17 @@ public:
         data.global_var_map[var_decl] = addr;
         // TODO replace with comment that includes the address
 
-        data.tu_os << llvm::formatv("/* \"{0}\" at offset {1:x} */\n", var_decl->getName(), addr);
+        data.tu_os << llvm::formatv("/* \"{0}\" at offset {1}/{1:X} */\n", var_decl->getName(), addr);
+        continue;
+      }
+
+      // apparently these can also appear starting C11?!
+      if (auto *_ = llvm::dyn_cast<StaticAssertDecl>(decl)) {
+        continue;
+      }
+
+      // I didn't even know this existed.......... :skull:
+      if (auto *_ = llvm::dyn_cast<EmptyDecl>(decl)) {
         continue;
       }
 
@@ -539,6 +549,13 @@ public:
         return BuiltExpr(std::move(pre_stmts), final_expr, final_expr_type, std::nullopt);
       }
 
+      if (auto *enum_constant_decl = dyn_cast<EnumConstantDecl>(decl_ref_expr->getDecl())) {
+        auto value = enum_constant_decl->getInitVal();
+        os << llvm::formatv("{0} /* {1}/{0:X} */", value.getZExtValue(), enum_constant_decl->getName());
+        os.flush();
+        return BuiltExpr(std::move(pre_stmts), final_expr, final_expr_type, std::nullopt);
+      }
+
       return CreateRuntimeError(
           std::move(llvm::formatv("\n    at {0}\nUnsupported declaration reference expression: {1}",
                                   decl_ref_expr->getExprLoc().printToString(data.Ctx.getSourceManager()),
@@ -551,7 +568,7 @@ public:
       // reserve enough space for the decimal representation
       integer_literal_str.reserve((integer_literal->getValue().getBitWidth() / 3) + 1);
       integer_literal->getValue().toString(integer_literal_str, 10, integer_literal->getType()->isSignedIntegerType());
-      os << integer_literal_str;
+      os << integer_literal_str << llvm::formatv(" /* 0x{0:X} */", integer_literal->getValue());
       os.flush();
       return BuiltExpr(std::move(pre_stmts), final_expr, final_expr_type, std::nullopt);
     }
@@ -565,6 +582,12 @@ public:
       integer_literal_str.reserve((value.getBitWidth() / 3) + 1);
       value.toString(integer_literal_str, 10, character_literal->getType()->isSignedIntegerType());
       os << integer_literal_str;
+
+      os << " /* '";
+      char c = static_cast<char>(character_literal->getValue());
+      llvm::printEscapedString(llvm::StringRef(&c, 1), os);
+      os << "' */";
+
       os.flush();
       return BuiltExpr(std::move(pre_stmts), final_expr, final_expr_type, std::nullopt);
     }
@@ -784,9 +807,8 @@ public:
                               unary_operator->getExprLoc().printToString(data.Ctx.getSourceManager()), size_bytes)));
           }
           pre_stmts.insert(pre_stmts.end(), sub_expr_res->pre_stmts.begin(), sub_expr_res->pre_stmts.end());
-          // Materialize loads before they are used in another load or address
-          // expression. Nested `lds` expressions are not handled reliably by
-          // the Pancake compiler.
+          // Materialize loads before they are used in another load or address expression. Nested lds expressions are
+          // not handled reliably by the Pancake compiler.
           auto load_expr = llvm::formatv("{0} ({1})", os.str(), sub_expr_res->final_expr).str();
           auto deref_tmp = llvm::formatv("__c2pnk_deref_tmp_{0}", data.tmp_var_counter++).str();
           pre_stmts.push_back(llvm::formatv("var 1 {0} = {1};", deref_tmp, load_expr).str());
@@ -942,28 +964,27 @@ public:
           return error;
         }
 
-        // Keep the complete address together when the base is a computed
-        // pointer load; otherwise `st` can parse the load and offset as
-        // separate operands.
+        // Keep the complete address together when the base is a computed pointer load; otherwise `st` can parse the
+        // load and offset as separate operands.
         auto member_address = llvm::formatv("({0} + {1})", member_base_expr->final_expr, offset_in_bytes).str();
         if (ctx.usage_kind == Usage::Value && !final_expr_type->isArrayType()) {
           const auto member_size = (uint64_t)data.Ctx.getTypeSizeInChars(final_expr_type).getQuantity();
           switch (member_size) {
           case 1:
-            os << "ld8";
+            os << "(ld8";
             break;
           case 4:
-            os << "ld32";
+            os << "(ld32";
             break;
           case 8:
-            os << "lds 1";
+            os << "(lds 1";
             break;
           default:
             return CreateRuntimeError(std::move(
                 llvm::formatv("\n    at {0}\nUnsupported member value size: {1} bytes",
                               member_expr->getExprLoc().printToString(data.Ctx.getSourceManager()), member_size)));
           }
-          os << llvm::formatv(" ({0})", member_address);
+          os << llvm::formatv(" {0})", member_address);
         } else {
           os << member_address;
         }

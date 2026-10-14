@@ -119,7 +119,7 @@ public:
     }
 
     auto tmp_var_name = GetTempVarName(var_name, data.current_function_decl->getName(), var_decl->getBeginLoc()).str();
-    if (var_decl->getType()->isArrayType() || var_decl->getType()->isRecordType()) {
+    if (!var_decl->hasGlobalStorage() && (var_decl->getType()->isArrayType() || var_decl->getType()->isRecordType())) {
       Replacements repls;
 
       // rename declaration
@@ -186,7 +186,8 @@ public:
       if (auto *decl_ref_expr = llvm::dyn_cast<DeclRefExpr>(operand)) {
         if (auto *var_decl = llvm::dyn_cast<VarDecl>(decl_ref_expr->getDecl())) {
           auto var_name = var_decl->getName();
-          if (!data.hoisted_vars.contains(var_decl) && !var_name.starts_with("__c2pnk_local_")) {
+          if (!var_decl->hasGlobalStorage() && !data.hoisted_vars.contains(var_decl) &&
+              !var_name.starts_with("__c2pnk_local_")) {
             Replacements repls;
             const auto *canonical_target = var_decl->getCanonicalDecl();
             auto tmp_var_name =
