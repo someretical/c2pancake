@@ -37,6 +37,8 @@
 using namespace clang;
 using namespace clang::tooling;
 
+extern llvm::cl::list<std::string> function_rewrite_extra_headers;
+
 namespace pancake::pass_inject_memcpy_polyfill {
 namespace {
 const char *memcpy_polyfill_code = R"(
@@ -447,15 +449,38 @@ public:
       auto include_path = file_manager.getCanonicalName(*file_entry);
       include_path_annotation = llvm::formatv("[[clang::annotate(\"__c2pnk_ffi_include_path_{0}\")]]", include_path);
       os << llvm::formatv("#include <{0}>\n", include_path);
-      os << llvm::formatv("#include <stdint.h>\n#include <string.h>\n");
+    }
 
-      // add #ifdef for the cursed __size_t type
-      // clang's qualifying type will output __size_t instead of size_t when converting to a string form
-      // this is broken because __size_t doesn't actually exist, only __ssize_t exists
+    os << llvm::formatv("#include <stdint.h>\n#include <string.h>\n");
 
-      os << "#ifndef __size_t\n"
-         << "  #define __size_t size_t\n"
-         << "#endif\n";
+    for (const auto &header : function_rewrite_extra_headers) {
+      os << header << "\n";
+    }
+
+    // add #ifdef for the cursed __size_t type
+    // clang's qualifying type will output __size_t instead of size_t when converting to a string form
+    // this is broken because __size_t doesn't actually exist, only __ssize_t exists
+    os << "#ifndef __size_t\n"
+       << "  #define __size_t size_t\n"
+       << "#endif\n";
+
+    const std::array<const std::string, 3> banned_prefixes = {"__builtin", "__extension", "__atomic"};
+    // also paste the original function's signature before the wrapper in case the original function sig is in the same
+    // file (and not the same file)
+    if (std::ranges::none_of(banned_prefixes,
+                             [&](const std::string &prefix) -> auto { return func_name.starts_with(prefix); })) {
+      std::string func_decl_str;
+      llvm::raw_string_ostream func_decl_os(func_decl_str);
+      if (auto error =
+              PrintSourceText(func_decl_os, CharSourceRange::getTokenRange(func_decl->getSourceRange()), data.Ctx)) {
+        return llvm::joinErrors(CreateRuntimeError(llvm::formatv(
+                                    "\n    at {0}\nCouldn't get source text for FFI function decl {1}",
+                                    func_decl->getBeginLoc().printToString(data.Ctx.getSourceManager()), func_name)),
+                                std::move(error));
+      }
+      func_decl_os << ";\n";
+      func_decl_os.flush();
+      os << func_decl_str;
     }
 
     // create the global buffers for the non-fastpath params and return value, if needed

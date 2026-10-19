@@ -66,6 +66,13 @@ public:
                          data.tmp_var_counter++);
   }
 
+  auto PrintType(const QualType ty, const llvm::StringRef var_name) const -> std::string {
+    std::string s;
+    llvm::raw_string_ostream os(s);
+    ty.print(os, data.Ctx.getPrintingPolicy(), var_name);
+    return os.str();
+  }
+
   auto VisitIfStmt(IfStmt *if_stmt) -> bool {
     if (data.error) {
       return false;
@@ -103,49 +110,6 @@ public:
             if_stmt->getIfLoc(),
             Lexer::getLocForEndOfToken(cond->getEndLoc(), 0, data.Ctx.getSourceManager(), data.Ctx.getLangOpts()))),
         replacement_text, data.Ctx.getLangOpts());
-
-    return true;
-  }
-
-  auto VisitReturnStmt(ReturnStmt *return_stmt) -> bool {
-    if (data.error) {
-      return false;
-    }
-
-    auto &sm = data.Ctx.getSourceManager();
-    if (return_stmt == nullptr || !sm.isInMainFile(sm.getSpellingLoc(return_stmt->getBeginLoc()))) {
-      return true;
-    }
-
-    const auto *ret_expr = return_stmt->getRetValue();
-    if (ret_expr == nullptr) {
-      return true;
-    }
-
-    const auto *cond = ret_expr->IgnoreParenImpCasts();
-    if (!cond->HasSideEffects(data.Ctx)) {
-      return true;
-    }
-
-    auto tmp_var_name = GetTempVarName("Return");
-    std::string replacement_text;
-    llvm::raw_string_ostream os(replacement_text);
-    auto cond_source_text = GetSourceText(cond, data.Ctx);
-    if (auto error = cond_source_text.takeError()) {
-      data.error = llvm::joinErrors(CreateRuntimeError(std::move(llvm::formatv(
-                                        "\n    at {0}\nFailed to get source text for ReturnStmt expression",
-                                        cond->getExprLoc().printToString(data.Ctx.getSourceManager())))),
-                                    std::move(error));
-      return false;
-    }
-    os << llvm::formatv("{0} {1} = {2};\n", GetWordTypeStr(data.Ctx), tmp_var_name, *cond_source_text);
-    os << llvm::formatv("return {0}", tmp_var_name);
-
-    // we want to replace the "return EXPR;" part
-    os.flush();
-    data.replacements.emplace_back(data.Ctx.getSourceManager(),
-                                   CharSourceRange::getTokenRange(return_stmt->getSourceRange()), replacement_text,
-                                   data.Ctx.getLangOpts());
 
     return true;
   }
@@ -499,9 +463,9 @@ public:
       if (field_decl->isAnonymousStructOrUnion()) {
         const auto *field_record_decl = field_decl->getType()->getAsRecordDecl();
         if (field_record_decl == nullptr) {
-          return CreateRuntimeError(std::move(llvm::formatv(
-              "    at {0}\nAnonymous record field does not have a record type",
-              field_decl->getLocation().printToString(data.Ctx.getSourceManager()))));
+          return CreateRuntimeError(
+              std::move(llvm::formatv("    at {0}\nAnonymous record field does not have a record type",
+                                      field_decl->getLocation().printToString(data.Ctx.getSourceManager()))));
         }
         auto nested_assignments = BuildRecordAssignments(lhs, rhs, field_record_decl);
         if (auto error = nested_assignments.takeError()) {
@@ -911,11 +875,11 @@ public:
       }
       last_stmt_as_expr = last_stmt_as_expr->IgnoreParenImpCasts();
 
-      if (ctx.usage_kind == Usage::Place) {
-        return CreateRuntimeError(
-            std::move(llvm::formatv("    at {0}\nStmtExpr cannot be used as a place expression",
-                                    statement_expr->getExprLoc().printToString(data.Ctx.getSourceManager()))));
-      }
+      // if (ctx.usage_kind == Usage::Place) {
+      //   return CreateRuntimeError(
+      //       std::move(llvm::formatv("    at {0}\nStmtExpr cannot be used as a place expression",
+      //                               statement_expr->getExprLoc().printToString(data.Ctx.getSourceManager()))));
+      // }
 
       std::string pre_block;
       llvm::raw_string_ostream os2(pre_block);
@@ -1259,9 +1223,9 @@ if ({4}) {
         if (lhs->getType()->isRecordType() && rhs->getType()->isRecordType()) {
           const auto *record_decl = lhs->getType()->getAsRecordDecl();
           if (record_decl == nullptr) {
-            return CreateRuntimeError(std::move(llvm::formatv(
-                "    at {0}\nRecord assignment target does not have a record declaration",
-                lhs->getExprLoc().printToString(data.Ctx.getSourceManager()))));
+            return CreateRuntimeError(
+                std::move(llvm::formatv("    at {0}\nRecord assignment target does not have a record declaration",
+                                        lhs->getExprLoc().printToString(data.Ctx.getSourceManager()))));
           }
 
           // A record assignment must not reevaluate a side-effecting destination for every field.
@@ -1269,8 +1233,7 @@ if ({4}) {
           const std::string lhs_tmp_var_name = GetTempVarName("RecordAssignmentTarget");
           const std::string lhs_tmp_var =
               PrintType(lhs_pointer_type, lhs_tmp_var_name) + " = &(" + lhs_res->final_expr + ");";
-          auto record_assignments =
-              BuildRecordAssignments("*" + lhs_tmp_var_name, rhs_res->final_expr, record_decl);
+          auto record_assignments = BuildRecordAssignments("*" + lhs_tmp_var_name, rhs_res->final_expr, record_decl);
           if (auto error = record_assignments.takeError()) {
             return std::move(error);
           }
@@ -1698,19 +1661,17 @@ if ({4}) {
           if (res->final_expr.empty()) {
             os << PrintType(var_decl->getType(), var_decl->getName()) << ";";
           }
-          if (var_decl->getType()->isRecordType() && init_expr->getType()->isRecordType() &&
-              !res->final_expr.empty()) {
+          if (var_decl->getType()->isRecordType() && init_expr->getType()->isRecordType() && !res->final_expr.empty()) {
             const auto *record_decl = var_decl->getType()->getAsRecordDecl();
             if (record_decl == nullptr) {
-              data.error = CreateRuntimeError(std::move(llvm::formatv(
-                  "\n    at {0}\nRecord initializer target does not have a record declaration",
-                  var_decl->getBeginLoc().printToString(data.Ctx.getSourceManager()))));
+              data.error = CreateRuntimeError(
+                  std::move(llvm::formatv("\n    at {0}\nRecord initializer target does not have a record declaration",
+                                          var_decl->getBeginLoc().printToString(data.Ctx.getSourceManager()))));
               return false;
             }
 
             os << PrintType(var_decl->getType(), var_decl->getName()) << ";\n";
-            auto record_assignments = BuildRecordAssignments(var_decl->getNameAsString(), res->final_expr,
-                                                              record_decl);
+            auto record_assignments = BuildRecordAssignments(var_decl->getNameAsString(), res->final_expr, record_decl);
             if (auto error = record_assignments.takeError()) {
               data.error = std::move(error);
               return false;
@@ -1750,6 +1711,40 @@ if ({4}) {
 
     auto &sm = data.Ctx.getSourceManager();
     if (stmt == nullptr || !sm.isInMainFile(sm.getSpellingLoc(stmt->getBeginLoc()))) {
+      return true;
+    }
+
+    if (auto *return_stmt = dyn_cast<ReturnStmt>(stmt)) {
+      auto *ret_expr = return_stmt->getRetValue();
+      if (ret_expr != nullptr) {
+        ret_expr = ret_expr->IgnoreParenImpCasts();
+        auto usage = GetUsage(data.Ctx, ret_expr);
+        if (auto error = usage.takeError()) {
+          data.error = std::move(error);
+          return false;
+        }
+        auto res = BuildExpr(BuildExprCtx(ret_expr, *usage, false, std::nullopt, std::nullopt));
+        if (auto error = res.takeError()) {
+          data.error = std::move(error);
+          return false;
+        }
+
+        std::string replacement_text;
+        llvm::raw_string_ostream os(replacement_text);
+        os << llvm::join(res->pre_stmts | std::views::reverse, "\n");
+        if (!res->final_expr.empty()) {
+          os << llvm::formatv("return {0};", res->final_expr);
+        } else {
+          os << "return;";
+        }
+        os.flush();
+
+        if (!replacement_text.empty()) {
+          data.replacements.emplace_back(data.Ctx.getSourceManager(),
+                                         CharSourceRange::getTokenRange(stmt->getSourceRange()), replacement_text,
+                                         data.Ctx.getLangOpts());
+        }
+      }
       return true;
     }
 

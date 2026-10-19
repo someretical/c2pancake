@@ -89,6 +89,11 @@ llvm::cl::opt<std::string> end_at_pass(
 llvm::cl::list<std::string>
     skipped_passes("skip", llvm::cl::desc("Passes to skip (default: empty, meaning no passes are skipped)"),
                    llvm::cl::CommaSeparated, llvm::cl::ZeroOrMore, llvm::cl::cat(c2_pancake_options));
+
+llvm::cl::list<std::string> function_rewrite_extra_headers(
+    "function-rewrite-extra-headers",
+    llvm::cl::desc("Extra headers to include in the function rewrite pass (default: empty, meaning no extra headers)"),
+    llvm::cl::CommaSeparated, llvm::cl::ZeroOrMore, llvm::cl::cat(c2_pancake_options));
 // NOLINTEND(misc-use-internal-linkage)
 
 auto main(int argc, const char **argv) -> int {
