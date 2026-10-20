@@ -454,13 +454,55 @@ public:
     }
   }
 
+  auto BuildArrayAssignments(const std::string &lhs, const std::string &rhs, QualType array_type) const
+      -> Expected<std::string> {
+    std::string assignments;
+    llvm::raw_string_ostream os(assignments);
+    const auto *constant_array_type = data.Ctx.getAsConstantArrayType(array_type);
+    if (constant_array_type == nullptr) {
+      return CreateRuntimeError(
+          std::move(llvm::formatv("Array type cannot be cast to ConstantArrayType: {0}", array_type.getAsString())));
+    }
+
+    const auto element_type = constant_array_type->getElementType();
+    for (uint64_t i = 0; i < constant_array_type->getSize().getZExtValue(); ++i) {
+      const auto element_lhs = llvm::formatv("*(({0}) + {1}UL)", lhs, i).str();
+      const auto element_rhs = llvm::formatv("*(({0}) + {1}UL)", rhs, i).str();
+
+      if (element_type->isArrayType()) {
+        auto nested_assignments = BuildArrayAssignments(element_lhs, element_rhs, element_type);
+        if (auto error = nested_assignments.takeError()) {
+          return std::move(error);
+        }
+        os << *nested_assignments;
+      } else if (element_type->isRecordType()) {
+        const auto *element_record_decl = element_type->getAsRecordDecl();
+        if (element_record_decl == nullptr) {
+          return CreateRuntimeError(std::move(llvm::formatv(
+              "Array element is a record type but cannot be cast to RecordDecl: {0}", element_type.getAsString())));
+        }
+
+        auto nested_assignments = BuildRecordAssignments(element_lhs, element_rhs, element_record_decl);
+        if (auto error = nested_assignments.takeError()) {
+          return std::move(error);
+        }
+        os << *nested_assignments;
+      } else {
+        os << llvm::formatv("{0} = {1};\n", element_lhs, element_rhs);
+      }
+    }
+
+    os.flush();
+    return assignments;
+  }
+
   auto BuildRecordAssignments(const std::string &lhs, const std::string &rhs, const RecordDecl *record_decl) const
       -> Expected<std::string> {
     std::string assignments;
     llvm::raw_string_ostream os(assignments);
 
     for (const auto *field_decl : record_decl->fields()) {
-      if (field_decl->isAnonymousStructOrUnion()) {
+      if (field_decl->isAnonymousStructOrUnion() || field_decl->getName().empty()) {
         const auto *field_record_decl = field_decl->getType()->getAsRecordDecl();
         if (field_record_decl == nullptr) {
           return CreateRuntimeError(
@@ -472,6 +514,24 @@ public:
           return std::move(error);
         }
         os << *nested_assignments;
+        continue;
+      }
+
+      if (field_decl->getType()->isConstantArrayType()) {
+        const auto field_name = field_decl->getNameAsString();
+        if (field_name.empty()) {
+          return CreateRuntimeError(
+              std::move(llvm::formatv("    at {0}\nArray field has no name",
+                                      field_decl->getLocation().printToString(data.Ctx.getSourceManager()))));
+        }
+
+        const auto array_lhs = llvm::formatv("({0}).{1}", lhs, field_name).str();
+        const auto array_rhs = llvm::formatv("({0}).{1}", rhs, field_name).str();
+        auto array_assignments = BuildArrayAssignments(array_lhs, array_rhs, field_decl->getType());
+        if (auto error = array_assignments.takeError()) {
+          return std::move(error);
+        }
+        os << *array_assignments;
         continue;
       }
 
@@ -629,53 +689,66 @@ public:
       auto var_type = _var_type.get();
 
       if (var_type->isArrayType()) {
-        if (!var_type->isConstantArrayType()) {
-          return CreateRuntimeError(
-              std::move(llvm::formatv("    at {0}\nInitListExpr must be assigned to a constant array type",
-                                      init_list_expr->getExprLoc().printToString(data.Ctx.getSourceManager()))));
+        using Statements = llvm::SmallVector<std::string, 16>;
+        std::function<Expected<Statements>(std::string, QualType, InitListExpr *)> expand_array;
+        expand_array = [&](std::string array_name, QualType array_type,
+                           InitListExpr *array_init) -> Expected<Statements> {
+          const auto *constant_array_type = data.Ctx.getAsConstantArrayType(array_type);
+          if (constant_array_type == nullptr) {
+            return CreateRuntimeError(
+                std::move(llvm::formatv("    at {0}\nInitListExpr must be assigned to a constant array type",
+                                        array_init->getExprLoc().printToString(data.Ctx.getSourceManager()))));
+          }
+
+          const auto element_type = constant_array_type->getElementType();
+          Statements statements; // Keep statements in execution order.
+          if (ctx.deref_force_extract) {
+            const auto tmp_var_type = data.Ctx.getPointerType(element_type);
+            const std::string tmp_var_name = GetTempVarName("InitList");
+            statements.emplace_back(llvm::formatv("{0} = {1};", PrintType(tmp_var_type, tmp_var_name), array_name));
+            array_name = tmp_var_name;
+          }
+
+          for (unsigned i = 0; i < array_init->getNumInits(); ++i) {
+            auto *init_expr = array_init->getInit(i);
+            if (isa<ImplicitValueInitExpr>(init_expr)) {
+              continue;
+            }
+
+            const std::string element_name = llvm::formatv("*({0} + {1}UL)", array_name, i);
+            if (auto *nested_init = dyn_cast<InitListExpr>(init_expr->IgnoreParenImpCasts());
+                nested_init != nullptr && element_type->isArrayType()) {
+              auto nested_statements = expand_array(element_name, element_type, nested_init);
+              if (auto error = nested_statements.takeError()) {
+                return std::move(error);
+              }
+              statements.insert(statements.end(), nested_statements->begin(), nested_statements->end());
+              continue;
+            }
+
+            auto usage = GetUsage(data.Ctx, init_expr);
+            if (auto error = usage.takeError()) {
+              return std::move(error);
+            }
+            auto res = BuildExpr(BuildExprCtx(init_expr, *usage, true, std::make_pair(element_name, element_type),
+                                              ctx.string_literal_usage_kind));
+            if (auto error = res.takeError()) {
+              return std::move(error);
+            }
+
+            statements.insert(statements.end(), res->pre_stmts.rbegin(), res->pre_stmts.rend());
+            if (!res->final_expr.empty()) {
+              statements.emplace_back(llvm::formatv("{0} = {1};", element_name, res->final_expr));
+            }
+          }
+          return statements;
+        };
+
+        auto statements = expand_array(var_name, var_type, init_list_expr);
+        if (auto error = statements.takeError()) {
+          return std::move(error);
         }
-        // e.g int arr[3][4][5] = {{1, 2, 3}, {4, 5, 6}, {7, 8, 9}};
-        auto element_type = data.Ctx.getAsConstantArrayType(var_type)->getElementType();
-
-        llvm::SmallVector<std::string, 16> tmp_stmts; // this is in real order. it will need to be reversed later
-        if (ctx.deref_force_extract) {
-          auto tmp_var_type = data.Ctx.getPointerType(
-              element_type); // we want to assign to a pointer to the element type, not the element type itself
-
-          // must extract var to tmp var first, then assign to array
-          const std::string tmp_var_name = GetTempVarName("InitList");
-          tmp_stmts.emplace_back(llvm::formatv("{0} = {1};", PrintType(tmp_var_type, tmp_var_name), var_name));
-          var_name = tmp_var_name;
-        }
-
-        for (unsigned i = 0; i < init_list_expr->getNumInits(); ++i) {
-          auto *init_expr = init_list_expr->getInit(i);
-
-          if (auto *_ = dyn_cast<ImplicitValueInitExpr>(init_expr)) {
-            continue;
-          }
-
-          const std::string element_var_name = llvm::formatv("*({0} + {1}UL)", var_name, i);
-          auto usage = GetUsage(data.Ctx, init_expr);
-          if (auto error = usage.takeError()) {
-            return std::move(error);
-          }
-          auto res = BuildExpr(BuildExprCtx(init_expr, *usage, true, std::make_pair(element_var_name, element_type),
-                                            ctx.string_literal_usage_kind));
-          if (auto error = res.takeError()) {
-            return std::move(error);
-          }
-
-          // insert in REAL order
-          tmp_stmts.insert(tmp_stmts.end(), res->pre_stmts.rbegin(), res->pre_stmts.rend());
-
-          // if there are nested init expr lists for arrays, then final_expr will be empty!
-          if (!res->final_expr.empty()) {
-            tmp_stmts.emplace_back(llvm::formatv("{0} = {1};", element_var_name, res->final_expr));
-          }
-        }
-
-        pre_stmts.assign(tmp_stmts.rbegin(), tmp_stmts.rend()); // reverse the order of the statements
+        pre_stmts.assign(statements->rbegin(), statements->rend());
       } else if (var_type->isUnionType()) {
         auto *field_decl = init_list_expr->getInitializedFieldInUnion();
         if (field_decl != nullptr) {
@@ -690,7 +763,7 @@ public:
             goto build_expr_end; // nothing to preserve
           }
 
-          if (field_decl->isAnonymousStructOrUnion()) {
+          if (field_decl->isAnonymousStructOrUnion() || field_decl->getName().empty()) {
             auto *sub_init_expr_list = dyn_cast<InitListExpr>(init_expr);
             if (sub_init_expr_list == nullptr) {
               return CreateRuntimeError(
@@ -783,7 +856,7 @@ public:
           init_expr = init_expr->IgnoreParenImpCasts();
 
           auto i_var_name = var_name;
-          if (field_decl->isAnonymousStructOrUnion()) {
+          if (field_decl->isAnonymousStructOrUnion() || field_decl->getName().empty()) {
             auto *sub_init_expr_list = dyn_cast<InitListExpr>(init_expr);
             if (sub_init_expr_list == nullptr) {
               return CreateRuntimeError(
@@ -972,8 +1045,7 @@ public:
       if (auto error = lhs_usage.takeError()) {
         return std::move(error);
       }
-      auto lhs_res = BuildExpr(
-          BuildExprCtx(lhs, *lhs_usage, ctx.deref_force_extract, ctx.assigned_to, ctx.string_literal_usage_kind));
+      auto lhs_res = BuildExpr(BuildExprCtx(lhs, *lhs_usage, false, ctx.assigned_to, ctx.string_literal_usage_kind));
       if (auto error = lhs_res.takeError()) {
         return std::move(error);
       }
@@ -1029,8 +1101,7 @@ public:
       if (auto error = lhs_usage.takeError()) {
         return std::move(error);
       }
-      auto lhs_res = BuildExpr(
-          BuildExprCtx(lhs, *lhs_usage, ctx.deref_force_extract, ctx.assigned_to, ctx.string_literal_usage_kind));
+      auto lhs_res = BuildExpr(BuildExprCtx(lhs, *lhs_usage, false, ctx.assigned_to, ctx.string_literal_usage_kind));
       if (auto error = lhs_res.takeError()) {
         return std::move(error);
       }
@@ -1088,8 +1159,7 @@ if ({4}) {
         if (auto error = lhs_usage.takeError()) {
           return error;
         }
-        auto lhs_res = BuildExpr(
-            BuildExprCtx(lhs, *lhs_usage, ctx.deref_force_extract, ctx.assigned_to, ctx.string_literal_usage_kind));
+        auto lhs_res = BuildExpr(BuildExprCtx(lhs, *lhs_usage, false, ctx.assigned_to, ctx.string_literal_usage_kind));
         if (auto error = lhs_res.takeError()) {
           return error;
         }
@@ -1144,8 +1214,7 @@ if (!({4})) {
         if (auto error = lhs_usage.takeError()) {
           return std::move(error);
         }
-        auto lhs_res = BuildExpr(
-            BuildExprCtx(lhs, *lhs_usage, ctx.deref_force_extract, ctx.assigned_to, ctx.string_literal_usage_kind));
+        auto lhs_res = BuildExpr(BuildExprCtx(lhs, *lhs_usage, false, ctx.assigned_to, ctx.string_literal_usage_kind));
         if (auto error = lhs_res.takeError()) {
           return std::move(error);
         }
@@ -1195,6 +1264,35 @@ if ({4}) {
       }
 
       case BO_Assign: {
+        if (lhs->getType()->isArrayType() && llvm::isa<InitListExpr>(rhs->IgnoreParenImpCasts())) {
+          auto lhs_usage = GetUsage(data.Ctx, lhs);
+          if (auto error = lhs_usage.takeError()) {
+            return std::move(error);
+          }
+          auto lhs_res = BuildExpr(
+              BuildExprCtx(lhs, *lhs_usage, ctx.deref_force_extract, ctx.assigned_to, ctx.string_literal_usage_kind));
+          if (auto error = lhs_res.takeError()) {
+            return std::move(error);
+          }
+
+          const auto lhs_type = lhs->getType();
+          auto rhs_res = BuildExpr(BuildExprCtx(rhs, Usage::Value, true, std::make_pair(lhs_res->final_expr, lhs_type),
+                                                ctx.string_literal_usage_kind));
+          if (auto error = rhs_res.takeError()) {
+            return std::move(error);
+          }
+          if (!rhs_res->final_expr.empty()) {
+            return CreateRuntimeError(
+                std::move(llvm::formatv("    at {0}\nArray initializer assignment produced a value",
+                                        binary_operator->getExprLoc().printToString(data.Ctx.getSourceManager()))));
+          }
+
+          pre_stmts.insert(pre_stmts.end(), rhs_res->pre_stmts.begin(), rhs_res->pre_stmts.end());
+          pre_stmts.insert(pre_stmts.end(), lhs_res->pre_stmts.begin(), lhs_res->pre_stmts.end());
+          data.ps_ctx.SetControl(StageControl::Repeat);
+          break;
+        }
+
         auto rhs_usage = GetUsage(data.Ctx, rhs);
         if (auto error = rhs_usage.takeError()) {
           return std::move(error);
@@ -1242,7 +1340,6 @@ if ({4}) {
           pre_stmts.insert(pre_stmts.end(), rhs_res->pre_stmts.begin(), rhs_res->pre_stmts.end());
           pre_stmts.push_back(lhs_tmp_var);
           pre_stmts.insert(pre_stmts.end(), lhs_res->pre_stmts.begin(), lhs_res->pre_stmts.end());
-          data.ps_ctx.SetControl(StageControl::Repeat);
           if (ctx.usage_kind == Usage::Value) {
             os << "*" << lhs_tmp_var_name;
           }
@@ -1563,12 +1660,16 @@ if ({4}) {
                                     member_expr->getBeginLoc().printToString(data.Ctx.getSourceManager()))));
       }
 
-      auto res = BuildExpr(BuildExprCtx(member_expr->getBase()->IgnoreParenImpCasts(), Usage::Place,
-                                        ctx.deref_force_extract, ctx.assigned_to, ctx.string_literal_usage_kind));
+      auto res = BuildExpr(BuildExprCtx(member_expr->getBase()->IgnoreParenImpCasts(), Usage::Place, false,
+                                        ctx.assigned_to, ctx.string_literal_usage_kind));
       if (auto error = res.takeError()) {
         return error;
       }
-      os << llvm::formatv("({0}).{1}", res->final_expr, member_expr->getMemberNameInfo().getAsString());
+      if (member_expr->getMemberNameInfo().getAsString().empty()) {
+        os << res->final_expr;
+      } else {
+        os << llvm::formatv("({0}).{1}", res->final_expr, member_expr->getMemberNameInfo().getAsString());
+      }
       pre_stmts.insert(pre_stmts.end(), res->pre_stmts.begin(), res->pre_stmts.end());
     } else {
       if (auto error = PrintSourceText(os, expr, data.Ctx)) {

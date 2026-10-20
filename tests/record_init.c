@@ -27,6 +27,7 @@ int main(void) {
   float mat[3][3][3] = {{{1.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f}, {0.0f, 0.0f, 1.0f}},
                         {{1.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f}, {0.0f, 0.0f, 1.0f}},
                         {{1.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f}, {0.0f, 0.0f, 1.0f}}};
+  int hypercube[2][2][2][2] = {{{{1, 2}, {3, 4}}, {{5, 6}, {7, 8}}}, {{{9, 10}, {11, 12}}, {{13, 14}, {15, 16}}}};
 
   struct Cell {
     int values[2][3];
@@ -45,6 +46,14 @@ int main(void) {
       .layers = {{.cells = {{.values = {{1, 2, 3}, {4, 5, 6}}}, {.values = {{7, 8, 9}, {10, 11, 12}}}}},
                  {.cells = {{.values = {{13, 14, 15}, {16, 17, 18}}}, {.values = {{19, 20, 21}, {22, 23, 24}}}}}},
       .name = "demo"};
+
+  struct World world2;
+  world2 = world;
+
+  struct World *p = ({
+    struct World *src = &world;
+    &world2;
+  });
 
   union Value {
     int i;
