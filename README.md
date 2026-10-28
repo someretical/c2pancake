@@ -75,6 +75,7 @@ Note if see a warning in the output like `WARNING: Maximum number of passes (X) 
 1. If there are any function definitions that should not be rewritten to follow Pancake's calling convention, annotate them with `[[clang::annotate("__c2pnk_external_entry_point")]]`.
     - E.g. the [`init`](https://github.com/seL4/microkit/blob/main/docs/manual.md#entry-points) function in [sDDF](https://github.com/au-ts/sDDF) has the signature `void init(void)` and applications are expected to implement it.
 1. Global variables shared across threads should be annotated with `[[clang::annotate("__c2pnk_shared_global")]]`.
+1. Global variables that are loaded externally should be annotated with `[[clang::annotate("__c2pnk_external_global")]]`. Their types should also be modified to be a pointer
 1. Macros like `assert()` cannot be converted properly so they should be expanded beforehand or replaced with a function.
 
 ### Other restrictions

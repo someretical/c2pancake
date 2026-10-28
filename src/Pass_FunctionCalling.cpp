@@ -37,6 +37,7 @@
 using namespace clang;
 using namespace clang::tooling;
 
+extern llvm::cl::opt<bool> opt_treat_external_functions_as_non_ffi;
 extern llvm::cl::list<std::string> function_rewrite_extra_headers;
 
 namespace pancake::pass_inject_memcpy_polyfill {
@@ -715,6 +716,10 @@ public:
       return true;
     }
 
+    if (opt_treat_external_functions_as_non_ffi && !func_decl->isThisDeclarationADefinition()) {
+      return true;
+    }
+
     std::string replacement_text;
     llvm::raw_string_ostream os(replacement_text);
 
@@ -1125,6 +1130,10 @@ public:
       }
     } else {
       // ffi function call
+      if (opt_treat_external_functions_as_non_ffi) {
+        return true;
+      }
+
       /*
       ret_type example_func(arg1, arg2, arg3, arg4, arg5);
 

@@ -49,6 +49,12 @@ void PrintVersion(llvm::raw_ostream &os) {
 } // namespace
 
 // NOLINTBEGIN(misc-use-internal-linkage)
+llvm::cl::opt<bool> opt_treat_external_functions_as_non_ffi(
+    "treat-header-functions-as-non-ffi",
+    llvm::cl::desc("Treat functions defined in headers as non-FFI, meaning no shims will be generated for them "
+                   "(default: false, meaning shims will be generated)"),
+    llvm::cl::cat(c2_pancake_options), llvm::cl::init(false));
+
 llvm::cl::opt<PointerWidth> pointer_bits("pointer-bits", llvm::cl::desc("Override pointer width"),
                                          llvm::cl::cat(c2_pancake_options),
                                          llvm::cl::values(clEnumValN(PointerWidth::W32, "32", "32-bit"),

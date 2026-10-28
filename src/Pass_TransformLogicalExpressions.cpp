@@ -1554,7 +1554,12 @@ if ({4}) {
       }
 
       case UO_Deref: {
-        auto usage_kind = ctx.deref_force_extract ? Usage::Value : ctx.usage_kind;
+        // can_be_used_as_an_access_base is true if the result of the deref is immediately used in a . OR -> OR []
+        // expression which means we don't need a temp var (and the associated memcpy)
+        const bool can_be_used_as_an_access_base =
+            ctx.usage_kind == Usage::Place &&
+            (final_expr_type->isRecordType() || final_expr_type->isArrayType() || final_expr_type->isPointerType());
+        auto usage_kind = ctx.deref_force_extract && !can_be_used_as_an_access_base ? Usage::Value : ctx.usage_kind;
         auto sub_expr_usage = GetUsage(data.Ctx, sub_expr);
         if (auto error = sub_expr_usage.takeError()) {
           return std::move(error);

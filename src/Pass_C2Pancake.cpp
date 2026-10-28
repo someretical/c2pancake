@@ -42,7 +42,7 @@ struct WorkerData {
   StageContext &ps_ctx;
   llvm::raw_string_ostream &tu_os;
   llvm::raw_ostream &ffi_os;
-  llvm::DenseMap<VarDecl *, uint64_t> &global_var_map;
+  llvm::DenseMap<VarDecl *, GlobalVarData> &global_var_map;
   llvm::Error error = llvm::Error::success();
   uint64_t next_global_var_addr = 0x0UL;
   size_t tmp_var_counter = 0;
@@ -109,7 +109,15 @@ public:
       return false;
     }
 
+    auto &sm = tu_decl->getASTContext().getSourceManager();
+
     for (auto *decl : tu_decl->decls()) {
+      // inline stuff from headers will appear here but we want to filter all of them out
+      auto loc = decl->getLocation();
+      if (loc.isInvalid() || !sm.isWrittenInMainFile(loc)) {
+        continue;
+      }
+
       if (auto *func_decl = llvm::dyn_cast<FunctionDecl>(decl)) {
         if (!func_decl->isThisDeclarationADefinition()) {
           continue;
@@ -155,7 +163,10 @@ public:
           return false;
         }
 
-        data.global_var_map[var_decl] = addr;
+        data.global_var_map[var_decl] = {.type = var_decl->getType()->getPointeeType().getAsString(),
+                                         .name = var_decl->getName().str(),
+                                         .addr = addr,
+                                         .is_external = IsGlobalVarExternal(var_decl)};
         // TODO replace with comment that includes the address
 
         data.tu_os << llvm::formatv("/* \"{0}\" at offset {1}/{1:X} */\n", var_decl->getName(), addr);
@@ -184,6 +195,17 @@ public:
     }
 
     return true;
+  }
+
+  static auto IsGlobalVarExternal(VarDecl *var_decl) -> bool {
+    return std::ranges::any_of(var_decl->getAttrs(), [](const Attr *attr) -> bool {
+      if (const auto *annotate_attr = llvm::dyn_cast<AnnotateAttr>(attr)) {
+        if (annotate_attr->getAnnotation() == "__c2pnk_external_global") {
+          return true;
+        }
+      }
+      return false;
+    });
   }
 
   auto TraverseFunctionDecl(FunctionDecl *func_decl) -> bool {
@@ -496,7 +518,7 @@ public:
     if (auto *decl_ref_expr = dyn_cast<DeclRefExpr>(expr)) {
       if (auto *var_decl = dyn_cast<VarDecl>(decl_ref_expr->getDecl())) {
         if (data.global_var_map.contains(var_decl)) {
-          auto addr = data.global_var_map[var_decl];
+          auto addr = data.global_var_map[var_decl].addr;
           auto bytes = (uint64_t)data.Ctx.getTypeSizeInChars(var_decl->getType()).getQuantity();
 
           auto usage_kind = ctx.usage_kind;
@@ -1164,7 +1186,7 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
   llvm::raw_string_ostream tu_os(tu_replacement_text);
   llvm::raw_string_ostream ffi_os(ffi_replacement_text);
 
-  llvm::DenseMap<VarDecl *, uint64_t> global_var_map;
+  llvm::DenseMap<VarDecl *, GlobalVarData> global_var_map;
   WorkerData data{.Ctx = Ctx, .ps_ctx = ps_ctx, .tu_os = tu_os, .ffi_os = ffi_os, .global_var_map = global_var_map};
   Worker w(data);
   w.TraverseDecl(Ctx.getTranslationUnitDecl());
@@ -1189,8 +1211,11 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
     ps_ctx.SetControl(StageControl::NextFile);
     return;
   }
-
-  ps_ctx.SetControl(StageControl::Continue);
+  if (auto error = ps_ctx.run.artifacts.Set(global_var_data_key, std::move(global_var_map))) {
+    ps_ctx.error = std::move(error);
+    ps_ctx.SetControl(StageControl::NextFile);
+    return;
+  }
 }
 
 namespace {
@@ -1234,6 +1259,9 @@ static void init_pancake_mem(void) {{
   cml_heap     = cml_memory;
   cml_stack    = (unsigned char *)cml_heap + cml_heap_sz;
   cml_stackend = (unsigned char *)cml_stack + cml_stack_sz;
+
+  /* externally declared global vars go here, they are all POINTERS */
+  {3}
 }
 
 int main(void) {{
@@ -1297,6 +1325,7 @@ auto Finalizer::Write(StageContext &ctx, clang::CompilerInstance &compiler) -> l
   auto &tu_str = ctx.run.artifacts.Get(translation_unit_output_key)->content;
   auto &ffi_str = ctx.run.artifacts.Get(ffi_output_key)->content;
   auto heap_size = ctx.run.artifacts.Get(heap_size_key)->size;
+  const auto &external_global_vars_map = ctx.run.artifacts.Get(global_var_data_key);
   auto &stack_size = stack_size_opt;
 
   auto tu_file_path = ctx.next_file + ".pancake";
@@ -1334,7 +1363,16 @@ auto Finalizer::Write(StageContext &ctx, clang::CompilerInstance &compiler) -> l
   PrintLogBegin(llvm::outs(), ctx);
   llvm::outs() << "Wrote pancake translation unit to " << tu_file_path << "\n";
 
-  scaffold_out << llvm::formatv(SCAFFOLD_TEMPLATE, heap_size + stack_size, heap_size, stack_size);
+  std::string external_global_vars;
+  llvm::raw_string_ostream external_global_vars_os(external_global_vars);
+  for (const auto &[var_decl, global_var_data] : *external_global_vars_map) {
+    /* note that {1} is a POINTER to the original type! */
+    external_global_vars_os << llvm::formatv("*({1})(((unsigned char *)cml_heap) + {0}) = 0; /* {2}*/\n",
+                                             global_var_data.addr, global_var_data.type, global_var_data.name);
+  }
+  external_global_vars_os.flush();
+
+  scaffold_out << llvm::formatv(SCAFFOLD_TEMPLATE, heap_size + stack_size, heap_size, stack_size, external_global_vars);
   scaffold_out.flush();
   PrintLogBegin(llvm::outs(), ctx);
   llvm::outs() << "Wrote pancake scaffold to " << scaffold_file_path << "\n";

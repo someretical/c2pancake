@@ -50,6 +50,7 @@
                 "--function-rewrite-extra-headers=#include \\\"uart2.h\\\"",
                 // "--end=RewriteFunctionCalling",
                 "--skip=ConvertIntegerTypes",
+                "--treat-header-functions-as-non-ffi",
                 "--",
                 "-DNDEBUG",
                 "-ffreestanding",
