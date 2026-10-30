@@ -40,6 +40,7 @@ endforeach()
 add_executable(
   c2pancake
   src/Utils.cpp
+  src/CodeGen.cpp
   src/Pipeline.cpp
   src/Pass_C2Pancake.cpp
   src/Pass_FunctionCalling.cpp

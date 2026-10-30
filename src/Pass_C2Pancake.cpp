@@ -1,5 +1,7 @@
 #include "Pass_C2Pancake.h"
+#include "CodeGen.h"
 #include "Utils.h"
+#include "pancake_ir.h"
 
 #include <clang/AST/ASTConsumer.h>
 #include <clang/AST/ASTContext.h>
@@ -24,6 +26,7 @@
 #include <llvm/Support/Program.h>
 #include <llvm/Support/raw_ostream.h>
 
+#include <functional>
 #include <string>
 #include <utility>
 
@@ -36,13 +39,21 @@ extern llvm::cl::opt<std::string> cake_path;
 extern llvm::cl::opt<std::string> cake_options;
 
 namespace pancake::pass_c2pancake {
+using clang::BreakStmt;
+using clang::CallExpr;
+using clang::ContinueStmt;
+using clang::Expr;
+using clang::IfStmt;
+using clang::ReturnStmt;
+using clang::Stmt;
+using clang::WhileStmt;
 namespace {
 struct WorkerData {
   ASTContext &Ctx;
   StageContext &ps_ctx;
-  llvm::raw_string_ostream &tu_os;
   llvm::raw_ostream &ffi_os;
   llvm::DenseMap<VarDecl *, GlobalVarData> &global_var_map;
+  pancake::Program program;
   llvm::Error error = llvm::Error::success();
   uint64_t next_global_var_addr = 0x0UL;
   size_t tmp_var_counter = 0;
@@ -87,11 +98,14 @@ struct BuildExprCtx {
 struct BuiltExpr {
   llvm::SmallVector<std::string, 8> pre_stmts;
   clang::QualType final_expr_type;
+  std::string final_expr_text;
   std::string final_expr;
+  pancake::ExprPtr expr;
   std::optional<size_t> heap_alignment;
   explicit BuiltExpr(llvm::SmallVector<std::string, 8> pre_stmts, std::string final_expr,
                      clang::QualType final_expr_type, std::optional<size_t> heap_alignment)
-      : pre_stmts(std::move(pre_stmts)), final_expr_type(final_expr_type), final_expr(std::move(final_expr)),
+      : pre_stmts(std::move(pre_stmts)), final_expr_type(final_expr_type), final_expr_text(final_expr),
+        final_expr(final_expr_text), expr(std::make_shared<pancake::RawExpr>(std::move(final_expr))),
         heap_alignment(heap_alignment) {}
 };
 
@@ -100,6 +114,22 @@ class Worker : public RecursiveASTVisitor<Worker> {
 
 public:
   explicit Worker(struct WorkerData &data) : data(data) {}
+
+  static auto IsVolatileAccess(const Expr *expr) -> bool {
+    expr = expr->IgnoreParenImpCasts();
+    if (expr->getType().isVolatileQualified()) {
+      return true;
+    }
+    if (const auto *member_expr = dyn_cast<MemberExpr>(expr)) {
+      return IsVolatileAccess(member_expr->getBase());
+    }
+    if (const auto *unary_operator = dyn_cast<UnaryOperator>(expr);
+        unary_operator != nullptr && unary_operator->getOpcode() == UO_Deref) {
+      const auto *pointer_type = unary_operator->getSubExpr()->getType()->getAs<PointerType>();
+      return pointer_type != nullptr && pointer_type->getPointeeType().isVolatileQualified();
+    }
+    return false;
+  }
 
   // process all outer record decls first
   static auto shouldTraversePostOrder() -> bool { return true; }
@@ -163,13 +193,39 @@ public:
           return false;
         }
 
-        data.global_var_map[var_decl] = {.type = var_decl->getType()->getPointeeType().getAsString(),
+        std::string pointee_type_str = data.Ctx.getPointerType(var_decl->getType()).getAsString();
+        data.global_var_map[var_decl] = {.type = pointee_type_str,
                                          .name = var_decl->getName().str(),
                                          .addr = addr,
                                          .is_external = IsGlobalVarExternal(var_decl)};
-        // TODO replace with comment that includes the address
 
-        data.tu_os << llvm::formatv("/* \"{0}\" at offset {1}/{1:X} */\n", var_decl->getName(), addr);
+        data.program.globals.emplace_back(std::make_shared<pancake::DefineStmt>(
+            var_decl->getName().str() + "_addr", llvm::formatv("@base + {0}", addr).str()));
+
+        std::string value_str;
+        llvm::raw_string_ostream value_os(value_str);
+        value_os << "(";
+        switch (size_bytes) {
+        case 1:
+          value_os << "ld8";
+          break;
+        case 4:
+          value_os << "ld32";
+          break;
+        case 8:
+          value_os << "lds 1";
+          break;
+        default:
+          data.error = CreateRuntimeError(std::move(llvm::formatv(
+              "\n    at {0}\nUnsupported global variable {1} size: {2} bytes",
+              var_decl->getBeginLoc().printToString(data.Ctx.getSourceManager()), var_decl->getName(), size_bytes)));
+          return false;
+        }
+        value_os << " (@base + " << addr << ")";
+        value_os << ")";
+        value_os.flush();
+        data.program.globals.emplace_back(
+            std::make_shared<pancake::DefineStmt>(var_decl->getName().str() + "_val", value_str));
         continue;
       }
 
@@ -244,42 +300,38 @@ public:
     auto *body = func_decl->getBody();
     if (body != nullptr) {
       if (auto *compound_stmt = llvm::dyn_cast<CompoundStmt>(body)) {
-        llvm::SmallVector<std::string> stmts;
+        llvm::SmallVector<pancake::StmtPtr> stmts;
         stmts.reserve(compound_stmt->size());
+        std::function<void(const pancake::StmtPtr &)> append_statement = [&](const pancake::StmtPtr &statement) {
+          if (statement == nullptr)
+            return;
+          if (statement->kind == pancake::StmtKind::Block) {
+            const auto &nested = static_cast<const pancake::BlockStmt &>(*statement);
+            for (const auto &child : nested.block->stmts)
+              append_statement(child);
+            return;
+          }
+          stmts.emplace_back(statement);
+        };
         for (auto *stmt : compound_stmt->body()) {
-          auto res = BuildStmt(stmt);
+          auto res = BuildAstStmt(stmt);
           if (auto error = res.takeError()) {
             data.error = std::move(error);
             return false;
           }
-          if (!res.get().empty()) {
-            stmts.emplace_back(res.get());
-          }
+          append_statement(res.get());
         }
 
-        std::string replacement_text;
-        llvm::raw_string_ostream os(replacement_text);
-
-        // TODO Pancake playground does not support this yet!
-        if (func_decl->isInlineSpecified()) {
-          os << "inline ";
-        }
-
-        os << "fun 1 " << func_decl->getName() << "(";
+        auto function = std::make_shared<pancake::Function>();
+        function->name = func_decl->getName().str();
+        function->isInline = func_decl->isInlineSpecified();
+        function->body = std::make_shared<pancake::Block>();
         for (auto &&param : func_decl->parameters()) {
-          os << "1 " << param->getName();
-          if (param != func_decl->parameters().back()) {
-            os << ", ";
-          }
+          function->params.push_back({param->getName().str(), 1});
         }
-        os << ") {\n";
-        for (auto &&stmt : stmts) {
-          os << stmt << "\n";
-        }
-        os << "}\n";
-        os.flush();
-
-        data.tu_os << replacement_text;
+        for (auto &&stmt : stmts)
+          function->body->stmts.emplace_back(std::move(stmt));
+        data.program.functions.emplace_back(std::move(function));
       } else {
         data.error = CreateRuntimeError(std::move(
             llvm::formatv("\n    at {0}\nFunction body is not a compound statement: {1}",
@@ -308,6 +360,201 @@ public:
 
   static auto FuncIsFFIWrapper(FunctionDecl *func_decl) -> bool {
     return func_decl->getName().starts_with("__c2pnk_ffi_wrapper_");
+  }
+
+  auto ParseAstStmt(std::string text) -> Expected<pancake::StmtPtr> {
+    auto trim = [](std::string value) {
+      const auto begin = value.find_first_not_of(" \t\n");
+      if (begin == std::string::npos)
+        return std::string{};
+      const auto end = value.find_last_not_of(" \t\n;");
+      return value.substr(begin, end - begin + 1);
+    };
+    text = trim(std::move(text));
+    if (text.empty())
+      return pancake::StmtPtr{};
+    if (text.starts_with("!ld")) {
+      const auto opcode_end = text.find(' ');
+      const auto comma = text.find(", ", opcode_end == std::string::npos ? 0 : opcode_end + 1);
+      if (opcode_end == std::string::npos || comma == std::string::npos)
+        return CreateRuntimeError("Malformed shared memory load");
+      const auto opcode = text.substr(1, opcode_end - 1);
+      pancake::MemoryWidth width;
+      if (opcode == "ldw")
+        width = pancake::MemoryWidth::Word;
+      else if (opcode == "ld8")
+        width = pancake::MemoryWidth::Byte;
+      else if (opcode == "ld32")
+        width = pancake::MemoryWidth::Word32;
+      else
+        return CreateRuntimeError(llvm::formatv("Unsupported shared memory load: {0}", opcode));
+      return std::make_shared<pancake::SharedMemoryLoadStmt>(
+          width, text.substr(opcode_end + 1, comma - opcode_end - 1),
+          std::make_shared<pancake::RawExpr>(text.substr(comma + 2)));
+    }
+    if (text == "break")
+      return std::make_shared<pancake::BreakStmt>();
+    if (text.starts_with("return "))
+      return std::make_shared<pancake::ReturnStmt>(std::make_shared<pancake::RawExpr>(text.substr(7)));
+    if (text.starts_with("var ")) {
+      auto name_start = text.find(' ', 4);
+      if (name_start == std::string::npos)
+        return CreateRuntimeError("Malformed lowered variable declaration");
+      ++name_start;
+      auto equals = text.find(" = ", name_start);
+      auto name = text.substr(name_start, equals == std::string::npos ? std::string::npos : equals - name_start);
+      pancake::ExprPtr init;
+      if (equals != std::string::npos)
+        init = std::make_shared<pancake::RawExpr>(text.substr(equals + 3));
+      return std::make_shared<pancake::VarDeclStmt>(std::move(name), std::move(init), 1);
+    }
+    const auto equals = text.find(" = ");
+    if (equals != std::string::npos)
+      return std::make_shared<pancake::AssignStmt>(std::make_shared<pancake::RawExpr>(text.substr(0, equals)),
+                                                   std::make_shared<pancake::RawExpr>(text.substr(equals + 3)));
+    return CreateRuntimeError(llvm::formatv("Unsupported lowered statement: {0}", text));
+  }
+
+  auto BuildAstStmt(Stmt *stmt) -> Expected<pancake::StmtPtr> {
+    auto AppendToBlock = [](const pancake::StmtPtr &statement, const pancake::BlockPtr &block) {
+      if (statement == nullptr)
+        return;
+      if (statement->kind == pancake::StmtKind::Block) {
+        const auto &nested = static_cast<const pancake::BlockStmt &>(*statement);
+        for (const auto &child : nested.block->stmts) {
+          if (child != nullptr && child->kind == pancake::StmtKind::Block) {
+            const auto &nested_child = static_cast<const pancake::BlockStmt &>(*child);
+            for (const auto &grandchild : nested_child.block->stmts)
+              block->stmts.emplace_back(grandchild);
+          } else {
+            block->stmts.emplace_back(child);
+          }
+        }
+        return;
+      }
+      block->stmts.emplace_back(statement);
+    };
+    auto WithPreStatements = [&](const llvm::SmallVector<std::string, 8> &pre_stmts,
+                                 pancake::StmtPtr statement) -> Expected<pancake::StmtPtr> {
+      if (pre_stmts.empty())
+        return statement;
+      auto block = std::make_shared<pancake::Block>();
+      for (const auto &pre_stmt : pre_stmts) {
+        auto pre = ParseAstStmt(pre_stmt);
+        if (auto error = pre.takeError())
+          return std::move(error);
+        if (pre.get())
+          block->stmts.emplace_back(std::move(pre.get()));
+      }
+      if (statement)
+        block->stmts.emplace_back(std::move(statement));
+      if (block->stmts.empty())
+        return pancake::StmtPtr{};
+      return std::make_shared<pancake::BlockStmt>(std::move(block));
+    };
+
+    if (auto *compound = dyn_cast<CompoundStmt>(stmt)) {
+      auto block = std::make_shared<pancake::Block>();
+      for (auto *child : compound->body()) {
+        auto result = BuildAstStmt(child);
+        if (auto error = result.takeError())
+          return std::move(error);
+        AppendToBlock(result.get(), block);
+      }
+      return std::make_shared<pancake::BlockStmt>(std::move(block));
+    }
+    if (auto *if_stmt = dyn_cast<IfStmt>(stmt)) {
+      auto condition = BuildExpr(BuildExprCtx(if_stmt->getCond(), Usage::Value));
+      if (auto error = condition.takeError())
+        return std::move(error);
+      auto then_result = BuildAstStmt(if_stmt->getThen());
+      if (auto error = then_result.takeError())
+        return std::move(error);
+      auto then_block = std::make_shared<pancake::Block>();
+      AppendToBlock(then_result.get(), then_block);
+      pancake::BlockPtr else_block;
+      if (auto *else_stmt = if_stmt->getElse()) {
+        auto else_result = BuildAstStmt(else_stmt);
+        if (auto error = else_result.takeError())
+          return std::move(error);
+        else_block = std::make_shared<pancake::Block>();
+        AppendToBlock(else_result.get(), else_block);
+      }
+      return std::make_shared<pancake::IfStmt>(std::move(condition->expr), std::move(then_block),
+                                               std::move(else_block));
+    }
+    if (auto *while_stmt = dyn_cast<WhileStmt>(stmt)) {
+      auto condition = BuildExpr(BuildExprCtx(while_stmt->getCond(), Usage::Value));
+      if (auto error = condition.takeError())
+        return std::move(error);
+      auto body_result = BuildAstStmt(while_stmt->getBody());
+      if (auto error = body_result.takeError())
+        return std::move(error);
+      auto body = std::make_shared<pancake::Block>();
+      AppendToBlock(body_result.get(), body);
+      return std::make_shared<pancake::WhileStmt>(std::move(condition->expr), std::move(body));
+    }
+    if (isa<BreakStmt>(stmt))
+      return std::make_shared<pancake::BreakStmt>();
+    if (isa<ContinueStmt>(stmt))
+      return std::make_shared<pancake::ContinueStmt>();
+
+    if (auto *decl_stmt = dyn_cast<DeclStmt>(stmt)) {
+      auto block = std::make_shared<pancake::Block>();
+      for (auto *decl : decl_stmt->decls()) {
+        auto *var_decl = dyn_cast<VarDecl>(decl);
+        if (var_decl == nullptr)
+          return CreateRuntimeError("Unsupported declaration in Pancake AST conversion");
+        BuiltExpr *init_result = nullptr;
+        std::optional<BuiltExpr> owned_init;
+        if (var_decl->hasInit() && !var_decl->getInit()->getType()->isArrayType()) {
+          auto result = BuildExpr(BuildExprCtx(var_decl->getInit(), Usage::Value));
+          if (auto error = result.takeError())
+            return std::move(error);
+          owned_init.emplace(std::move(result.get()));
+          init_result = &*owned_init;
+          for (const auto &pre_stmt : init_result->pre_stmts) {
+            auto pre = ParseAstStmt(pre_stmt);
+            if (auto error = pre.takeError())
+              return std::move(error);
+            if (pre.get())
+              block->stmts.emplace_back(std::move(pre.get()));
+          }
+        }
+        pancake::ExprPtr init =
+            init_result == nullptr ? std::make_shared<pancake::IntLitExpr>(0) : std::move(init_result->expr);
+        block->stmts.emplace_back(
+            std::make_shared<pancake::VarDeclStmt>(var_decl->getName().str(), std::move(init), 1));
+      }
+      if (block->stmts.size() == 1)
+        return std::move(block->stmts.front());
+      return std::make_shared<pancake::BlockStmt>(std::move(block));
+    }
+
+    if (auto *return_stmt = dyn_cast<ReturnStmt>(stmt)) {
+      if (return_stmt->getRetValue() == nullptr)
+        return std::make_shared<pancake::ReturnStmt>();
+      auto result = BuildExpr(BuildExprCtx(return_stmt->getRetValue(), Usage::Value));
+      if (auto error = result.takeError())
+        return std::move(error);
+      return WithPreStatements(result->pre_stmts, std::make_shared<pancake::ReturnStmt>(std::move(result->expr)));
+    }
+
+    if (auto *expr_stmt = dyn_cast<clang::Expr>(stmt)) {
+      if (!expr_stmt->HasSideEffects(data.Ctx))
+        return pancake::StmtPtr{};
+      auto result = BuildExpr(BuildExprCtx(expr_stmt, Usage::Effect));
+      if (auto error = result.takeError())
+        return std::move(error);
+      if (result->expr == nullptr || result->final_expr.empty())
+        return WithPreStatements(result->pre_stmts, pancake::StmtPtr{});
+      return WithPreStatements(result->pre_stmts, std::make_shared<pancake::ExprStmt>(std::move(result->expr)));
+    }
+
+    auto lowered = BuildStmt(stmt);
+    if (auto error = lowered.takeError())
+      return std::move(error);
+    return ParseAstStmt(std::move(lowered.get()));
   }
 
   auto BuildStmt(Stmt *stmt, bool needs_semicolon = true) -> Expected<std::string> {
@@ -354,6 +601,39 @@ public:
         if (auto *var_decl = llvm::dyn_cast<VarDecl>(decl)) {
           if (var_decl->hasInit()) {
             auto *init_expr = var_decl->getInit();
+            if (IsVolatileAccess(init_expr) && !init_expr->getType()->isArrayType()) {
+              auto address_res = BuildExpr(BuildExprCtx(init_expr, Usage::Place));
+              if (auto error = address_res.takeError()) {
+                return std::move(error);
+              }
+
+              const auto size_bytes = (uint64_t)data.Ctx.getTypeSizeInChars(init_expr->getType()).getQuantity();
+              std::string load_op;
+              switch (size_bytes) {
+              case 1:
+                load_op = "ld8";
+                break;
+              case 4:
+                load_op = "ld32";
+                break;
+              case 8:
+                load_op = "lds 1";
+                break;
+              default:
+                return CreateRuntimeError(std::move(
+                    llvm::formatv("\n    at {0}\nUnsupported volatile initializer size: {1} bytes",
+                                  init_expr->getExprLoc().printToString(data.Ctx.getSourceManager()), size_bytes)));
+              }
+
+              for (auto &&pre_stmt : address_res->pre_stmts) {
+                os << pre_stmt << "\n";
+              }
+              auto shared_load_op = size_bytes == 1 ? "ld8" : size_bytes == 4 ? "ld32" : "ldw";
+              os << llvm::formatv("var 1 {0} = 0;\n!{1} {0}, {2};", var_decl->getName(), shared_load_op,
+                                  address_res->final_expr);
+              continue;
+            }
+
             auto res = BuildExpr(BuildExprCtx(init_expr, Usage::Value));
             if (auto error = res.takeError()) {
               return std::move(error);
@@ -518,51 +798,16 @@ public:
     if (auto *decl_ref_expr = dyn_cast<DeclRefExpr>(expr)) {
       if (auto *var_decl = dyn_cast<VarDecl>(decl_ref_expr->getDecl())) {
         if (data.global_var_map.contains(var_decl)) {
-          auto addr = data.global_var_map[var_decl].addr;
-          auto bytes = (uint64_t)data.Ctx.getTypeSizeInChars(var_decl->getType()).getQuantity();
-
+          // auto addr = data.global_var_map[var_decl].addr;
+          // auto bytes = (uint64_t)data.Ctx.getTypeSizeInChars(var_decl->getType()).getQuantity();
           auto usage_kind = ctx.usage_kind;
           // if type is array, just decay to pointer AKA place
           if (final_expr_type->isArrayType()) {
             usage_kind = Usage::Place;
           }
 
-          // std::optional<size_t> heap_alignment = std::nullopt;
-
-          switch (usage_kind) {
-          case Usage::Value: {
-            switch (bytes) {
-            case 1:
-              os << "ld8";
-              break;
-            case 4:
-              os << "ld32";
-              break;
-            case 8:
-              os << "lds 1";
-              break;
-            default:
-              return CreateRuntimeError(std::move(llvm::formatv(
-                  "\n    at {0}\nUnsupported global variable {1} size: {2} bytes",
-                  decl_ref_expr->getExprLoc().printToString(data.Ctx.getSourceManager()), var_decl->getName(), bytes)));
-            }
-            // TODO add support for shared loads
-            os << llvm::formatv(" (@base + {0})", addr);
-            break;
-          }
-          case Usage::Place: {
-            os << llvm::formatv("@base + {0}", addr);
-            break;
-          }
-          default:
-            return CreateRuntimeError(
-                std::move(llvm::formatv("\n    at {0}\nUnsupported usage kind for global variable ({1}): {2}",
-                                        decl_ref_expr->getExprLoc().printToString(data.Ctx.getSourceManager()),
-                                        var_decl->getName(), static_cast<uint8_t>(ctx.usage_kind))));
-          }
-          os.flush();
-          return BuiltExpr(std::move(pre_stmts), final_expr, final_expr_type,
-                           (size_t)data.Ctx.getTypeAlignInChars(var_decl->getType()).getQuantity());
+          auto name = llvm::formatv("{0}_{1}", var_decl->getName(), Usage::Value == usage_kind ? "val" : "addr");
+          return BuiltExpr(std::move(pre_stmts), name.str(), final_expr_type, std::nullopt);
         }
 
         // local var
@@ -573,7 +818,11 @@ public:
 
       if (auto *enum_constant_decl = dyn_cast<EnumConstantDecl>(decl_ref_expr->getDecl())) {
         auto value = enum_constant_decl->getInitVal();
-        os << llvm::formatv("{0} /* {1}/{0:X} */", value.getZExtValue(), enum_constant_decl->getName());
+        os << llvm::formatv("{0} /* {1}", value.getZExtValue(), enum_constant_decl->getName());
+        if (value.getZExtValue() > 15) {
+          os << llvm::formatv(" ({0:X})", value.getZExtValue());
+        }
+        os << " */";
         os.flush();
         return BuiltExpr(std::move(pre_stmts), final_expr, final_expr_type, std::nullopt);
       }
@@ -590,7 +839,10 @@ public:
       // reserve enough space for the decimal representation
       integer_literal_str.reserve((integer_literal->getValue().getBitWidth() / 3) + 1);
       integer_literal->getValue().toString(integer_literal_str, 10, integer_literal->getType()->isSignedIntegerType());
-      os << integer_literal_str << llvm::formatv(" /* 0x{0:X} */", integer_literal->getValue());
+      os << integer_literal_str;
+      if (integer_literal->getValue().getZExtValue() > 15) {
+        os << llvm::formatv(" /* {0:X} */", integer_literal->getValue().getZExtValue());
+      }
       os.flush();
       return BuiltExpr(std::move(pre_stmts), final_expr, final_expr_type, std::nullopt);
     }
@@ -653,16 +905,22 @@ public:
         }
 
         if (auto heap_alignment = lhs_res->heap_alignment) {
+          // check if volatile...
+          if (lhs->getType().isVolatileQualified())
+            os << "!";
+
           switch (heap_alignment.value()) {
-          case 1:
+          case 1: {
             os << "st8";
             break;
-          case 4:
+          }
+          case 4: {
             os << "st32";
             break;
-          case 8:
+          }
+          case 8: {
             os << "st";
-            break;
+          } break;
           default:
             return CreateRuntimeError(
                 std::move(llvm::formatv("\n    at {0}\nUnsupported global variable alignment: {1} bytes",
@@ -813,15 +1071,16 @@ public:
           auto deref_type = sub_expr->getType()->getPointeeType();
           // auto align_bytes = (uint64_t)data.Ctx.getTypeAlignInChars(deref_type).getQuantity();
           auto size_bytes = (uint64_t)data.Ctx.getTypeSizeInChars(deref_type).getQuantity();
+          std::string load_op;
           switch (size_bytes) {
           case 1:
-            os << "ld8";
+            load_op = "ld8";
             break;
           case 4:
-            os << "ld32";
+            load_op = "ld32";
             break;
           case 8:
-            os << "lds 1";
+            load_op = "lds 1";
             break;
           default:
             return CreateRuntimeError(std::move(
@@ -829,9 +1088,18 @@ public:
                               unary_operator->getExprLoc().printToString(data.Ctx.getSourceManager()), size_bytes)));
           }
           pre_stmts.insert(pre_stmts.end(), sub_expr_res->pre_stmts.begin(), sub_expr_res->pre_stmts.end());
+          if (IsVolatileAccess(unary_operator)) {
+            auto deref_tmp = llvm::formatv("__c2pnk_VolatileLoad_{0}", data.tmp_var_counter++).str();
+            auto shared_load_op = size_bytes == 1 ? "ld8" : size_bytes == 4 ? "ld32" : "ldw";
+            pre_stmts.push_back(llvm::formatv("var 1 {0} = 0;", deref_tmp).str());
+            pre_stmts.push_back(
+                llvm::formatv("!{0} {1}, {2};", shared_load_op, deref_tmp, sub_expr_res->final_expr).str());
+            os << deref_tmp;
+            break;
+          }
           // Materialize loads before they are used in another load or address expression. Nested lds expressions are
           // not handled reliably by the Pancake compiler.
-          auto load_expr = llvm::formatv("{0} ({1})", os.str(), sub_expr_res->final_expr).str();
+          auto load_expr = llvm::formatv("{0} ({1})", load_op, sub_expr_res->final_expr).str();
           auto deref_tmp = llvm::formatv("__c2pnk_deref_tmp_{0}", data.tmp_var_counter++).str();
           pre_stmts.push_back(llvm::formatv("var 1 {0} = {1};", deref_tmp, load_expr).str());
           final_expr.clear();
@@ -991,22 +1259,31 @@ public:
         auto member_address = llvm::formatv("({0} + {1})", member_base_expr->final_expr, offset_in_bytes).str();
         if (ctx.usage_kind == Usage::Value && !final_expr_type->isArrayType()) {
           const auto member_size = (uint64_t)data.Ctx.getTypeSizeInChars(final_expr_type).getQuantity();
+          std::string load_op;
           switch (member_size) {
           case 1:
-            os << "(ld8";
+            load_op = "ld8";
             break;
           case 4:
-            os << "(ld32";
+            load_op = "ld32";
             break;
           case 8:
-            os << "(lds 1";
+            load_op = "lds 1";
             break;
           default:
             return CreateRuntimeError(std::move(
                 llvm::formatv("\n    at {0}\nUnsupported member value size: {1} bytes",
                               member_expr->getExprLoc().printToString(data.Ctx.getSourceManager()), member_size)));
           }
-          os << llvm::formatv(" {0})", member_address);
+          if (IsVolatileAccess(member_expr)) {
+            auto member_tmp = llvm::formatv("__c2pnk_VolatileLoad_{0}", data.tmp_var_counter++).str();
+            auto shared_load_op = member_size == 1 ? "ld8" : member_size == 4 ? "ld32" : "ldw";
+            pre_stmts.push_back(llvm::formatv("var 1 {0} = 0;", member_tmp).str());
+            pre_stmts.push_back(llvm::formatv("!{0} {1}, {2};", shared_load_op, member_tmp, member_address).str());
+            os << member_tmp;
+          } else {
+            os << llvm::formatv("({0} {1})", load_op, member_address);
+          }
         } else {
           os << member_address;
         }
@@ -1181,17 +1458,14 @@ public:
 } // namespace
 
 auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
-  std::string tu_replacement_text;
   std::string ffi_replacement_text;
-  llvm::raw_string_ostream tu_os(tu_replacement_text);
   llvm::raw_string_ostream ffi_os(ffi_replacement_text);
 
   llvm::DenseMap<VarDecl *, GlobalVarData> global_var_map;
-  WorkerData data{.Ctx = Ctx, .ps_ctx = ps_ctx, .tu_os = tu_os, .ffi_os = ffi_os, .global_var_map = global_var_map};
+  WorkerData data{.Ctx = Ctx, .ps_ctx = ps_ctx, .ffi_os = ffi_os, .global_var_map = global_var_map};
   Worker w(data);
   w.TraverseDecl(Ctx.getTranslationUnitDecl());
 
-  tu_os.flush();
   ffi_os.flush();
 
   if (data.error) {
@@ -1200,8 +1474,10 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
     return;
   }
 
+  pancake::CodeGen codegen;
+  auto tu_output = codegen.Generate(data.program);
   if (auto error = ps_ctx.run.artifacts.Set(translation_unit_output_key,
-                                            TranslationUnitOutput{.content = std::move(tu_replacement_text)})) {
+                                            TranslationUnitOutput{.content = std::move(tu_output)})) {
     ps_ctx.error = std::move(error);
     ps_ctx.SetControl(StageControl::NextFile);
     return;

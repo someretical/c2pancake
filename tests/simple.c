@@ -26,5 +26,9 @@ typedef volatile struct imx_uart_regs imx_uart_regs_t;
 int main(void) {
   int i = 0;
   imx_uart_regs_t uart1 = {0};
+  imx_uart_regs_t *uart_regs = &uart1;
+
+  (*uart_regs).cr1 &= 0xFFFFFFFE;
+
   return 0;
 }

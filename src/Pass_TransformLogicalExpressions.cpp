@@ -426,6 +426,32 @@ public:
     return os.str();
   }
 
+  auto IsVolatileAccess(const Expr *expr) const -> bool {
+    expr = expr->IgnoreParenImpCasts();
+    if (expr->getType().isVolatileQualified()) {
+      return true;
+    }
+    if (const auto *member_expr = dyn_cast<MemberExpr>(expr)) {
+      return IsVolatileAccess(member_expr->getBase());
+    }
+    if (const auto *unary_operator = dyn_cast<UnaryOperator>(expr);
+        unary_operator != nullptr && unary_operator->getOpcode() == UO_Deref) {
+      const auto *pointer_type = unary_operator->getSubExpr()->getType()->getAs<PointerType>();
+      return expr->getType().isVolatileQualified() ||
+             (pointer_type != nullptr && pointer_type->getPointeeType().isVolatileQualified()) ||
+             IsVolatileAccess(unary_operator->getSubExpr());
+    }
+    return false;
+  }
+
+  auto GetValueUsage(const Expr *expr) const -> Expected<Usage> {
+    auto usage = GetUsage(data.Ctx, expr);
+    if (usage && *usage == Usage::Place && IsVolatileAccess(expr)) {
+      return Usage::Value;
+    }
+    return usage;
+  }
+
   static auto CompoundAssignOpToOp(BinaryOperatorKind compound_assign_op) -> Expected<BinaryOperatorKind> {
     switch (compound_assign_op) {
     case BO_MulAssign:
@@ -560,6 +586,14 @@ public:
                                     decl_ref_expr->getExprLoc().printToString(data.Ctx.getSourceManager())))),
                                 std::move(error));
       }
+      if (ctx.usage_kind != Usage::Place && final_expr_type.isVolatileQualified()) {
+        const auto tmp_var_name = GetTempVarName("Volatile").str();
+        pre_stmts.push_back(llvm::formatv("{0} = {1};", PrintType(final_expr_type.getUnqualifiedType(), tmp_var_name),
+                                          decl_ref_expr->getNameInfo().getAsString())
+                                .str());
+        os.flush();
+        final_expr = tmp_var_name;
+      }
     } else if (auto *integer_literal = dyn_cast<IntegerLiteral>(expr)) {
       if (auto error = PrintSourceText(os, integer_literal, data.Ctx)) {
         return llvm::joinErrors(CreateRuntimeError(std::move(llvm::formatv(
@@ -654,7 +688,7 @@ public:
                                   implicit_value_init_expr->getExprLoc().printToString(data.Ctx.getSourceManager()))));
     } else if (auto *c_style_cast_expr = dyn_cast<CStyleCastExpr>(expr)) {
       auto *sub_expr = c_style_cast_expr->getSubExpr();
-      auto usage = GetUsage(data.Ctx, sub_expr);
+      auto usage = GetValueUsage(sub_expr);
       if (auto error = usage.takeError()) {
         return std::move(error);
       }
@@ -726,7 +760,7 @@ public:
               continue;
             }
 
-            auto usage = GetUsage(data.Ctx, init_expr);
+            auto usage = GetValueUsage(init_expr);
             if (auto error = usage.takeError()) {
               return std::move(error);
             }
@@ -787,7 +821,7 @@ public:
             }
           }
 
-          auto usage = GetUsage(data.Ctx, init_expr);
+          auto usage = GetValueUsage(init_expr);
           if (auto error = usage.takeError()) {
             return std::move(error);
           }
@@ -868,7 +902,7 @@ public:
             i_var_name = llvm::formatv("({0}).{1}", i_var_name, field_decl->getNameAsString());
           }
 
-          auto usage = GetUsage(data.Ctx, init_expr);
+          auto usage = GetValueUsage(init_expr);
           if (auto error = usage.takeError()) {
             return std::move(error);
           }
@@ -984,7 +1018,7 @@ public:
         os2 << "{\n";
         for (auto *stmt : compound_stmt->body()) {
           if (stmt == last) {
-            auto usage = GetUsage(data.Ctx, last_stmt_as_expr);
+            auto usage = GetValueUsage(last_stmt_as_expr);
             if (auto error = usage.takeError()) {
               return std::move(error);
             }
@@ -1032,7 +1066,7 @@ public:
       // technically we need to compute both the place and value of the LHS, but syntactically at least,
       // every valid place is also a valid value (not the other way around though!)
       // note this is only true since we are working with a "description" of the place, not a pointer!
-      auto rhs_usage = GetUsage(data.Ctx, rhs);
+      auto rhs_usage = GetValueUsage(rhs);
       if (auto error = rhs_usage.takeError()) {
         return std::move(error);
       }
@@ -1050,6 +1084,18 @@ public:
         return std::move(error);
       }
 
+      std::string lhs_value_expr = lhs_res->final_expr;
+      std::optional<std::string> lhs_value_stmt;
+      if (IsVolatileAccess(lhs)) {
+        const auto lhs_value_tmp_name = GetTempVarName("VolatileCompoundAssign").str();
+        lhs_value_stmt = llvm::formatv("{0} = {1};",
+                                       PrintType(compound_assign_operator->getType().getUnqualifiedType(),
+                                                 lhs_value_tmp_name),
+                                       lhs_res->final_expr)
+                             .str();
+        lhs_value_expr = lhs_value_tmp_name;
+      }
+
       if (ctx.usage_kind == Usage::Place) {
         return CreateRuntimeError(std::move(
             llvm::formatv("    at {0}\nCompound assignment operator cannot be used as a place expression",
@@ -1062,33 +1108,38 @@ public:
       }
       // don't care about temp var
       if (ctx.usage_kind == Usage::Effect) {
-        pre_stmts.push_back(llvm::formatv("{0} = {0} {1} {2};\n", lhs_res->final_expr,
+        pre_stmts.push_back(llvm::formatv("{0} = {1} {2} {3};\n", lhs_res->final_expr, lhs_value_expr,
                                           BinaryOperator::getOpcodeStr(*compound_assign_op), rhs_res->final_expr));
       } else {
         std::string tmp_var_name = GetTempVarName("CompoundAssignResult");
         pre_stmts.push_back(llvm::formatv(
                                 /*
                                 0 = temp var for result of compound assignment
-                                1 = lhs final expr
+                                1 = lhs value expr
                                 2 = binary operator string for compound assignment
                                 3 = rhs final expr
-                                4 = tmp var name (without type!)
+                                5 = lhs place expr
                                 */
                                 R"({0} = {1} {2} {3};
-{1} = {4};)",
-                                PrintType(compound_assign_operator->getType(), tmp_var_name), lhs_res->final_expr,
-                                BinaryOperator::getOpcodeStr(*compound_assign_op), rhs_res->final_expr, tmp_var_name)
+{5} = {0};)",
+                                PrintType(compound_assign_operator->getType().getUnqualifiedType(), tmp_var_name),
+                                lhs_value_expr,
+                                BinaryOperator::getOpcodeStr(*compound_assign_op), rhs_res->final_expr, tmp_var_name,
+                                lhs_res->final_expr)
                                 .str());
         os << tmp_var_name;
       }
       pre_stmts.insert(pre_stmts.end(), rhs_res->pre_stmts.begin(), rhs_res->pre_stmts.end());
+      if (lhs_value_stmt.has_value()) {
+        pre_stmts.push_back(*lhs_value_stmt);
+      }
       pre_stmts.insert(pre_stmts.end(), lhs_res->pre_stmts.begin(), lhs_res->pre_stmts.end());
     } else if (auto *conditional_operator = dyn_cast<ConditionalOperator>(expr)) {
       auto *cond = conditional_operator->getCond()->IgnoreParenImpCasts();
       auto *lhs = conditional_operator->getTrueExpr()->IgnoreParenImpCasts();
       auto *rhs = conditional_operator->getFalseExpr()->IgnoreParenImpCasts();
 
-      auto cond_usage = GetUsage(data.Ctx, cond);
+      auto cond_usage = GetValueUsage(cond);
       if (auto error = cond_usage.takeError()) {
         return std::move(error);
       }
@@ -1105,7 +1156,7 @@ public:
       if (auto error = lhs_res.takeError()) {
         return std::move(error);
       }
-      auto rhs_usage = GetUsage(data.Ctx, rhs);
+      auto rhs_usage = GetValueUsage(rhs);
       if (auto error = rhs_usage.takeError()) {
         return std::move(error);
       }
@@ -1155,7 +1206,7 @@ if ({4}) {
       switch (binary_operator->getOpcode()) {
         // LAnd and LOr are handled specially because they short circuit
       case BO_LAnd: {
-        auto lhs_usage = GetUsage(data.Ctx, lhs);
+          auto lhs_usage = GetValueUsage(lhs);
         if (auto error = lhs_usage.takeError()) {
           return error;
         }
@@ -1163,7 +1214,7 @@ if ({4}) {
         if (auto error = lhs_res.takeError()) {
           return error;
         }
-        auto rhs_usage = GetUsage(data.Ctx, rhs);
+        auto rhs_usage = GetValueUsage(rhs);
         if (auto error = rhs_usage.takeError()) {
           return error;
         }
@@ -1210,7 +1261,7 @@ if (!({4})) {
         break;
       }
       case BO_LOr: {
-        auto lhs_usage = GetUsage(data.Ctx, lhs);
+        auto lhs_usage = GetValueUsage(lhs);
         if (auto error = lhs_usage.takeError()) {
           return std::move(error);
         }
@@ -1218,7 +1269,7 @@ if (!({4})) {
         if (auto error = lhs_res.takeError()) {
           return std::move(error);
         }
-        auto rhs_usage = GetUsage(data.Ctx, rhs);
+        auto rhs_usage = GetValueUsage(rhs);
         if (auto error = rhs_usage.takeError()) {
           return std::move(error);
         }
@@ -1265,7 +1316,7 @@ if ({4}) {
 
       case BO_Assign: {
         if (lhs->getType()->isArrayType() && llvm::isa<InitListExpr>(rhs->IgnoreParenImpCasts())) {
-          auto lhs_usage = GetUsage(data.Ctx, lhs);
+          auto lhs_usage = GetValueUsage(lhs);
           if (auto error = lhs_usage.takeError()) {
             return std::move(error);
           }
@@ -1293,7 +1344,7 @@ if ({4}) {
           break;
         }
 
-        auto rhs_usage = GetUsage(data.Ctx, rhs);
+        auto rhs_usage = GetValueUsage(rhs);
         if (auto error = rhs_usage.takeError()) {
           return std::move(error);
         }
@@ -1359,7 +1410,7 @@ if ({4}) {
         // LHS is evaluated first, then RHS
         // RHS is returned (only when ctx.usage_kind == Value)
 
-        auto rhs_usage = GetUsage(data.Ctx, rhs);
+        auto rhs_usage = GetValueUsage(rhs);
         if (auto error = rhs_usage.takeError()) {
           return std::move(error);
         }
@@ -1416,7 +1467,7 @@ if ({4}) {
         [[fallthrough]];
       case BO_Or: {
 
-        auto rhs_usage = GetUsage(data.Ctx, rhs);
+        auto rhs_usage = GetValueUsage(rhs);
         if (auto error = rhs_usage.takeError()) {
           return std::move(error);
         }
@@ -1425,7 +1476,7 @@ if ({4}) {
         if (auto error = rhs_res.takeError()) {
           return std::move(error);
         }
-        auto lhs_usage = GetUsage(data.Ctx, lhs);
+        auto lhs_usage = GetValueUsage(lhs);
         if (auto error = lhs_usage.takeError()) {
           return std::move(error);
         }
@@ -1675,6 +1726,15 @@ if ({4}) {
       } else {
         os << llvm::formatv("({0}).{1}", res->final_expr, member_expr->getMemberNameInfo().getAsString());
       }
+      if (ctx.usage_kind != Usage::Place && IsVolatileAccess(member_expr) && !final_expr_type->isArrayType()) {
+        const auto tmp_var_name = GetTempVarName("Volatile").str();
+        os.flush();
+        const auto member_access = final_expr;
+        pre_stmts.push_back(
+            llvm::formatv("{0} = {1};", PrintType(final_expr_type.getUnqualifiedType(), tmp_var_name), member_access)
+                .str());
+        final_expr = tmp_var_name;
+      }
       pre_stmts.insert(pre_stmts.end(), res->pre_stmts.begin(), res->pre_stmts.end());
     } else {
       if (auto error = PrintSourceText(os, expr, data.Ctx)) {
@@ -1730,7 +1790,7 @@ if ({4}) {
           // normally we would put Usage::Value here but since every Usage::Place is also a Usage::Value, we can just
           // use Usage::Place to avoid an extra copy of the expression
           init_expr = init_expr->IgnoreParenImpCasts();
-          auto usage = GetUsage(data.Ctx, init_expr);
+          auto usage = GetValueUsage(init_expr);
           if (auto error = usage.takeError()) {
             data.error = std::move(error);
             return false;
@@ -1824,7 +1884,7 @@ if ({4}) {
       auto *ret_expr = return_stmt->getRetValue();
       if (ret_expr != nullptr) {
         ret_expr = ret_expr->IgnoreParenImpCasts();
-        auto usage = GetUsage(data.Ctx, ret_expr);
+        auto usage = GetValueUsage(ret_expr);
         if (auto error = usage.takeError()) {
           data.error = std::move(error);
           return false;
