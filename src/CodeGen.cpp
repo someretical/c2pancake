@@ -108,6 +108,7 @@ auto CodeGen::NeedsSemicolon(const Stmt &stmt) -> bool {
   case StmtKind::If:
   case StmtKind::While:
   case StmtKind::Comment:
+  case StmtKind::Define:
     return false;
   default:
     return true;

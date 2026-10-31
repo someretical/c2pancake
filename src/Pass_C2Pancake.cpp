@@ -27,6 +27,7 @@
 #include <llvm/Support/raw_ostream.h>
 
 #include <functional>
+#include <map>
 #include <string>
 #include <utility>
 
@@ -57,6 +58,8 @@ struct WorkerData {
   llvm::Error error = llvm::Error::success();
   uint64_t next_global_var_addr = 0x0UL;
   size_t tmp_var_counter = 0;
+  llvm::DenseMap<const FieldDecl *, std::string> member_offset_macros;
+  std::map<std::string, const FieldDecl *> member_macro_fields;
 };
 
 enum class Usage : uint8_t {
@@ -114,6 +117,44 @@ class Worker : public RecursiveASTVisitor<Worker> {
 
 public:
   explicit Worker(struct WorkerData &data) : data(data) {}
+
+  auto GetMemberOffsetMacro(const FieldDecl *field_decl, uint64_t offset_in_bytes) -> std::string {
+    if (const auto it = data.member_offset_macros.find(field_decl); it != data.member_offset_macros.end()) {
+      return it->second;
+    }
+
+    auto record_name = field_decl->getParent()->getNameAsString();
+    if (record_name.empty()) {
+      record_name = "anonymous";
+    }
+    auto field_name = field_decl->getNameAsString();
+    if (field_name.empty()) {
+      field_name = llvm::formatv("field_{0}", field_decl->getFieldIndex()).str();
+    }
+
+    const auto base_macro_name = llvm::formatv("__{0}_{1}_of", record_name, field_name).str();
+    auto macro_name = base_macro_name;
+    if (const auto it = data.member_macro_fields.find(macro_name);
+        it != data.member_macro_fields.end() && it->second != field_decl) {
+      const auto loc = field_decl->getLocation();
+      const auto &source_manager = data.Ctx.getSourceManager();
+      const auto full_loc = FullSourceLoc(loc, source_manager);
+      macro_name =
+          llvm::formatv("{0}_L{1}C{2}", base_macro_name, full_loc.getSpellingLineNumber(),
+                        full_loc.getSpellingColumnNumber())
+              .str();
+      size_t suffix = 0;
+      while (data.member_macro_fields.contains(macro_name)) {
+        macro_name = llvm::formatv("{0}_{1}", base_macro_name, ++suffix).str();
+      }
+    }
+
+    data.member_offset_macros[field_decl] = macro_name;
+    data.member_macro_fields[macro_name] = field_decl;
+    data.program.globals.emplace_back(
+        std::make_shared<pancake::DefineStmt>(macro_name, std::to_string(offset_in_bytes)));
+    return macro_name;
+  }
 
   static auto IsVolatileAccess(const Expr *expr) -> bool {
     expr = expr->IgnoreParenImpCasts();
@@ -200,7 +241,7 @@ public:
                                          .is_external = IsGlobalVarExternal(var_decl)};
 
         data.program.globals.emplace_back(std::make_shared<pancake::DefineStmt>(
-            var_decl->getName().str() + "_addr", llvm::formatv("@base + {0}", addr).str()));
+            var_decl->getName().str() + "_addr", llvm::formatv("(@base + {0})", addr).str()));
 
         std::string value_str;
         llvm::raw_string_ostream value_os(value_str);
@@ -302,11 +343,12 @@ public:
       if (auto *compound_stmt = llvm::dyn_cast<CompoundStmt>(body)) {
         llvm::SmallVector<pancake::StmtPtr> stmts;
         stmts.reserve(compound_stmt->size());
-        std::function<void(const pancake::StmtPtr &)> append_statement = [&](const pancake::StmtPtr &statement) {
+        std::function<void(const pancake::StmtPtr &)> append_statement =
+            [&](const pancake::StmtPtr &statement) -> void {
           if (statement == nullptr)
             return;
           if (statement->kind == pancake::StmtKind::Block) {
-            const auto &nested = static_cast<const pancake::BlockStmt &>(*statement);
+            const auto &nested = dynamic_cast<const pancake::BlockStmt &>(*statement);
             for (const auto &child : nested.block->stmts)
               append_statement(child);
             return;
@@ -327,7 +369,7 @@ public:
         function->isInline = func_decl->isInlineSpecified();
         function->body = std::make_shared<pancake::Block>();
         for (auto &&param : func_decl->parameters()) {
-          function->params.push_back({param->getName().str(), 1});
+          function->params.push_back({.name = param->getName().str(), .shape = 1});
         }
         for (auto &&stmt : stmts)
           function->body->stmts.emplace_back(std::move(stmt));
@@ -362,15 +404,15 @@ public:
     return func_decl->getName().starts_with("__c2pnk_ffi_wrapper_");
   }
 
-  auto ParseAstStmt(std::string text) -> Expected<pancake::StmtPtr> {
-    auto trim = [](std::string value) {
+  static auto ParseAstStmt(std::string text) -> Expected<pancake::StmtPtr> {
+    auto trim = [](const std::string &value) -> std::basic_string<char> {
       const auto begin = value.find_first_not_of(" \t\n");
       if (begin == std::string::npos)
         return std::string{};
       const auto end = value.find_last_not_of(" \t\n;");
       return value.substr(begin, end - begin + 1);
     };
-    text = trim(std::move(text));
+    text = trim(text);
     if (text.empty())
       return pancake::StmtPtr{};
     if (text.starts_with("!ld")) {
@@ -379,7 +421,7 @@ public:
       if (opcode_end == std::string::npos || comma == std::string::npos)
         return CreateRuntimeError("Malformed shared memory load");
       const auto opcode = text.substr(1, opcode_end - 1);
-      pancake::MemoryWidth width;
+      pancake::MemoryWidth width = pancake::MemoryWidth::Word;
       if (opcode == "ldw")
         width = pancake::MemoryWidth::Word;
       else if (opcode == "ld8")
@@ -416,14 +458,14 @@ public:
   }
 
   auto BuildAstStmt(Stmt *stmt) -> Expected<pancake::StmtPtr> {
-    auto AppendToBlock = [](const pancake::StmtPtr &statement, const pancake::BlockPtr &block) {
+    auto append_to_block = [](const pancake::StmtPtr &statement, const pancake::BlockPtr &block) -> void {
       if (statement == nullptr)
         return;
       if (statement->kind == pancake::StmtKind::Block) {
-        const auto &nested = static_cast<const pancake::BlockStmt &>(*statement);
+        const auto &nested = dynamic_cast<const pancake::BlockStmt &>(*statement);
         for (const auto &child : nested.block->stmts) {
           if (child != nullptr && child->kind == pancake::StmtKind::Block) {
-            const auto &nested_child = static_cast<const pancake::BlockStmt &>(*child);
+            const auto &nested_child = dynamic_cast<const pancake::BlockStmt &>(*child);
             for (const auto &grandchild : nested_child.block->stmts)
               block->stmts.emplace_back(grandchild);
           } else {
@@ -434,8 +476,8 @@ public:
       }
       block->stmts.emplace_back(statement);
     };
-    auto WithPreStatements = [&](const llvm::SmallVector<std::string, 8> &pre_stmts,
-                                 pancake::StmtPtr statement) -> Expected<pancake::StmtPtr> {
+    auto with_pre_statements = [&](const llvm::SmallVector<std::string, 8> &pre_stmts,
+                                   pancake::StmtPtr statement) -> Expected<pancake::StmtPtr> {
       if (pre_stmts.empty())
         return statement;
       auto block = std::make_shared<pancake::Block>();
@@ -459,7 +501,7 @@ public:
         auto result = BuildAstStmt(child);
         if (auto error = result.takeError())
           return std::move(error);
-        AppendToBlock(result.get(), block);
+        append_to_block(result.get(), block);
       }
       return std::make_shared<pancake::BlockStmt>(std::move(block));
     }
@@ -471,14 +513,14 @@ public:
       if (auto error = then_result.takeError())
         return std::move(error);
       auto then_block = std::make_shared<pancake::Block>();
-      AppendToBlock(then_result.get(), then_block);
+      append_to_block(then_result.get(), then_block);
       pancake::BlockPtr else_block;
       if (auto *else_stmt = if_stmt->getElse()) {
         auto else_result = BuildAstStmt(else_stmt);
         if (auto error = else_result.takeError())
           return std::move(error);
         else_block = std::make_shared<pancake::Block>();
-        AppendToBlock(else_result.get(), else_block);
+        append_to_block(else_result.get(), else_block);
       }
       return std::make_shared<pancake::IfStmt>(std::move(condition->expr), std::move(then_block),
                                                std::move(else_block));
@@ -491,7 +533,7 @@ public:
       if (auto error = body_result.takeError())
         return std::move(error);
       auto body = std::make_shared<pancake::Block>();
-      AppendToBlock(body_result.get(), body);
+      append_to_block(body_result.get(), body);
       return std::make_shared<pancake::WhileStmt>(std::move(condition->expr), std::move(body));
     }
     if (isa<BreakStmt>(stmt))
@@ -537,7 +579,7 @@ public:
       auto result = BuildExpr(BuildExprCtx(return_stmt->getRetValue(), Usage::Value));
       if (auto error = result.takeError())
         return std::move(error);
-      return WithPreStatements(result->pre_stmts, std::make_shared<pancake::ReturnStmt>(std::move(result->expr)));
+      return with_pre_statements(result->pre_stmts, std::make_shared<pancake::ReturnStmt>(std::move(result->expr)));
     }
 
     if (auto *expr_stmt = dyn_cast<clang::Expr>(stmt)) {
@@ -547,8 +589,8 @@ public:
       if (auto error = result.takeError())
         return std::move(error);
       if (result->expr == nullptr || result->final_expr.empty())
-        return WithPreStatements(result->pre_stmts, pancake::StmtPtr{});
-      return WithPreStatements(result->pre_stmts, std::make_shared<pancake::ExprStmt>(std::move(result->expr)));
+        return with_pre_statements(result->pre_stmts, pancake::StmtPtr{});
+      return with_pre_statements(result->pre_stmts, std::make_shared<pancake::ExprStmt>(std::move(result->expr)));
     }
 
     auto lowered = BuildStmt(stmt);
@@ -628,7 +670,7 @@ public:
               for (auto &&pre_stmt : address_res->pre_stmts) {
                 os << pre_stmt << "\n";
               }
-              auto shared_load_op = size_bytes == 1 ? "ld8" : size_bytes == 4 ? "ld32" : "ldw";
+              const auto *shared_load_op = size_bytes == 1 ? "ld8" : (size_bytes == 4 ? "ld32" : "ldw");
               os << llvm::formatv("var 1 {0} = 0;\n!{1} {0}, {2};", var_decl->getName(), shared_load_op,
                                   address_res->final_expr);
               continue;
@@ -797,9 +839,10 @@ public:
 
     if (auto *decl_ref_expr = dyn_cast<DeclRefExpr>(expr)) {
       if (auto *var_decl = dyn_cast<VarDecl>(decl_ref_expr->getDecl())) {
-        if (data.global_var_map.contains(var_decl)) {
+        auto var_info_it = data.global_var_map.find(var_decl);
+        if (var_info_it != data.global_var_map.end()) {
           // auto addr = data.global_var_map[var_decl].addr;
-          // auto bytes = (uint64_t)data.Ctx.getTypeSizeInChars(var_decl->getType()).getQuantity();
+          auto bytes = (uint64_t)data.Ctx.getTypeSizeInChars(var_decl->getType()).getQuantity();
           auto usage_kind = ctx.usage_kind;
           // if type is array, just decay to pointer AKA place
           if (final_expr_type->isArrayType()) {
@@ -807,7 +850,7 @@ public:
           }
 
           auto name = llvm::formatv("{0}_{1}", var_decl->getName(), Usage::Value == usage_kind ? "val" : "addr");
-          return BuiltExpr(std::move(pre_stmts), name.str(), final_expr_type, std::nullopt);
+          return BuiltExpr(std::move(pre_stmts), name.str(), final_expr_type, bytes);
         }
 
         // local var
@@ -1090,7 +1133,7 @@ public:
           pre_stmts.insert(pre_stmts.end(), sub_expr_res->pre_stmts.begin(), sub_expr_res->pre_stmts.end());
           if (IsVolatileAccess(unary_operator)) {
             auto deref_tmp = llvm::formatv("__c2pnk_VolatileLoad_{0}", data.tmp_var_counter++).str();
-            auto shared_load_op = size_bytes == 1 ? "ld8" : size_bytes == 4 ? "ld32" : "ldw";
+            const auto *shared_load_op = size_bytes == 1 ? "ld8" : size_bytes == 4 ? "ld32" : "ldw";
             pre_stmts.push_back(llvm::formatv("var 1 {0} = 0;", deref_tmp).str());
             pre_stmts.push_back(
                 llvm::formatv("!{0} {1}, {2};", shared_load_op, deref_tmp, sub_expr_res->final_expr).str());
@@ -1248,6 +1291,7 @@ public:
               member_expr->getBeginLoc().printToString(data.Ctx.getSourceManager()), field_decl->getName())));
         }
         auto offset_in_bytes = offset_in_bits / 8;
+        auto offset_macro = GetMemberOffsetMacro(field_decl, offset_in_bytes);
 
         auto member_base_expr = BuildExpr(BuildExprCtx(member_expr->getBase()->IgnoreParenImpCasts(), Usage::Place));
         if (auto error = member_base_expr.takeError()) {
@@ -1256,7 +1300,7 @@ public:
 
         // Keep the complete address together when the base is a computed pointer load; otherwise `st` can parse the
         // load and offset as separate operands.
-        auto member_address = llvm::formatv("({0} + {1})", member_base_expr->final_expr, offset_in_bytes).str();
+        auto member_address = llvm::formatv("({0} + {1})", member_base_expr->final_expr, offset_macro).str();
         if (ctx.usage_kind == Usage::Value && !final_expr_type->isArrayType()) {
           const auto member_size = (uint64_t)data.Ctx.getTypeSizeInChars(final_expr_type).getQuantity();
           std::string load_op;
@@ -1277,7 +1321,7 @@ public:
           }
           if (IsVolatileAccess(member_expr)) {
             auto member_tmp = llvm::formatv("__c2pnk_VolatileLoad_{0}", data.tmp_var_counter++).str();
-            auto shared_load_op = member_size == 1 ? "ld8" : member_size == 4 ? "ld32" : "ldw";
+            const auto *shared_load_op = member_size == 1 ? "ld8" : (member_size == 4 ? "ld32" : "ldw");
             pre_stmts.push_back(llvm::formatv("var 1 {0} = 0;", member_tmp).str());
             pre_stmts.push_back(llvm::formatv("!{0} {1}, {2};", shared_load_op, member_tmp, member_address).str());
             os << member_tmp;
@@ -1462,7 +1506,12 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
   llvm::raw_string_ostream ffi_os(ffi_replacement_text);
 
   llvm::DenseMap<VarDecl *, GlobalVarData> global_var_map;
-  WorkerData data{.Ctx = Ctx, .ps_ctx = ps_ctx, .ffi_os = ffi_os, .global_var_map = global_var_map};
+  llvm::DenseMap<const FieldDecl *, std::string> member_offset_macros;
+  WorkerData data{.Ctx = Ctx,
+                  .ps_ctx = ps_ctx,
+                  .ffi_os = ffi_os,
+                  .global_var_map = global_var_map,
+                  .member_offset_macros = member_offset_macros};
   Worker w(data);
   w.TraverseDecl(Ctx.getTranslationUnitDecl());
 

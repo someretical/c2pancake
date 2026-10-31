@@ -693,7 +693,8 @@ public:
         return std::move(error);
       }
       auto res = BuildExpr(
-          BuildExprCtx(sub_expr, *usage, ctx.deref_force_extract, ctx.assigned_to, ctx.string_literal_usage_kind));
+          BuildExprCtx(sub_expr, *usage, ctx.deref_force_extract, ctx.assigned_to, ctx.string_literal_usage_kind,
+                       ctx.allow_inline_function_call));
       if (auto error = res.takeError()) {
         return std::move(error);
       }
@@ -765,7 +766,7 @@ public:
               return std::move(error);
             }
             auto res = BuildExpr(BuildExprCtx(init_expr, *usage, true, std::make_pair(element_name, element_type),
-                                              ctx.string_literal_usage_kind));
+                                              ctx.string_literal_usage_kind, true));
             if (auto error = res.takeError()) {
               return std::move(error);
             }
@@ -827,7 +828,7 @@ public:
           }
           auto res =
               BuildExpr(BuildExprCtx(init_expr, *usage, ctx.deref_force_extract,
-                                     std::make_pair(var_name, field_decl->getType()), ctx.string_literal_usage_kind));
+                                     std::make_pair(var_name, field_decl->getType()), ctx.string_literal_usage_kind, true));
           if (auto error = res.takeError()) {
             return std::move(error);
           }
@@ -922,7 +923,7 @@ public:
 
           auto res =
               BuildExpr(BuildExprCtx(init_expr, *usage, ctx.deref_force_extract,
-                                     std::make_pair(i_var_name, field_decl->getType()), ctx.string_literal_usage_kind));
+                                     std::make_pair(i_var_name, field_decl->getType()), ctx.string_literal_usage_kind, true));
           if (auto error = res.takeError()) {
             return std::move(error);
           }
@@ -1088,11 +1089,11 @@ public:
       std::optional<std::string> lhs_value_stmt;
       if (IsVolatileAccess(lhs)) {
         const auto lhs_value_tmp_name = GetTempVarName("VolatileCompoundAssign").str();
-        lhs_value_stmt = llvm::formatv("{0} = {1};",
-                                       PrintType(compound_assign_operator->getType().getUnqualifiedType(),
-                                                 lhs_value_tmp_name),
-                                       lhs_res->final_expr)
-                             .str();
+        lhs_value_stmt =
+            llvm::formatv("{0} = {1};",
+                          PrintType(compound_assign_operator->getType().getUnqualifiedType(), lhs_value_tmp_name),
+                          lhs_res->final_expr)
+                .str();
         lhs_value_expr = lhs_value_tmp_name;
       }
 
@@ -1123,9 +1124,8 @@ public:
                                 R"({0} = {1} {2} {3};
 {5} = {0};)",
                                 PrintType(compound_assign_operator->getType().getUnqualifiedType(), tmp_var_name),
-                                lhs_value_expr,
-                                BinaryOperator::getOpcodeStr(*compound_assign_op), rhs_res->final_expr, tmp_var_name,
-                                lhs_res->final_expr)
+                                lhs_value_expr, BinaryOperator::getOpcodeStr(*compound_assign_op), rhs_res->final_expr,
+                                tmp_var_name, lhs_res->final_expr)
                                 .str());
         os << tmp_var_name;
       }
@@ -1206,7 +1206,7 @@ if ({4}) {
       switch (binary_operator->getOpcode()) {
         // LAnd and LOr are handled specially because they short circuit
       case BO_LAnd: {
-          auto lhs_usage = GetValueUsage(lhs);
+        auto lhs_usage = GetValueUsage(lhs);
         if (auto error = lhs_usage.takeError()) {
           return error;
         }
@@ -1349,7 +1349,7 @@ if ({4}) {
           return std::move(error);
         }
         auto rhs_res = BuildExpr(
-            BuildExprCtx(rhs, *rhs_usage, ctx.deref_force_extract, ctx.assigned_to, ctx.string_literal_usage_kind));
+            BuildExprCtx(rhs, *rhs_usage, ctx.deref_force_extract, ctx.assigned_to, ctx.string_literal_usage_kind, true));
         if (auto error = rhs_res.takeError()) {
           return std::move(error);
         }
@@ -1688,7 +1688,7 @@ if ({4}) {
         }
 
         auto res = BuildExpr(BuildExprCtx(arg->IgnoreParenImpCasts(), Usage::Value, ctx.deref_force_extract,
-                                          ctx.assigned_to, string_literal_usage_kind));
+                                          std::nullopt, string_literal_usage_kind));
         if (auto error = res.takeError()) {
           return error;
         }
@@ -1697,6 +1697,8 @@ if ({4}) {
       // TODO
       // it's possible for getDirectCallee to return nullptr, but I don't know what to do in that case...
       // TODO throw error on any function pointers
+
+      // Current Pancake compiler doesn't like it when the result of a function call is used in-place so
       os << llvm::formatv("{0}({1})", call_expr->getDirectCallee()->getName().str(),
                           llvm::join(arg_built_exprs | std::views::transform([](const BuiltExpr &e) -> std::string {
                                        return e.final_expr;
@@ -1704,6 +1706,13 @@ if ({4}) {
                                      ", "));
       for (auto &&built_expr : arg_built_exprs | std::views::reverse) {
         pre_stmts.insert(pre_stmts.end(), built_expr.pre_stmts.begin(), built_expr.pre_stmts.end());
+      }
+      if (ctx.usage_kind == Usage::Value && !ctx.allow_inline_function_call) {
+        const auto tmp_var_name = GetTempVarName("CallResult").str();
+        const auto call = final_expr;
+        pre_stmts.push_back(llvm::formatv("{0} = {1};", PrintType(final_expr_type, tmp_var_name), call).str());
+        os.flush();
+        final_expr = tmp_var_name;
       }
     } else if (auto *member_expr = dyn_cast<MemberExpr>(expr)) {
       if (member_expr->isArrow()) {
@@ -1816,7 +1825,7 @@ if ({4}) {
           auto res = BuildExpr(BuildExprCtx(
               init_expr, *usage, false,
               std::make_optional(std::make_pair(var_decl->getNameAsString(), var_decl->getType().getCanonicalType())),
-              string_literal_usage_kind));
+              string_literal_usage_kind, true));
           if (auto error = res.takeError()) {
             data.error = std::move(error);
             return false;
@@ -1889,7 +1898,7 @@ if ({4}) {
           data.error = std::move(error);
           return false;
         }
-        auto res = BuildExpr(BuildExprCtx(ret_expr, *usage, false, std::nullopt, std::nullopt));
+        auto res = BuildExpr(BuildExprCtx(ret_expr, *usage, false, std::nullopt, std::nullopt, true));
         if (auto error = res.takeError()) {
           data.error = std::move(error);
           return false;
