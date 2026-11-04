@@ -212,6 +212,51 @@ Test `uart.c`
   -I/usr/lib/gcc-cross/aarch64-linux-gnu/13/include
 ```
 
+Build serial
+
+```
+#include <stdint.h>
+#include <sddf/util/pancake_common.h>
+#include "uart.h"
+
+/* renamed from the init() function of the C driver */
+extern void c_init(void);
+
+void init(void)
+{
+    c_init();
+
+    init_pancake_mem();
+
+    uintptr_t *pnk_mem = (uintptr_t *)cml_heap;
+
+    pnk_mem[0] = (uintptr_t)&device_resources;
+    pnk_mem[1] = (uintptr_t)&config;
+    pnk_mem[2] = (uintptr_t)&rx_queue_handle;
+    pnk_mem[3] = (uintptr_t)&tx_queue_handle;
+
+    cml_main();
+}
+```
+
+```
+make \
+  MICROKIT_SDK=/home/tor/microkit \
+  MICROKIT_BOARD=qemu_virt_aarch64 \
+  MICROKIT_CONFIG=debug \
+  CC=clang-22 \
+  CXX=clang++-22 \
+  LD=ld.lld-22 \
+  AR=llvm-ar-22 \
+  RANLIB=llvm-ranlib-22 \
+  OBJCOPY=llvm-objcopy-22 \
+  OBJDUMP=llvm-objdump-22 \
+  SIZE=llvm-size-22 \
+  CPP='clang-22 -E -' \
+  PANCAKE_SERIAL_DRIVER=1 \
+  qemu
+```
+
 ## Detailed pass documentation
 
 The pipeline is registered in [`main.cpp`](./src/main.cpp) and runs in the following order. Most AST-rewrite passes:

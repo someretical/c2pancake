@@ -21,7 +21,7 @@
             "stopAtEntry": false,
             "cwd": "${workspaceFolder}",
             "sourceFileMap": {
-                "/scratch/yankai/c2pancake": "${workspaceFolder}"
+                // "/scratch/yankai/c2pancake": "${workspaceFolder}"
             },
             "environment": [],
             "externalConsole": false,
@@ -45,9 +45,8 @@
             "request": "launch",
             "program": "${command:cmake.getLaunchTargetPath}",
             "args": [
-                "/home/tor/sDDF/drivers/serial/imx/uart2.c",
+                "/home/tor/sDDF/drivers/serial/arm/uart.c",
                 "--max-pass-retries=20",
-                "--function-rewrite-extra-headers=#include \\\"uart2.h\\\"",
                 // "--end=RewriteFunctionCalling",
                 "--skip=ConvertIntegerTypes",
                 "--treat-header-functions-as-non-ffi",
@@ -63,7 +62,7 @@
                 "-I/home/tor/sDDF/include",
                 "-I/home/tor/sDDF/include/microkit",
                 "-I/home/tor/sDDF/include/sddf/util/custom_libc",
-                "-I/home/tor/sDDF/drivers/serial/imx/include",
+                "-I/home/tor/sDDF/drivers/serial/arm/include",
                 "-I/usr/lib/gcc-cross/aarch64-linux-gnu/13/include",
             ],
             "cwd": "${workspaceFolder}",
