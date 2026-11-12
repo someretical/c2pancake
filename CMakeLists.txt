@@ -44,6 +44,7 @@ add_executable(
   src/Pipeline.cpp
   src/Pass_C2Pancake.cpp
   src/Pass_FunctionCalling.cpp
+  src/Pass_GlobalVariablePointerify.cpp
   src/Pass_HoistArraysAndAddresses.cpp
   src/Pass_InjectHeaders.cpp
   src/Pass_IntegerConversion.cpp

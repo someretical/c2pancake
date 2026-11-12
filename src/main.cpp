@@ -1,5 +1,6 @@
 #include "Pass_C2Pancake.h"
 #include "Pass_FunctionCalling.h"
+#include "Pass_GlobalVariablePointerify.h"
 #include "Pass_HoistArraysAndAddresses.h"
 #include "Pass_InjectHeaders.h"
 #include "Pass_IntegerConversion.h"
@@ -137,6 +138,7 @@ auto main(int argc, const char **argv) -> int {
   };
   */
   Pipeline pipeline(*parser);
+  pipeline.AddStage<pass_global_variable_pointerify::Action>();
   pipeline.AddStage<pass_inject_headers::Action>();
   pipeline.AddStage<pass_name_anon_records::Action>();
   pipeline.AddStage<pass_rename_to_be_promoted_records::Action>();

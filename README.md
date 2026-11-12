@@ -199,46 +199,6 @@ Dump Clang AST
 clang-22 -fsyntax-only -Xclang -ast-dump-all <file.c>
 ```
 
-Test `uart.c`
-```
-./build/Debug/c2pancake /home/one/sddf/drivers/serial/imx/uart.c -- \
-  -ffreestanding -mstrict-align -mcpu=cortex-a53 -mtune=cortex-a53 -target aarch64-none-elf \
-  -I/home/one/microkit_tutorial/microkit-sdk-2.2.0/board/maaxboard/debug/include \
-  -I/home/one/sddf/examples/serial/include \
-  -I/home/one/sddf/include \
-  -I/home/one/sddf/include/microkit \
-  -I/home/one/sddf/include/sddf/util/custom_libc \
-  -I/home/one/sddf/drivers/serial/imx/include \
-  -I/usr/lib/gcc-cross/aarch64-linux-gnu/13/include
-```
-
-Build serial
-
-```
-#include <stdint.h>
-#include <sddf/util/pancake_common.h>
-#include "uart.h"
-
-/* renamed from the init() function of the C driver */
-extern void c_init(void);
-
-void init(void)
-{
-    c_init();
-
-    init_pancake_mem();
-
-    uintptr_t *pnk_mem = (uintptr_t *)cml_heap;
-
-    pnk_mem[0] = (uintptr_t)&device_resources;
-    pnk_mem[1] = (uintptr_t)&config;
-    pnk_mem[2] = (uintptr_t)&rx_queue_handle;
-    pnk_mem[3] = (uintptr_t)&tx_queue_handle;
-
-    cml_main();
-}
-```
-
 ```
 make \
   MICROKIT_SDK=/home/tor/microkit \

@@ -139,10 +139,9 @@ public:
       const auto loc = field_decl->getLocation();
       const auto &source_manager = data.Ctx.getSourceManager();
       const auto full_loc = FullSourceLoc(loc, source_manager);
-      macro_name =
-          llvm::formatv("{0}_L{1}C{2}", base_macro_name, full_loc.getSpellingLineNumber(),
-                        full_loc.getSpellingColumnNumber())
-              .str();
+      macro_name = llvm::formatv("{0}_L{1}C{2}", base_macro_name, full_loc.getSpellingLineNumber(),
+                                 full_loc.getSpellingColumnNumber())
+                       .str();
       size_t suffix = 0;
       while (data.member_macro_fields.contains(macro_name)) {
         macro_name = llvm::formatv("{0}_{1}", base_macro_name, ++suffix).str();
@@ -1622,7 +1621,7 @@ CC     ?= cc
 
 CAKE_FLAGS = {1}
 
-PANCAKE_SRC = {2}.pancake
+PANCAKE_SRC = {2}.pnk
 SCAFFOLD    = {2}.scaffold.c
 FFI         = {2}.ffi.c
 ASM         = {2}.S
@@ -1653,7 +1652,7 @@ auto Finalizer::Write(StageContext &ctx, clang::CompilerInstance &compiler) -> l
   const auto &external_global_vars_map = ctx.run.artifacts.Get(global_var_data_key);
   auto &stack_size = stack_size_opt;
 
-  auto tu_file_path = ctx.next_file + ".pancake";
+  auto tu_file_path = ctx.next_file + ".pnk";
   auto scaffold_file_path = ctx.next_file + ".scaffold.c";
   auto ffi_file_path = ctx.next_file + ".ffi.c";
   auto makefile_path = ctx.next_file + ".makefile";
