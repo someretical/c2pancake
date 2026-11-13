@@ -334,6 +334,7 @@ struct Function {
   BlockPtr body;
   SourceLoc loc;
   bool isInline = false;
+  bool isExternal = false;
 };
 
 struct Program {

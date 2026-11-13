@@ -22,23 +22,21 @@
 #include <string>
 #include <utility>
 
-// TODO have a check that runs before everything to find any loops that span ACROSS switch statements because those
-// cannot be safely transpiled!
-
 using namespace clang;
 using namespace clang::ast_matchers;
 using namespace clang::transformer;
 using namespace clang::tooling;
 
 namespace {
-constexpr static const char *c2pancake_external_global_annotation = "__c2pnk_external_global";
+constexpr const char *c2pancake_external_global_annotation = "__c2pnk_external_global";
 }
 
 namespace clang::ast_matchers {
 // Does the declaration carry annotate("<Expected>")?
-AST_MATCHER_P(Decl, hasAnnotationString, std::string, Expected) {
-  return std::ranges::any_of(Node.specific_attrs<AnnotateAttr>(),
-                             [&](const AnnotateAttr *A) -> bool { return A->getAnnotation() == Expected; });
+AST_MATCHER(Decl, hasExternalAttr) {
+  return std::ranges::any_of(Node.specific_attrs<AnnotateAttr>(), [&](const AnnotateAttr *a) -> bool {
+    return a->getAnnotation() == c2pancake_external_global_annotation;
+  });
 }
 
 // Is this DeclRefExpr the operand of '&' (looking through parentheses)?
@@ -65,20 +63,17 @@ AST_MATCHER(DeclRefExpr, isAddrOfOperand) {
 }
 
 // Any global variable carrying the annotation (used for references).
-static auto annotatedGlobal() {
-  return varDecl(hasGlobalStorage(), hasAnnotationString(c2pancake_external_global_annotation));
-}
+static auto annotatedGlobal() { return varDecl(hasGlobalStorage(), hasExternalAttr()); }
 
 // The declarations we rewrite: annotated, no initializer, in the main file.
 static auto externalGlobalDecl() {
-  return varDecl(isExpansionInMainFile(), hasGlobalStorage(), hasAnnotationString(c2pancake_external_global_annotation),
-                 unless(hasInitializer(anything())));
+  return varDecl(isExpansionInMainFile(), hasGlobalStorage(), hasExternalAttr(), unless(hasInitializer(anything())));
 }
 
 // "extern int a[10]" -> "extern int (*a_ptr)[10]"
 static llvm::Expected<std::string> pointerizedDecl(const MatchFinder::MatchResult &R) {
   const auto *vd = R.Nodes.getNodeAs<VarDecl>("global_var");
-  if (!vd)
+  if (vd == nullptr)
     return llvm::make_error<llvm::StringError>("global_var not bound", llvm::inconvertibleErrorCode());
 
   ASTContext &ctx = *R.Context;
@@ -93,7 +88,7 @@ static llvm::Expected<std::string> pointerizedDecl(const MatchFinder::MatchResul
     out = "extern ";
   else if (vd->getStorageClass() == SC_Static)
     out = "static ";
-  return out + declarator;
+  return out + declarator + ";";
 }
 } // namespace clang::ast_matchers
 
@@ -160,7 +155,7 @@ auto Consumer::HandleTranslationUnit(ASTContext &Ctx) -> void {
     }
   }
 
-  if (errors == 0 && changes.empty()) {
+  if (errors == 0) {
     ps_ctx.SetControl(StageControl::Continue);
     return;
   }

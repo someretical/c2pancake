@@ -50,6 +50,8 @@
                 // "--end=RewriteFunctionCalling",
                 "--skip=ConvertIntegerTypes",
                 "--treat-header-functions-as-non-ffi",
+                // "--start=GlobalVariablePointerify",
+                // "--end=InjectHeaders",
                 "--",
                 "-DNDEBUG",
                 "-ffreestanding",

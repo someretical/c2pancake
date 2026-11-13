@@ -136,6 +136,8 @@ auto CodeGen::Generate(const Program &program) -> std::string {
 }
 
 void CodeGen::Emit(const Function &function) {
+  if (function.isExternal)
+    out << "export ";
   if (function.isInline)
     out << "inline ";
   out << "fun 1 " << function.name << "(";

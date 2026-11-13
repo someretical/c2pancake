@@ -366,6 +366,14 @@ public:
         auto function = std::make_shared<pancake::Function>();
         function->name = func_decl->getName().str();
         function->isInline = func_decl->isInlineSpecified();
+        function->isExternal = std::ranges::any_of(func_decl->getAttrs(), [](const Attr *attr) -> bool {
+          if (const auto *annotate_attr = llvm::dyn_cast<AnnotateAttr>(attr)) {
+            if (annotate_attr->getAnnotation() == "__c2pnk_external_entry_point") {
+              return true;
+            }
+          }
+          return false;
+        });
         function->body = std::make_shared<pancake::Block>();
         for (auto &&param : func_decl->parameters()) {
           function->params.push_back({.name = param->getName().str(), .shape = 1});
@@ -1585,7 +1593,7 @@ static void init_pancake_mem(void) {{
   cml_stackend = (unsigned char *)cml_stack + cml_stack_sz;
 
   /* externally declared global vars go here, they are all POINTERS */
-  {3}
+{3}
 }
 
 int main(void) {{
@@ -1691,7 +1699,7 @@ auto Finalizer::Write(StageContext &ctx, clang::CompilerInstance &compiler) -> l
   llvm::raw_string_ostream external_global_vars_os(external_global_vars);
   for (const auto &[var_decl, global_var_data] : *external_global_vars_map) {
     /* note that {1} is a POINTER to the original type! */
-    external_global_vars_os << llvm::formatv("*({1})(((unsigned char *)cml_heap) + {0}) = 0; /* {2}*/\n",
+    external_global_vars_os << llvm::formatv("  *({1})(((unsigned char *)cml_heap) + {0}) = 0; /* {2}*/\n",
                                              global_var_data.addr, global_var_data.type, global_var_data.name);
   }
   external_global_vars_os.flush();
